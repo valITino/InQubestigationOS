@@ -597,7 +597,11 @@ class Provisioner:
         # qvm-* works as an unprivileged user in dom0, so a run without sudo
         # re-templates the service qubes and rewires every netvm quite happily,
         # and only falls over later when it tries to write /root/.backup-pass.
-        if os.geteuid() != 0 and not self.args.dry_run:
+        #
+        # TEST_ROOT is exempt: with a synthetic dom0 root there is no real dom0
+        # to damage — every write lands inside the test tree — and the harness
+        # has to be runnable by an ordinary CI user.
+        if os.geteuid() != 0 and not self.args.dry_run and not TEST_ROOT:
             raise Fatal("this must run as root — it writes dom0 policy, systemd "
                         "units and /root/.backup-pass.\n"
                         f"     sudo {Path(sys.argv[0]).name} "

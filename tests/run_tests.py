@@ -98,6 +98,7 @@ def make_env(work: Path) -> dict:
     env["FAKE_DOM0_CAPTURE"] = str(work / "capture")
     env["GOLDEN_IMAGE_DOM0_ROOT"] = str(dom0)
     env["HOME"] = str(work / "home")
+    env["PYTHONPYCACHEPREFIX"] = str(work / "pycache")
     (work / "home").mkdir(parents=True, exist_ok=True)
     (work / "capture").mkdir(parents=True, exist_ok=True)
     (work / "actions.jsonl").touch()
@@ -131,9 +132,13 @@ def main() -> int:
     bi = sandbox / "build_iso.py"
 
     print("compile")
+    # Bytecode goes to the work tree, not into the repository: a test run must
+    # not need write access to the checkout, and CI checkouts are not ours to
+    # litter.
+    cenv = dict(os.environ, PYTHONPYCACHEPREFIX=str(work / "pycache"))
     for f in (ROOT / "golden_image.py", ROOT / "build_iso.py"):
         p = subprocess.run([sys.executable, "-m", "py_compile", str(f)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=cenv)
         stage(f"{f.name} compiles", p.returncode == 0, p.stderr.strip())
 
     print("\ndry run")
