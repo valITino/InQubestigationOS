@@ -295,6 +295,14 @@ subprocess now runs with `stdin` closed); and phase 10 stopped marking itself
 complete after a refactor, which the "phases recorded as complete" stage caught
 immediately.
 
+Adding the credential-lifecycle flow to the harness immediately found three
+more: `qvm-prefs` reports an offline qube as `none` while the code compared
+against `None`, so the escrow refused to write into `vault`; `qwrite` appended a
+newline to *every* file it wrote, so a copy could never be byte-identical to its
+original and the escrow's integrity check could never pass; and
+`--shred-credentials` destroyed the build log and then re-created it with its own
+success message.
+
 `ensure_running` used to `sleep(5)` after starting a qube — simultaneously too
 long on a fast machine and too short on a slow one. It now polls until qrexec
 answers, which is the condition that actually matters, and gives up after

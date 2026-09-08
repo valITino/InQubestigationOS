@@ -93,6 +93,17 @@ def cmd_qvm_run(w: dict, argv: list[str]) -> int:
             mode = (CHMOD_RE.search(inner) or [None, "0644"])[1] if CHMOD_RE.search(inner) else "0644"
             capture_write(name, path, data, mode)
             return 0
+        # Answer the read-back probes the provisioner uses to prove a file
+        # arrived intact, by hashing what was actually captured.
+        m = re.search(r"sha256sum (?P<p>'[^']*'|\S+)", inner)
+        if m:
+            path = m.group("p").strip("'\"")
+            f = CAPTURE / name / path.lstrip("/")
+            if f.is_file():
+                import hashlib
+                print(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {path}")
+                return 0
+            return 1
         record("qvm-run-passio", vm=name, cmd=inner, stdin_bytes=len(data))
         return 0
 

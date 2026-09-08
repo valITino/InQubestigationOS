@@ -195,6 +195,30 @@ def main() -> int:
           f"rc={p2.returncode} " + p2.stderr.strip()[-400:])
     stage("completed phases are skipped on re-run", "skipping" in p2.stdout)
 
+    print("\ncredential lifecycle")
+    # The handover used to be a checklist whose last step — destroying the dom0
+    # copy — was the one that got skipped. These are the commands that replaced
+    # it, and the refusal is the part that matters.
+    p_no = run(gi, ["--shred-credentials"], env, sandbox)
+    stage("--shred-credentials refuses without an escrow record",
+          p_no.returncode != 0 and creds.exists(),
+          "it destroyed the only copy of the machine's secrets")
+    p_es = run(gi, ["--escrow-credentials", "vault"], env, sandbox)
+    stage("--escrow-credentials copies into the offline qube",
+          p_es.returncode == 0, p_es.stderr.strip()[-400:])
+    escrowed = work / "capture" / "vault"
+    stage("the escrowed copy exists in the target qube",
+          escrowed.is_dir() and any(escrowed.rglob("golden-image-credentials-*.json")))
+    rec = Path(env["HOME"]) / "golden-image" / "escrow.json"
+    stage("an escrow record was written", rec.exists())
+    p_sh = run(gi, ["--shred-credentials"], env, sandbox)
+    stage("--shred-credentials proceeds once the copy is verified",
+          p_sh.returncode == 0, p_sh.stderr.strip()[-400:])
+    stage("the dom0 copy is gone", not creds.exists())
+    log_after = Path(env["HOME"]) / "golden-image" / "build.log"
+    stage("the build log is destroyed with it", not log_after.exists(),
+          "it records every command run against every qube")
+
     print("\nacceptance tests")
     p3 = run(gi, ["--verify"], env, sandbox)
     stage("--verify runs", p3.returncode in (0, 2), f"rc={p3.returncode} "

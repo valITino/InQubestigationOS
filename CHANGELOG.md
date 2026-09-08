@@ -68,6 +68,11 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
   scripts were run as root with nothing but TLS behind them. Both are pinned.
 - `write-usb` and the generated `verify-iso.sh` reported a signature as
   verified against the unit key without ever checking which key signed it.
+- `qwrite` appended a newline to every file it wrote, so nothing copied into a
+  qube could be byte-identical to its original.
+- An offline qube reports `netvm` as `none`; the code compared against `None`.
+- `--shred-credentials` destroyed the build log and then re-created it by
+  logging that it had done so.
 
 **Fixed — security**
 

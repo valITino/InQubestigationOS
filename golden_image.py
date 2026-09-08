@@ -425,7 +425,11 @@ class Runner:
                  f"cat > {shlex.quote(path)} && chmod {mode} {shlex.quote(path)}")
         cmd = ["qvm-run", "--no-gui", "--pass-io", "-u", "root", vm, inner]
         try:
-            p = subprocess.run(cmd, input=content + "\n", capture_output=True,
+            # Only add the trailing newline the file is missing. Appending one
+            # unconditionally meant qwrite silently modified every file it
+            # wrote, so a copy could never be byte-identical to its original.
+            payload = content if content.endswith("\n") else content + "\n"
+            p = subprocess.run(cmd, input=payload, capture_output=True,
                                text=True, timeout=self.timeout_short)
         except subprocess.TimeoutExpired:
             raise Fatal(f"writing {path} into {vm} timed out")
@@ -2580,8 +2584,9 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             if not r.vm_exists(vm):
                 continue
             nv = r.run("qvm-prefs", vm, "netvm", check=False, capture=True).strip()
-            self._t("pass" if nv in ("", "None") else "fail",
-                    f"{vm} is offline" if nv in ("", "None") else f"{vm} has netvm '{nv}'")
+            offline = nv.lower() in ("", "none")
+            self._t("pass" if offline else "fail",
+                    f"{vm} is offline" if offline else f"{vm} has netvm '{nv}'")
 
         o.say("")
         o.info("4. Wazuh agent present in every template")
@@ -3007,7 +3012,9 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if not r.vm_exists(target):
             raise Fatal(f"escrow target '{target}' does not exist")
         netvm = r.run("qvm-prefs", target, "netvm", check=False, capture=True).strip()
-        if netvm not in ("", "None"):
+        # qvm-prefs reports an offline qube as "", "None" or "none" depending on
+        # how it was set; all three mean the same thing.
+        if netvm.lower() not in ("", "none"):
             raise Fatal(f"'{target}' has netvm '{netvm}'. Refusing to copy every "
                         f"secret for this machine into a qube with a network "
                         f"route. Use an offline qube.")
@@ -3071,6 +3078,9 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             return 0
         targets = [self.cred_file, self.out.log_path,
                    self.build_dir / "CREDENTIALS-README.txt"]
+        # Stop logging first, or the very next o.ok() re-creates the log file
+        # this command just destroyed.
+        self.out.enabled = False
         for t in targets:
             if not t.exists():
                 continue
