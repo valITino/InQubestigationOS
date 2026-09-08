@@ -526,7 +526,16 @@ nft add rule ip qubes custom-forward ip daddr 10.137.0.50 tcp dport { 1514, 1515
 <div class="cal fix"><div class="ct"><span class="tag">corrected</span> DNS rules were written into a chain Qubes regenerates</div>
 <p>The old code ran <code>nft flush chain ip qubes dnat-dns</code> from the user script. Two problems: modifying Qubes-managed chains is explicitly unsupported, and <code>qubes-setup-dnat-to-ns</code> <strong>rewrites <code>dnat-dns</code> when the network comes up</strong>, silently discarding the rules. DNS enforcement would have appeared configured and quietly not applied — the worst failure mode in the whole design, because it looks fine until someone audits egress.</p></div>
 
-<p>The working pattern (qubes-issues #9056) replaces the chain wholesale from an <code>nft -f</code> script in <code>/rw/config/qubes-firewall.d/</code>, which runs as part of qubes-firewall startup:</p>
+<p><strong>Pass 2 correction:</strong> qubes-issues #9056 is Closed as
+not planned and labelled <code>R: declined</code>, so it was never a pattern to
+follow. What it does establish, and what matters here, is the <em>ordering</em>:
+<code>qubes-firewall.service</code> starts <em>before</em>
+<code>qubes-network.service</code>, which is what runs
+<code>qubes-setup-dnat-to-ns</code>. Running earlier therefore loses. The rule set still lives in <code>/rw/config/qubes-firewall.d/</code> — it is the
+documented place and it covers a firewall reload — but a
+<code>golden-dns.service</code> in <code>tpl-sys</code>, ordered
+<code>After=qubes-network.service</code>, re-applies it once the Qubes-generated
+chain has been written. Acceptance group 13 reads the chain back. The script replaces the chain wholesale:</p>
 <div class="filehead">sys-firewall · /rw/config/qubes-firewall.d/10-golden-dns  (mode 0755)</div>
 <pre class="conf">#!/usr/sbin/nft -f
 <span class="cm"># mode: dot — redirect downstream DNS to the local unbound, which forwards</span>

@@ -216,7 +216,13 @@ the manpage and built a rule-by-rule fallback for it. It is in the synopsis of
 registered in `qubesadmin/tools/qvm_firewall.py`. The capability check is kept
 because it costs one call, but `reset` is the expected path.
 
-**qubes-issues #9056 says the opposite of what was quoted.** See defect 4 above.
+**qubes-issues #9056 says the opposite of what was quoted**, and it is Closed as
+not planned, labelled `R: declined` — so it was never "the working pattern"
+either. Its body is still the primary source for the *ordering*, which is what
+matters here: `qubes-firewall.service` starts before `qubes-network.service`. See
+"DNS enforcement lost a race it was documented as winning" above.
+
+**`qvm-backup --yes` exists.** See pass 1 defect 4.
 
 ---
 
@@ -255,9 +261,16 @@ Qubes-managed chains is unsupported, and `qubes-setup-dnat-to-ns` rewrites
 
 ### 4. `qvm-backup` has no `--yes` flag
 
-The weekly backup would have hung waiting for confirmation, forever, every Sunday
-at 03:00. Profile mode is the documented non-interactive path. (Pass 2 found the
-profile itself used a key that does not exist — see above.)
+**This was wrong too.** `--yes`/`-y` is registered on `qvm-backup`'s *top-level*
+parser in qubes-core-admin-client, not inside the mutually-exclusive "Profile
+setup" argument group, so it combines with `--profile` perfectly well. Pass 1
+appears to have read the group and concluded the flag did not exist.
+
+The conclusion — use profile mode — was still right, for a different reason: the
+profile is how the passphrase reaches an unattended run. But the weekly script
+now passes `--yes` as well, because a timer that can be asked a y/N question is a
+timer that hangs forever, which is the failure pass 1 was trying to prevent.
+(Pass 2 also found the profile used a key that does not exist — see above.)
 
 ### 5. `qvm-firewall reset`
 

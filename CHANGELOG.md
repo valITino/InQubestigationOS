@@ -129,8 +129,13 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
 - Qubes 4.3 template names, dom0 Fedora 41, and the `custom-forward` /
   `custom-input` user hooks all confirmed; `custom-prerouting` still does not
   exist and qubes-issues #8629 is still open.
-- `qvm-backup` has no `--yes`; `qvm-firewall <vm> reset` **is** documented on 4.3,
-  contrary to what release 2.1 recorded.
+- Two of release 2.1's own records were wrong: `qvm-firewall <vm> reset` **is**
+  documented on 4.3, and `qvm-backup --yes` **does** exist — it is on the
+  top-level parser, not inside the mutually-exclusive "Profile setup" group.
+  The weekly backup passes it now, because a timer that can be asked a
+  y/N question is a timer that hangs forever.
+- qubes-issues #9056 is Closed as not planned and labelled `R: declined`; it was
+  cited as "the working pattern". Its value is the ordering fact, nothing more.
 
 ## 2.1 — 2026-09-01
 

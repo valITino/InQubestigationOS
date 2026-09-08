@@ -2125,7 +2125,11 @@ umask 077
 }} > "$CONF"
 chmod 600 "$CONF"
 
-qvm-backup --profile "$PROFILE"
+# --yes: it is registered on qvm-backup's top-level parser, not inside the
+# mutually-exclusive "Profile setup" group, so it combines with --profile. A
+# release note in this repository once claimed the flag does not exist; it does,
+# and a timer that can be asked a y/N question is a timer that hangs forever.
+qvm-backup --yes --profile "$PROFILE"
 
 # Retention. backup.keep_sets used to be documented in CREDENTIALS-README.txt
 # as a policy and implemented nowhere, so the destination filled up until the
@@ -2903,7 +2907,11 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         try:
             ref = {l.split(":", 1)[0].strip() for l in probe.read_text().splitlines()
                    if ":" in l and not l.startswith(" ")}
-            unknown = ours - ref - {"passphrase_file"}
+            # No exemptions. passphrase_file in particular is the key the
+            # admin API is guaranteed to reject, and subtracting it here would
+            # have hidden exactly the defect this test exists to catch.
+            # (--save-profile emits passphrase_text, so it is in the reference.)
+            unknown = ours - ref
             self._t("pass" if not unknown else "fail",
                     "qvm-backup accepts every key in the golden-image profile"
                     if not unknown else

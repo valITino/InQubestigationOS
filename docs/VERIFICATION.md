@@ -71,7 +71,7 @@ mismatch stops the build.
 | Repository | `deb [signed-by=/usr/share/keyrings/security_zeek.gpg] https://download.opensuse.org/repositories/security:/zeek/Debian_13/ /` |
 | Key URL | `https://download.opensuse.org/repositories/security:zeek/Debian_13/Release.key` |
 | Install path | `/usr/share/keyrings/security_zeek.gpg` |
-| Package | `zeek-8.0` (LTS line) |
+| Package | `zeek-lts` — the 8.0 LTS line, 8.0.10-0 as of 2026-09-08 |
 | Install prefix | `/opt/zeek` |
 
 Zeek is not in Debian main. Upstream distributes binaries through the openSUSE Build
@@ -89,9 +89,14 @@ when the old one expires — an expired OBS key silently stops `tpl-ids` from re
 Zeek updates, which means your DPI recorder quietly goes stale. That check is no
 longer on anyone's monthly checklist; see below.
 
-`zeek-8.0` pins the 8.0 LTS line rather than tracking feature releases, so the
-template will not jump to a new LTS on its own. That is the right choice for
-casework: predictable log formats matter more than new features.
+**The package name matters more than it looks.** The OBS repository offers
+`zeek` (the feature line, 8.2.2-0 today), `zeek-lts` (the 8.0 LTS line, 8.0.10-0)
+and `zeek-8.0` — which sounds like the LTS pin and is in fact **frozen at
+8.0.1-0**, nine point releases behind. This image was pinned to the frozen one
+until 2026-09-08; a DPI recorder that never receives a fix is a DPI recorder you
+should not be relying on. `zeek-lts` tracks the 8.0 LTS line and will not jump to
+a new LTS on its own, which is the right choice for casework: predictable log
+formats matter more than new features.
 
 **The OBS key, recorded.** Confirmed 2026-09-08:
 
