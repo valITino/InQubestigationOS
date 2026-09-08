@@ -724,6 +724,8 @@ echo '{z['repo_line']}' > "${{INSTALL_DIR}}/etc/apt/sources.list.d/security:zeek
 # openSUSE Build Service is outside the Zeek project's control.
 chroot_cmd mkdir -p /usr/share/keyrings
 chroot_cmd bash -c "curl -fsSL '{z['key_url']}' | gpg --dearmor > /usr/share/keyrings/security_zeek.gpg && chmod 644 /usr/share/keyrings/security_zeek.gpg"
+chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/security_zeek.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{{print toupper(\\$10)}}' | grep -qxF '{z['key_fpr']}'" \\
+    || error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'
 aptUpdate
 aptInstall {z['package']}
 uninstallQubesRepo
@@ -1143,10 +1145,9 @@ MOTD_EOF
     if extra_packages:
         x.info(f"%packages adds: {', '.join('qubes-template-'+p for p in extra_packages)}")
         x.verify("pykickstart merges multiple %packages sections rather than letting "
-                 "one override the other. This is standard Anaconda behaviour but was "
-                 "not confirmed against a Qubes-specific source — after the build, "
-                 "mount the ISO and check the templates appear in the package set, or "
-                 "install once in a VM and run 'qvm-ls | grep investigator'.")
+                 "one override the other — standard Anaconda behaviour, not confirmed "
+                 "against a Qubes-specific source. The build checks the RPMs are in "
+                 "the image afterwards, which answers it in practice.")
     x.info(f"auto-provision on first boot: {x.c['auto_provision']}")
     x.verify("the first-boot service fires after Qubes initial setup on your hardware "
              "(the runner polls for sys-net rather than trusting unit order)")
@@ -1297,6 +1298,24 @@ def build_iso(x: Ctx, payload: Path):
     else:
         x.warn("UNSIGNED. Set iso_sign_key and re-run to sign before distributing.")
         x.warn("  ./build_iso.py gen-key --use-key auto   (or --uid \"...\")")
+
+    # The %packages question, answered against the artefact rather than left as
+    # a note: are the custom template RPMs actually inside the image?
+    if tier2 and shutil.which("bsdtar"):
+        listing = x.run("bsdtar", "-tf", str(target), check=False, capture=True)
+        absent = [n for n in x.c["tier2_templates"]
+                  if f"qubes-template-{n}" not in listing]
+        if listing.strip() and not absent:
+            x.ok(f"all {len(x.c['tier2_templates'])} investigator templates are "
+                 f"present in the ISO")
+        elif listing.strip():
+            raise Fatal(f"these templates are NOT in the ISO: {', '.join(absent)}\n"
+                        "     The %packages section did not take effect. Do not "
+                        "distribute this image — it installs a broken workstation.")
+    elif tier2:
+        x.verify("bsdtar is not installed, so the ISO contents were not checked. "
+                 "Mount the image and confirm the investigator template RPMs are "
+                 "in it before distributing.")
 
     # Everything a colleague needs to check the image, in one command, beside
     # the image. GUIDE section 7 used to be three commands typed from memory.
@@ -1588,11 +1607,12 @@ def key_expiry(fpr: str) -> int | None:
 #  setup-host — GUIDE section 2, performed instead of described
 # ---------------------------------------------------------------------------
 # python3-yaml is not optional: builder.yml is merged rather than appended, and
-# without it this script refuses to edit builder.yml at all.
+# without it this script refuses to edit builder.yml at all. bsdtar lets the
+# build confirm the investigator templates are actually inside the finished ISO.
 DEB_PACKAGES = ["docker.io", "git", "curl", "gnupg", "rsync", "python3",
-                "python3-yaml"]
+                "python3-yaml", "libarchive-tools"]
 RPM_PACKAGES = ["docker", "git", "curl", "gnupg2", "rsync", "python3",
-                "python3-pyyaml"]
+                "python3-pyyaml", "bsdtar"]
 
 
 def setup_host(x: Ctx) -> int:
@@ -2125,6 +2145,26 @@ def check_upstream(x: Ctx) -> int:
     except Exception as e:                                   # noqa: BLE001
         c.append(Check("Wazuh: signing key reachable", WARN, f"{type(e).__name__}: {e}"))
 
+    # --- the vendor scripts phase 8 runs as root ----------------------
+    try:
+        import hashlib
+        series = ".".join(str(x.c["wazuh"]["version"]).split(".")[:2])
+        seen["wazuh_tools"] = {}
+        for tool in ("wazuh-certs-tool.sh", "wazuh-passwords-tool.sh"):
+            digest = hashlib.sha256(
+                _fetch(f"https://packages.wazuh.com/{series}/{tool}")).hexdigest()
+            seen["wazuh_tools"][tool] = digest
+            known = lock.get("wazuh_tools", {}).get(tool)
+            c.append(Check(f"Wazuh: {tool} unchanged since the last check",
+                           OK if known in (None, digest) else WARN,
+                           digest[:16] + "…",
+                           "it runs as root against the SIEM — read the diff, then "
+                           "update wazuh.certs_tool_sha256 / "
+                           "wazuh.passwords_tool_sha256 in golden-image.json"))
+    except Exception as e:                                   # noqa: BLE001
+        c.append(Check("Wazuh: vendor scripts reachable", WARN,
+                       f"{type(e).__name__}: {e}"))
+
     # --- Qubes security bulletins ------------------------------------
     #  "Rebuild on every QSB affecting dom0 or Xen" was a line in a table that
     #  assumed somebody was reading the mailing list.
@@ -2303,12 +2343,25 @@ def write_usb(x: Ctx) -> int:
         # signature means hashing the entire image. A timeout would have been
         # swallowed into False and reported as a forged signature.
         x.info("verifying the signature (gpg hashes the whole image)")
-        try:
-            x.run("gpg", "--batch", "--verify", str(asc), str(iso), live=True)
-        except Fatal:
+        # --status-fd, not a bare --verify: `gpg --verify` exits 0 for a good
+        # signature from ANY key in the keyring, so reporting "verifies against
+        # <the unit key>" after it asserted a binding that was never tested —
+        # on the last checkpoint before an image reaches removable media.
+        out = x.run("gpg", "--batch", "--status-fd", "1", "--verify",
+                    str(asc), str(iso), check=False, capture=True)
+        signer = ""
+        for line in out.splitlines():
+            if line.startswith("[GNUPG:] VALIDSIG "):
+                signer = line.split()[2]
+                break
+        if not signer:
             raise Fatal("the detached signature does not verify. Do not write "
                         "this image to media.")
-        x.ok(f"signature verifies against {x.c['iso_sign_key']}")
+        want = (x.c["iso_sign_key"] or "").upper()
+        if want and signer.upper() != want:
+            raise Fatal(f"the image is signed by {signer}, not by the configured "
+                        f"key {want}.\n     Do not write it to media.")
+        x.ok(f"signature verifies, signed by {signer}")
     else:
         x.warn("image is UNSIGNED — colleagues will have nothing to verify against")
 

@@ -129,6 +129,12 @@ DEFAULT_CONFIG: dict = {
     "zeek": {
         "repo_line": "deb [signed-by=/usr/share/keyrings/security_zeek.gpg] https://download.opensuse.org/repositories/security:/zeek/Debian_13/ /",
         "key_url": "https://download.opensuse.org/repositories/security:zeek/Debian_13/Release.key",
+        # The openSUSE Build Service is outside the Zeek project's control, so
+        # this key deserves the same gate as the Kali and Wazuh ones rather than
+        # "whatever came back over TLS". Confirmed 2026-09-08; expires
+        # 2026-12-02, which golden-key-expiry.timer and check-upstream both
+        # watch. Blank disables the check and says so.
+        "key_fpr": "F9FA0223B56B116C363737EF5DA57BDD6DD785CA",
         # NOT /etc/apt/trusted.gpg.d: a key there is a global trust anchor and
         # apt accepts ANY repository signed by it. The openSUSE Build Service is
         # outside the Zeek project's control, so its key is scoped to the Zeek
@@ -163,6 +169,11 @@ DEFAULT_CONFIG: dict = {
         "ip": "10.137.0.50",
         "port_events": 1514,
         "port_enroll": 1515,
+        # The two vendor scripts phase 8 runs as root inside wazuh-srv. Pinned
+        # by checksum, confirmed 2026-09-08 for the 4.14 series; blank disables
+        # the check and says so. check-upstream reports drift.
+        "certs_tool_sha256": "8c93ed36d7b956a6e97a906aed6b6bc636d7cb55a15a41fd6e9c2aa825164216",
+        "passwords_tool_sha256": "29ce567ce1bcb4629a34f3ccfcaec7463a5418bcdd0ee96db5e25dbc0340f8eb",
         "mem": 4096, "maxmem": 8192, "vcpus": 2, "root_gb": 60,
     },
 
@@ -670,8 +681,8 @@ class Provisioner:
         o.info("firewall chains used: custom-forward and custom-input (both documented"
                " user hooks), plus a created custom-dnat-squid chain, plus a wholesale"
                " replacement of dnat-dns via /rw/config/qubes-firewall.d/")
-        o.verify("after the build, confirm rules are live: "
-                 "nft list table ip qubes | grep -A5 'custom-input\\|dnat-dns'")
+        o.info("rules are asserted live in acceptance-test group 13 — "
+               "no manual nft inspection needed")
         self._mark(1)
 
     # =======================================================================
@@ -853,8 +864,9 @@ Backup passphrase
         o, r = self.out, self.r
         o.warn("templates reach the network through the Qubes update proxy (qrexec), "
                "not a netvm.")
-        o.verify("if apt fails with a proxy/CONNECT error on an HTTPS repo, temporarily "
-                 "assign the template a netvm, install, then clear it")
+        o.info("if apt fails with a proxy/CONNECT error on an HTTPS repo, "
+               "temporarily assign the template a netvm, install, then clear it "
+               "— a workaround, not something to verify")
 
         # --- office ---
         if self._tier2_ready("personal"):
@@ -892,8 +904,8 @@ Backup passphrase
                    "apt-get install -y firmware-linux firmware-iwlwifi || "
                    "apt-get install -y firmware-linux-free || true", check=False)
             o.ok(f"{self.t['sys']} service-qube packages installed")
-            o.verify("Wi-Fi actually works in a Debian sys-net on your NIC — drivers "
-                     "come from the dom0 kernel, firmware from this template")
+            o.info("group 13 checks for a wireless interface and for firmware load "
+                   "failures in sys-net")
 
         # --- proxy ---
         if self._tier2_ready("proxy"):
@@ -904,8 +916,7 @@ Backup passphrase
                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                    "(apt-get install -y squid-openssl ca-certificates openssl || "
                    " apt-get install -y squid ca-certificates openssl)")
-            o.verify("whether the installed squid build supports peek/splice "
-                     "(squid-openssl does; plain squid cannot log TLS SNI)")
+            o.info("group 13 runs 'squid -k parse' against the peek/splice config")
             o.ok(f"{self.t['proxy']} payload installed")
 
         # --- ids ---
@@ -926,6 +937,8 @@ Backup passphrase
             r.qrun(self.t["ids"],
                    f"curl -fsSL {shlex.quote(z['key_url'])} | gpg --dearmor "
                    f"> {shlex.quote(z['keyring_path'])} && chmod 644 {shlex.quote(z['keyring_path'])}")
+            self._verify_keyring(self.t["ids"], z["keyring_path"],
+                                 z.get("key_fpr", ""), "Zeek OBS")
             r.qrun(self.t["ids"],
                    f"export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                    f"apt-get install -y {shlex.quote(z['package'])}")
@@ -1016,17 +1029,19 @@ Backup passphrase
         self.r.qwrite(tpl, "/etc/apt/sources.list.d/wazuh.list", w["apt_repo_line"])
         self.r.qrun(tpl, "apt-get update")
 
-    def _verify_wazuh_key(self, tpl: str, keyring: str) -> None:
-        """The imported key signs every package in the SIEM. Pin it."""
-        o, r, w = self.out, self.r, self.c["wazuh"]
-        fpr = (w.get("key_fpr") or "").strip().upper()
+    def _verify_keyring(self, tpl: str, keyring: str, fpr: str, label: str) -> None:
+        """A key fetched over the network signs packages for a police
+        workstation. Every one of them is compared against a pinned
+        fingerprint, exactly as the Kali key is."""
+        o, r = self.out, self.r
+        fpr = (fpr or "").strip().upper()
         if not fpr:
-            o.warn("wazuh.key_fpr is empty — the Wazuh signing key is imported "
-                   "UNVERIFIED. Anything that can answer for packages.wazuh.com "
-                   "can sign packages this image trusts.")
+            o.warn(f"no pinned fingerprint for the {label} key — it is imported "
+                   f"UNVERIFIED. Anything that can answer for that host can sign "
+                   f"packages this image trusts.")
             return
         if self.args.dry_run:
-            o.info(f"[dry-run] verify Wazuh key {fpr} in {tpl}")
+            o.info(f"[dry-run] verify {label} key {fpr} in {tpl}")
             return
         check = (f"gpg --no-default-keyring --keyring {shlex.quote(keyring)} "
                  f"--with-colons --fingerprint 2>/dev/null "
@@ -1036,12 +1051,16 @@ Backup passphrase
             r.qrun(tpl, f"gpg --no-default-keyring --keyring {shlex.quote(keyring)} "
                         f"--fingerprint", check=False)
             raise Fatal(
-                f"the Wazuh signing key in {tpl} is not {fpr}.\n"
-                "     Either Wazuh rolled the key (confirm the new fingerprint at\n"
-                "     documentation.wazuh.com and update wazuh.key_fpr) or the\n"
-                f"     download was tampered with. What was found is in "
-                f"{self.out.log_path}")
-        o.ok(f"{tpl}: Wazuh signing key verified ({fpr[-8:]})")
+                f"the {label} signing key in {tpl} is not {fpr}.\n"
+                "     Either upstream rolled the key — confirm the new fingerprint\n"
+                "     at the vendor's own site and update the config — or the\n"
+                f"     download was tampered with. What was found is in\n"
+                f"     {self.out.log_path}")
+        o.ok(f"{tpl}: {label} signing key verified ({fpr[-8:]})")
+
+    def _verify_wazuh_key(self, tpl: str, keyring: str) -> None:
+        self._verify_keyring(tpl, keyring, self.c["wazuh"].get("key_fpr", ""),
+                             "Wazuh")
 
     def _wazuh_repo_dnf(self, tpl: str):
         w = self.c["wazuh"]
@@ -1342,7 +1361,8 @@ systemctl restart squid
         o.ok(f"{q['proxy']} configured")
         o.info("uses a created custom-dnat-squid chain + custom-input accept, per the")
         o.info("  documented Qubes port-forwarding pattern — there is no custom-prerouting")
-        o.verify("counters increment: nft list chain ip qubes custom-dnat-squid")
+        o.info("group 13 reads the custom-dnat-squid counters back and fails if "
+               "nothing was redirected")
 
         # ---------------- sys-ids ----------------
         mode = self.c["ips_failure_mode"]
@@ -1758,6 +1778,28 @@ WantedBy=multi-user.target
         o.ok("Wazuh packages present (baked in by the Tier 2 template)")
         o.info("generating per-machine certificates and starting the stack")
 
+        # Baked into the template by the ISO build, then run as root against the
+        # SIEM. Checksum them before that happens.
+        for tool, key in (("wazuh-certs-tool.sh", "certs_tool_sha256"),
+                          ("wazuh-passwords-tool.sh", "passwords_tool_sha256")):
+            want = (w.get(key) or "").strip()
+            if not want:
+                o.warn(f"no pinned checksum for {tool} — it runs as root in "
+                       f"{q['wazuh']} unverified")
+                continue
+            if not r.qtest(q["wazuh"], f"test -f /opt/{tool}", dry_default=False):
+                continue
+            if not r.qtest(q["wazuh"],
+                           f"sha256sum /opt/{tool} | grep -qF {shlex.quote(want)}",
+                           dry_default=False):
+                raise Fatal(
+                    f"/opt/{tool} in {q['wazuh']} does not match the pinned "
+                    f"checksum\n     {want}\n"
+                    "     It is about to run as root against the SIEM. Confirm the\n"
+                    "     current file at packages.wazuh.com and update "
+                    f"wazuh.{key},\n     or rebuild the template.")
+            o.ok(f"{tool} matches its pinned checksum")
+
         certs_ok = r.qtest(q["wazuh"], "test -x /opt/wazuh-certs-tool.sh")
         if certs_ok:
             # The file MUST be called config.yml and MUST sit beside the script:
@@ -1851,11 +1893,10 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
             o.warn("  whatever the indexer generated. Retrieve it from")
             o.warn("  /etc/wazuh-indexer/ or reset it before issuing the laptop.")
 
-        o.verify("the SIEM is actually up before issuing the laptop:")
-        o.verify("    qvm-run -u root wazuh-srv 'systemctl is-active wazuh-manager "
-                 "wazuh-indexer wazuh-dashboard'")
-        o.verify("certificate paths against the Wazuh "
-                 f"{w['version']} single-node guide — layout changes between series")
+        o.info("group 13 asserts wazuh-manager, -indexer and -dashboard are active")
+        o.verify(f"certificate paths against the Wazuh {w['version']} single-node "
+                 f"guide — the layout changes between series, and this is the one "
+                 f"thing group 13 cannot tell apart from a working install")
         o.info("agents self-enroll on first start (phase 11) — no manual key exchange")
 
         self._mark(8)
@@ -2011,7 +2052,8 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
             pol.parent.mkdir(parents=True, exist_ok=True)
             pol.write_text(policy)
             o.ok(f"wrote {pol}")
-        o.verify("qubes.ConnectTCP policy grammar and qvm-connect-tcp argument order")
+        o.info("group 13 opens the dashboard from 'work' over qrexec, which is the "
+               "policy grammar and the argument order both, tested end to end")
 
         for name in self._qrexec_telemetry_qubes():
             if not r.vm_exists(name):
@@ -2472,6 +2514,29 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if self.args.dry_run:
             o.info("[dry-run] acceptance tests are read-only; run them for real")
             return
+
+        # A check that never runs cannot fail, and the gate counts failures. So
+        # a half-finished build — sys-ids never created, --verify run before
+        # phase 6, an aborted phase 8 — used to sail through most of these
+        # groups, because every one of them starts "if not r.vm_exists(...):
+        # continue". Assert the estate exists FIRST.
+        o.say("")
+        o.info("0. every qube and template this design requires exists")
+        required = [q["proxy"], q["ids"], q["dpi"], q["firewall"], q["net"],
+                    self.t["sys"], self.t["proxy"], self.t["ids"],
+                    self.t["kali"], self.t["personal"]]
+        if self.c["wazuh"]["mode"] != "central":
+            required += [q["wazuh"], self.t["wazuh"]]
+        for name in required:
+            present = r.vm_exists(name)
+            self._t("pass" if present else "fail",
+                    f"{name} exists" if present else
+                    f"{name} is MISSING — every test that would have examined it "
+                    f"is silently skipped")
+        for name in (q["whonix"], q["kali_tor"], q["usb"], q["dvm_offline"],
+                     "personal", "work", "vault"):
+            if not r.vm_exists(name):
+                self._t("warn", f"{name} does not exist — its checks are skipped")
 
         o.say("")
         o.info("1. chain order")

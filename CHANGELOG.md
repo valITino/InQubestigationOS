@@ -62,6 +62,12 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
   caller named the qube explicitly, so all of them were denied.
 - Acceptance group 7 scored total DNS failure as a warning, and warnings do not
   block, so a workstation that could resolve nothing still passed phase 12.
+- Every acceptance group skips a qube that does not exist, and the gate counts
+  failures, so a half-finished build passed. Group 0 asserts the estate first.
+- The Zeek/OBS key had no fingerprint check at all, and the two Wazuh vendor
+  scripts were run as root with nothing but TLS behind them. Both are pinned.
+- `write-usb` and the generated `verify-iso.sh` reported a signature as
+  verified against the unit key without ever checking which key signed it.
 
 **Fixed — security**
 

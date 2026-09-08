@@ -29,9 +29,13 @@
     ],
     "pinned": "0DCFCA5547B19D2A6099506096B3EE5F29111145"
   },
+  "wazuh_tools": {
+    "wazuh-certs-tool.sh": "8c93ed36d7b956a6e97a906aed6b6bc636d7cb55a15a41fd6e9c2aa825164216",
+    "wazuh-passwords-tool.sh": "29ce567ce1bcb4629a34f3ccfcaec7463a5418bcdd0ee96db5e25dbc0340f8eb"
+  },
   "zeek": {
     "expiries": {
-      "F9FA0223B56B116C363737EF5DA57BDD6DD785CA": 85
+      "F9FA0223B56B116C363737EF5DA57BDD6DD785CA": 84
     },
     "fingerprints": [
       "F9FA0223B56B116C363737EF5DA57BDD6DD785CA"

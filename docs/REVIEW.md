@@ -141,7 +141,13 @@ every caller in the image names the qube explicitly. `@default` only matches the
 form with an empty middle field. The policy now carries both, and group 13 opens
 the dashboard over qrexec to prove it.
 
-**19. A workstation that could resolve nothing still passed.**
+**19. Absent infrastructure produced no failing test.**
+Every group starts `if not r.vm_exists(name): continue`, and the gate counts
+failures — so a check that never runs cannot fail. A half-finished build, or
+`--verify` run before phase 6, skipped most of the suite and was accepted. Group
+0 now asserts the estate exists before anything else looks at it.
+
+**20. A workstation that could resolve nothing still passed.**
 Acceptance test group 7 scored total DNS failure as a WARN, and warnings never
 block: phase 12 marks the build complete on `fail == 0`. It is a failure now.
 
@@ -151,7 +157,9 @@ block: phase 12 marks the build complete on `fail == 0`. It is a failure now.
 |---|---|
 | Secrets in a world-readable log | `qrun` logged every in-qube script verbatim, including the enrollment and dashboard passwords, into a 0644 `build.log` that the documented `shred` step never touched. The log is 0600 and secrets are redacted at the writer. |
 | Secrets on a command line | The enrollment password was passed as a `qvm-run` argument, making it readable from `/proc/<pid>/cmdline` by any process inside the target qube. It goes over stdin. |
-| An unverified signing key | The Wazuh key was imported from whatever `curl -s` returned — `-s` alone exits 0 on a 404 — into a keyring `signed-by=` then trusted for the SIEM's packages. Pinned to `0DCFCA5547B19D2A6099506096B3EE5F29111145` and checked after import. |
+| Unverified signing keys | The Wazuh key was imported from whatever `curl -s` returned — `-s` alone exits 0 on a 404 — into a keyring `signed-by=` then trusted for the SIEM's packages. The Zeek/OBS key had no check at all. Both are now pinned (`0DCF…1145`, `F9FA…85CA`) and compared after import, in the provisioner and in the ISO build. |
+| Unverified vendor scripts | `wazuh-certs-tool.sh` and `wazuh-passwords-tool.sh` were downloaded into the template and run as root against the SIEM with nothing but TLS behind them, in a file where every apt key is fingerprint-pinned. Both are now checksum-pinned, and `check-upstream` reports when either changes. |
+| A signature check that checked nothing | `write-usb` printed "signature verifies against \<the unit key\>" after a bare `gpg --verify`, which exits 0 for a good signature from *any* key in the keyring. It reads `VALIDSIG` from `--status-fd` and compares. The generated `verify-iso.sh` had the same flaw, printing a fingerprint baked into a script that travels with the image. |
 | A fingerprint check that a UID could satisfy | `gpg --fingerprint \| tr -d ' \n' \| grep -qi <fpr>` flattens uid text into the same blob as the fingerprints. Both scripts now compare exact `--with-colons` `fpr` records with `grep -qxF`. |
 | Global apt trust anchors | The Kali and Zeek keys went into `/etc/apt/trusted.gpg.d`, where apt accepts *any* repository they sign — defeating the `signed-by=` on the same line, and the Zeek key belongs to a build service the code itself flags as outside upstream's control. Both are now in `/usr/share/keyrings/`. |
 | No root check | `qvm-*` works as an unprivileged dom0 user, so a run without `sudo` re-templated the service qubes and rewired every netvm, then warned that it could not write the backup passphrase and carried on. |
