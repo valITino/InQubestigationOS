@@ -129,6 +129,10 @@ DEFAULT_CONFIG: dict = {
         # zeek-8.0 in the OBS repository is frozen at 8.0.1-0; the 8.0 LTS line
         # is published as zeek-lts (8.0.10-0 today).
         "package": "zeek-lts",
+        # Pinned like every other key in this image. Confirmed 2026-09-08;
+        # expires 2026-12-02, which check-upstream and the golden-key-expiry
+        # timer both watch.
+        "key_fpr": "F9FA0223B56B116C363737EF5DA57BDD6DD785CA",
     },
     "wazuh": {
         # Kept in step with golden_image.py's wazuh.version by tests/doc_checks.py;
@@ -354,18 +358,32 @@ def preflight(x: Ctx, tier2: bool):
         x._log("ACK   warnings acknowledged non-interactively (--yes/--force)")
 
     need = 250 if tier2 else 100
-    try:
-        st = os.statvfs(x.work)
-        free = st.f_bavail * st.f_frsize // (1024 ** 3)
-        x.info(f"free space at {x.work}: {free}G")
+    # Measure the nearest existing ancestor. statvfs on a directory that does
+    # not exist yet raises, and the check used to disappear silently on exactly
+    # the two occasions it matters most: a fresh host, and any --dry-run.
+    probe = x.work
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    free = _free_gb(probe)
+    if free is None:
+        x.warn(f"could not measure free space at {probe}")
+    else:
+        x.info(f"free space at {probe}: {free}G")
         if free < need:
             x.warn(f"under {need}G free — this build will very likely fail")
-    except OSError:
-        pass
+
+    # In a dry run the environment gates become warnings: the whole point of
+    # "print the plan and change nothing" is that you can read it before the
+    # host is ready. Configuration errors stay fatal either way.
+    def gate(message: str) -> None:
+        if x.args.dry_run:
+            x.warn(message.splitlines()[0] + "  (dry run: continuing)")
+        else:
+            raise Fatal(message)
 
     for tool in ("git", "curl", "gpg"):
         if not shutil.which(tool):
-            raise Fatal(f"{tool} not installed")
+            gate(f"{tool} not installed — ./build_iso.py setup-host")
 
     host = "debian/ubuntu" if shutil.which("apt-get") else (
         "fedora" if shutil.which("dnf") else "unknown")
@@ -380,17 +398,18 @@ def preflight(x: Ctx, tier2: bool):
 
     ce = x.c["container_engine"]
     if not shutil.which(ce):
-        raise Fatal(f"{ce} is required for the builder cages")
-    if not x.quiet(ce, "ps"):
-        raise Fatal(f"cannot talk to {ce} without sudo.\n"
+        gate(f"{ce} is required for the builder cages — ./build_iso.py setup-host")
+    elif not x.quiet(ce, "ps"):
+        gate(f"cannot talk to {ce} without sudo.\n"
                     f"     Fix it in one step:  ./build_iso.py setup-host\n"
                     f"     (adds you to the {ce} group, enables the service, and in "
                     f"an app qube\n      persists /var/lib/docker through bind-dirs)")
-    x.ok(f"{ce} usable without sudo")
+    else:
+        x.ok(f"{ce} usable without sudo")
 
     payload = Path(__file__).resolve().parent / "golden_image.py"
     if not payload.is_file():
-        raise Fatal(f"provisioning payload not found: {payload}\n"
+        gate(f"provisioning payload not found: {payload}\n"
                     "     golden_image.py must sit beside this script — it is what "
                     "gets embedded into the ISO.")
     x.ok(f"provisioning payload found: {payload.name}")
@@ -403,6 +422,11 @@ def preflight(x: Ctx, tier2: bool):
 def setup_builder(x: Ctx):
     x.phase("1", "fetch qubes-builderv2 and build the container image")
     branch = x.c["builder_branch"]
+    if x.args.dry_run and not (x.builder / ".git").is_dir():
+        x.info(f"[dry-run] clone qubes-builderv2 @ {branch}, install its "
+               f"dependencies, build the container image, fetch qubes-release")
+        x.info("[dry-run] nothing below can be checked until that has happened")
+        return
     if (x.builder / ".git").is_dir():
         x.skip("qubes-builderv2 cloned")
         # builder_branch was a documented setting nothing ever read: the clone
@@ -453,6 +477,10 @@ def setup_builder(x: Ctx):
     bcfg = x.builder / "builder.yml"
     if not bcfg.exists():
         example = x.builder / "example-configs" / f"qubes-os-{x.c['qubes_release']}.yml"
+        if not example.exists() and x.args.dry_run:
+            x.info(f"[dry-run] seed builder.yml from "
+                   f"example-configs/qubes-os-{x.c['qubes_release']}.yml")
+            return
         if not example.exists():
             avail = sorted(p.name for p in (x.builder / "example-configs").glob("*.yml"))
             raise Fatal(f"no example config for {x.c['qubes_release']}.\n"
@@ -635,7 +663,9 @@ def fetch_kali_key(x: Ctx):
 def gen_component(x: Ctx):
     x.phase("t2", "generate the template component")
     if x.args.dry_run:
-        x.info(f"[dry-run] generate component at {x.component} with 4 flavors")
+        x.info(f"[dry-run] generate component at {x.component} with "
+               f"{len(x.c['tier2_templates'])} flavors: "
+               f"{', '.join(x.c['tier2_templates'])}")
         return
     dist = x.c["dist_codename"]
     comp = x.component
@@ -936,7 +966,7 @@ def missing_template_rpms(x: Ctx) -> list[str]:
 def build_templates(x: Ctx):
     x.phase("t3", "wire templates into builder.yml and build")
     bcfg = x.builder / "builder.yml"
-    if not bcfg.exists():
+    if not bcfg.exists() and not x.args.dry_run:
         raise Fatal("builder.yml not found — run the builder setup first")
     dist = x.c["dist_codename"]
     names = x.c["tier2_templates"]
@@ -1196,6 +1226,13 @@ def build_iso(x: Ctx, payload: Path):
            f"{'PRESENT' if marker else 'ABSENT'}")
 
     iso_tpls = list(x.c["iso_templates"]) or derived
+    if not iso_tpls and x.args.dry_run:
+        # The names release4.3's comps-dom0.xml carries, recorded in this
+        # script's docstring. Only for planning: a real build derives them.
+        iso_tpls = ["debian-13-xfce", "fedora-43-xfce",
+                    "whonix-gateway-18", "whonix-workstation-18"]
+        x.warn("planning against the release4.3 template names; a real build "
+               "derives them from the fetched comps file")
     if not iso_tpls:
         raise Fatal("no ISO templates resolved. Set iso_templates in iso-build.json.")
 

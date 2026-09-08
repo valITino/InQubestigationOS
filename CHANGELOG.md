@@ -73,6 +73,16 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
 - An offline qube reports `netvm` as `none`; the code compared against `None`.
 - `--shred-credentials` destroyed the build log and then re-created it by
   logging that it had done so.
+- `./build_iso.py templates` died with a `KeyError` before building anything:
+  the generated hook read `zeek.key_fpr`, which the builder's config lacked.
+- The generated API password was stored, documented and rotated but never
+  applied to the `wazuh-wui` user.
+- `--dry-run` — the first command the guide tells you to run — could not
+  complete on a host that had not already built.
+- `prefer_debian: false` left `tpl-sys` with no agent while phase 12 asserted
+  one, so that configuration could never pass its own tests.
+- The wazuh-agent version pin fell back to an unpinned install in silence, and
+  the hold then froze an unknown version.
 
 **Fixed — security**
 

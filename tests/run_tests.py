@@ -242,9 +242,23 @@ def main() -> int:
     p5 = run(bi, ["--write-config"], ienv, sandbox)
     stage("build_iso --write-config exits 0", p5.returncode == 0, p5.stderr.strip()[-300:])
     stage("iso-build.json written", (sandbox / "iso-build.json").exists())
-    p6 = run(bi, ["--dry-run", "--force", "iso"], ienv, sandbox)
-    stage("build_iso refuses to guess in a dry run without sources",
-          p6.returncode in (0, 1), f"rc={p6.returncode}")
+    # docs/GUIDE.md's first build command is `./build_iso.py --dry-run all` on a
+    # host where nothing has been fetched yet. It has to reach the end.
+    p6 = run(bi, ["--dry-run", "--yes", "all"], ienv, sandbox)
+    stage("build_iso --dry-run all completes on a bare host", p6.returncode == 0,
+          p6.stdout.strip()[-500:] + p6.stderr.strip()[-300:])
+    stage("the dry run reaches the final phase", "4 —" in p6.stdout,
+          "it stopped before naming and signing the image")
+    stage("the dry run wrote nothing",
+          not (Path(ienv["HOME"]) / "investigator-iso").exists(),
+          "a work tree was created by a run that says it changes nothing")
+
+    print("\nconfiguration")
+    pc = subprocess.run([sys.executable, str(TESTS / "config_checks.py")],
+                        capture_output=True, text=True, cwd=ROOT)
+    print(pc.stdout.rstrip())
+    stage("the code and its configuration agree", pc.returncode == 0,
+          "see output above")
 
     print("\ndocumentation")
     p7 = subprocess.run([sys.executable, str(TESTS / "doc_checks.py")],

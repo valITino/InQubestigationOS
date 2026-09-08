@@ -1097,6 +1097,25 @@ Backup passphrase
                     self.t["personal"], self.t["wazuh"], self.c["base_debian"]]
         if self.c["prefer_debian"]:
             deb_tpls.insert(0, self.t["sys"])
+        else:
+            # tpl-sys is a Fedora clone in this configuration, so it needs the
+            # rpm path. Without this it got no agent at all while phase 12 still
+            # asserted one — that configuration could never pass its own tests.
+            if r.vm_exists(self.t["sys"]) and not r.qtest(
+                    self.t["sys"], "test -d /var/ossec", dry_default=False):
+                o.info(f"{self.t['sys']}: wazuh-agent {w['version']} (dnf — "
+                       f"prefer_debian is false, so this template is Fedora)")
+                self._wazuh_repo_dnf(self.t["sys"])
+                r.qrun(self.t["sys"], f"dnf install -y "
+                                      f"wazuh-agent-{shlex.quote(w['version'])} "
+                                      f"|| dnf install -y wazuh-agent", check=False)
+                r.qrun(self.t["sys"], "systemctl disable --now wazuh-agent",
+                       check=False)
+                if w["pin_agent"]:
+                    r.qrun(self.t["sys"],
+                           "sed -i 's|^enabled=1|enabled=0|' "
+                           "/etc/yum.repos.d/wazuh.repo", check=False)
+                o.ok(self.t["sys"])
         for k in ("base_whonix_gw", "base_whonix_ws"):
             if r.vm_exists(self.c[k]):
                 deb_tpls.append(self.c[k])
@@ -1113,9 +1132,24 @@ Backup passphrase
             # being installed, but apt was given a bare package name and took
             # whatever the repository offered; the dpkg hold below then froze
             # that unknown version instead of the configured one.
-            r.qrun(tpl, "export DEBIAN_FRONTEND=noninteractive; "
-                        f"apt-get install -y wazuh-agent={shlex.quote(w['version'])}-1 "
-                        f"|| apt-get install -y wazuh-agent")
+            if not r.qtest(tpl, "export DEBIAN_FRONTEND=noninteractive; "
+                                f"apt-get install -y "
+                                f"wazuh-agent={shlex.quote(w['version'])}-1",
+                           dry_default=True):
+                # Wazuh has shipped -2 revisions, and the repository moves on.
+                # Falling back is reasonable; doing it silently is not — the
+                # hold below would then freeze an unknown version and phase 12
+                # only checks that a hold exists, not what it holds.
+                o.warn(f"{tpl}: wazuh-agent {w['version']}-1 is not available; "
+                       f"installing whatever the repository offers")
+                r.qrun(tpl, "export DEBIAN_FRONTEND=noninteractive; "
+                            "apt-get install -y wazuh-agent")
+                got = r.run("qvm-run", "--no-gui", "--pass-io", "-u", "root", tpl,
+                            "dpkg-query -W -f='${Version}' wazuh-agent",
+                            check=False, capture=True).strip()
+                o.warn(f"{tpl}: pinned at {got or 'unknown'}, not "
+                       f"{w['version']} — update wazuh.version to match the "
+                       f"manager, or this agent may overtake it")
             # Not '|| true': p05's own preamble explains that an enabled agent
             # in a shared template gives every qube cloned from it the SAME
             # identity, so they collide in the manager instead of appearing as
@@ -1892,6 +1926,19 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
                     "has.\n     Fix it inside "
                     f"{q['wazuh']} and re-run:  sudo ./golden_image.py --phase 8")
             o.ok("dashboard admin password set from credentials.json")
+            # The 'api' secret was generated, written into credentials.json,
+            # documented in CREDENTIALS-README.txt and rotated — and applied to
+            # nothing. Either it is a credential or it is not.
+            api = self._need_secret("api", 8)
+            if r.quiet("qvm-run", "--no-gui", "-u", "root", q["wazuh"],
+                       "bash -c " + shlex.quote(
+                           f"/opt/wazuh-passwords-tool.sh -u wazuh-wui "
+                           f"-p {shlex.quote(api)}")):
+                o.ok("API password set from credentials.json")
+            else:
+                o.warn("could not set the wazuh-wui API password — the dashboard "
+                       "keeps whatever the installer generated. Reset it before "
+                       "issuing the laptop.")
         else:
             o.warn("wazuh-passwords-tool.sh not available — the admin password is")
             o.warn("  whatever the indexer generated. Retrieve it from")
@@ -2954,11 +3001,15 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             r.qrun(q["wazuh"], "systemctl restart wazuh-manager", check=False)
             o.ok("manager enrollment password rotated")
             if r.qtest(q["wazuh"], "test -x /opt/wazuh-passwords-tool.sh"):
+                r.quiet("qvm-run", "--no-gui", "-u", "root", q["wazuh"],
+                        "bash -c " + shlex.quote(
+                            f"/opt/wazuh-passwords-tool.sh -u wazuh-wui "
+                            f"-p {shlex.quote(new['api'])}"))
                 if r.quiet("qvm-run", "--no-gui", "-u", "root", q["wazuh"],
                            "bash -c " + shlex.quote(
                                f"/opt/wazuh-passwords-tool.sh -u admin "
                                f"-p {shlex.quote(new['dashboard'])}")):
-                    o.ok("dashboard admin password rotated")
+                    o.ok("dashboard and API passwords rotated")
                 else:
                     raise Fatal("could not set the new dashboard password — "
                                 "nothing has been written to credentials.json, so "

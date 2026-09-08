@@ -194,6 +194,33 @@ key must resolve in the right `DEFAULT_CONFIG`, the version stamps must agree,
 and the two scripts must pin the same fingerprints as each other and as the
 verification record.
 
+**21. `./build_iso.py templates` died before building anything.**
+The generated Kali/Zeek hook reads `zeek.key_fpr`, which existed in the
+provisioner's configuration but not in the builder's — a `KeyError` raised the
+moment `gen_component()` evaluated its bodies. `tests/config_checks.py` now
+proves statically that every config key the code reads exists, and that every key
+the config defines is read; it reproduces this failure on the commit before the
+fix.
+
+**22. The API password was generated, stored, rotated and applied to nothing.**
+Three of the four secrets reach something: the dashboard password through
+`wazuh-passwords-tool.sh`, the enrollment password into `authd.pass`, the backup
+passphrase into the profile. The fourth was documented in
+`CREDENTIALS-README.txt` as a login credential and never set on the `wazuh-wui`
+API user, whose password stayed whatever the installer generated.
+
+**23. `--dry-run` could not run on a host that had not already built.**
+The command docs/GUIDE.md tells you to run first, on the machine you have just
+cloned onto, died at the first environment gate. Environment gates are warnings
+in a dry run now, and the plan is printed against the recorded release4.3 names
+when the sources are not fetched — so `--dry-run all` reaches phase 4 on a bare
+host. The harness asserts that, and asserts that it wrote nothing.
+
+**24. `prefer_debian: false` could never pass its own acceptance tests.**
+In that configuration `tpl-sys` is cloned from Fedora, phase 5 installed an agent
+into neither the apt list nor the dnf path for it, and phase 12 then failed
+"`tpl-sys` carries the agent" every time.
+
 ### Settings that did nothing
 
 Each of these was a documented knob the code never read — worse than an error,
@@ -206,6 +233,7 @@ because it looks configured:
 | `wazuh.version` | printed as though it were installed; `apt` was given a bare package name | passed to `apt-get install wazuh-agent=<version>-1` before the hold is applied |
 | `backup.keep_sets` | documented as retention, implemented nowhere | the weekly wrapper prunes to it |
 | `use_fedora_template` | selected between two log lines | decides whether the Fedora template is in service at all: agent, and coverage by the tests |
+| the generated API secret | stored, documented and rotated; applied to nothing | set on the `wazuh-wui` API user |
 | `wazuh_version` (build_iso) | read from a key that does not exist in its `DEFAULT_CONFIG` | reads `wazuh.version`, which does |
 
 ### Corrections to pass 1
