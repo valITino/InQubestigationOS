@@ -1,5 +1,126 @@
 # Changelog
 
+## 2.2 — 2026-09-08
+
+A second verification pass, and the automation of everything the first pass left
+as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
+
+**Fixed — would have failed in production**
+
+- `wazuh-certs-tool.sh` was invoked with `-c /opt/wazuh-config.yml`. The tool has
+  no `-c` flag; it hardcodes `config.yml` beside itself. It therefore generated
+  no certificates, `|| true` hid that, and the indexer would not have started.
+- The `qvm-backup` profile used a `passphrase_file:` key. `qubes-core-admin`
+  accepts only `passphrase_text` or `passphrase_vm` — the weekly backup would
+  have been rejected every Sunday.
+- Phase 7 staged boot-time configuration into already-running qubes and never
+  restarted them, so phase 12 tested, and passed, an unconfigured chain. The
+  chain is now cycled before the tests run.
+- `suricata-nfqueue.service` was written into `sys-ids`, an AppVM. It was
+  discarded at the first shutdown, leaving a fail-closed queue rule with no
+  listener — i.e. no traffic at all. It now lives in `tpl-ids`.
+- DNS enforcement was applied only from `qubes-firewall.d`, which runs *before*
+  `qubes-network.service` — the service that regenerates `dnat-dns`. It is now
+  re-applied by `golden-dns.service`, ordered after it, and acceptance-test
+  group 13 reads the chain back to prove it stuck.
+- `nft add rule` in the firewall user scripts appended a fresh copy of every rule
+  on every firewall reload. The chains are flushed first.
+- Phases 3, 4 and 6 marked themselves complete after warning that a template or
+  chain qube was missing, so the resume path skipped them forever and the machine
+  stayed half-built. They now refuse to mark.
+- `self.creds` was populated only by phase 2, so any resumed run set the
+  dashboard admin password to the empty string and reported success. Credentials
+  are loaded once at start-up and their absence is fatal where they are needed.
+- `--from-phase N` left the completion marks in place, so it skipped every phase
+  it was asked to redo.
+- The Tor branch was given a qrexec pipe for the events port but not the
+  enrollment port, so its agents could never register.
+- `personal` and `work` were restricted to 80/443/DNS and then dropped
+  everything, which blocked the SIEM traffic phase 11 configures.
+- `zeek-8.0` in the OBS repository is frozen at 8.0.1-0. The 8.0 LTS line is
+  published as `zeek-lts`, currently 8.0.10-0.
+- ISO selection took the alphabetically first match under `artifacts/`, which
+  accumulates across runs — a stale image could be signed and shipped as the new
+  one. It now takes the newest and refuses anything older than the run.
+- `builder.yml` was edited by appending duplicate top-level keys. YAML keeps only
+  the last, so the upstream component list and the rpm/deb signing fingerprints
+  were silently dropped. The script warned about this and told the operator to
+  merge by hand; it now merges properly and verifies with `qb config get-var`.
+- The generated Kali hook pointed `FLAVORS_DIR` at a directory that is never
+  created, so it could not find the keyring the build had just verified.
+- `investigator.ks` was written where its `%include conf/<base>` could not
+  resolve.
+- ISO signing, and the pre-write signature check, ran through a helper with a
+  180-second timeout — too short to hash a tens-of-GB image. A timeout was
+  reported as "signing failed" (build still exited 0) or as a forged signature.
+- Phase 11 enabled the agent with `systemctl enable`, which writes into an
+  AppVM's volatile `/etc`; every agent was disabled again at the next boot.
+- Phase 11 enrolled `sys-ids`, `sys-dpi`, `sys-firewall`, `sys-net` and `sys-usb`
+  over the network at the SIEM address. Those qubes are upstream of `sys-proxy`
+  and the SIEM hangs off it — there is no route. They use qrexec now.
+- Every `qubes.ConnectTCP` rule named `@default` as the destination while every
+  caller named the qube explicitly, so all of them were denied.
+- Acceptance group 7 scored total DNS failure as a warning, and warnings do not
+  block, so a workstation that could resolve nothing still passed phase 12.
+
+**Fixed — security**
+
+- Generated secrets were written verbatim into a world-readable `build.log`. The
+  log is now mode 600 and every registered secret is redacted at the writer.
+- The agent enrollment password was passed on a `qvm-run` command line, making it
+  readable from `/proc` by any process inside the target qube. It goes over stdin.
+- The Wazuh signing key was imported unverified over a `curl -s` that does not
+  fail on HTTP errors. It is now pinned to
+  `0DCFCA5547B19D2A6099506096B3EE5F29111145` and checked after import.
+- The Kali fingerprint check flattened `gpg --fingerprint`'s human-readable output
+  and looked for the fingerprint as a substring, so a key's own UID text could
+  satisfy it. Both scripts now compare exact `--with-colons` `fpr` records.
+- The Kali and Zeek keys were installed into `/etc/apt/trusted.gpg.d`, making them
+  global trust anchors for every repository. Both are now in
+  `/usr/share/keyrings/` and scoped with `signed-by=`.
+- Nothing checked for root; a non-sudo run rewired the machine and only warned
+  when it could not write the backup passphrase.
+- `systemctl disable wazuh-agent` in templates was forced to succeed with
+  `|| true`, defeating the identity-collision protection the code explains at
+  length two screens earlier.
+- `ips_failure_mode: closed` degraded to *no inspection at all* when the NFQUEUE
+  hook could not be installed. It now installs a fallback drop.
+- `golden-image.json` was written 0644 although it can carry four passwords.
+
+**Automated — the requirements, not just the build**
+
+- `setup-host`, `gen-key`, `doctor`, `config` and `check-upstream` replace the
+  first four sections of the guide.
+- `write-usb` verifies the signature, refuses non-removable targets, and reads
+  the stick back; `verify-iso.sh` and `FINGERPRINT.txt` ship beside the image.
+- Acceptance-test group 13 performs every check the guide used to list under
+  "confirm by hand", including asking `check.torproject.org` whether the Tor
+  branch really exits over Tor.
+- `--rotate-credentials`, `--escrow-credentials` and `--shred-credentials` replace
+  the handover checklist; shredding refuses without a verified escrow copy.
+- Seven timers replace the maintenance table: template updates, weekly
+  acceptance tests, backups with retention, monthly restore verification, IPS
+  rule refresh, signing-key expiry, and a staleness banner.
+- The backup disk mounts itself by filesystem label; the SIEM dashboard is a
+  launcher in `work`.
+- `--upgrade-wazuh` performs the manager-then-agents order.
+- `tests/` is the fake-dom0 harness and the static checks the previous release
+  described but did not ship; CI runs them on every push and `check-upstream`
+  every Monday.
+
+**Verified 2026-09-08 against primary sources**
+
+- Kali `827C…E4C5` current, expires 2028-04-17; legacy `44C6…0BF6` expires
+  2027-02-04; published keyring SHA1 unchanged.
+- Zeek OBS key `F9FA0223B56B116C363737EF5DA57BDD6DD785CA`, **expires 2026-12-02**.
+- Wazuh 4.14.7 is current in the stable apt repository; signing key
+  `0DCF…1145` expires 2027-05.
+- Qubes 4.3 template names, dom0 Fedora 41, and the `custom-forward` /
+  `custom-input` user hooks all confirmed; `custom-prerouting` still does not
+  exist and qubes-issues #8629 is still open.
+- `qvm-backup` has no `--yes`; `qvm-firewall <vm> reset` **is** documented on 4.3,
+  contrary to what release 2.1 recorded.
+
 ## 2.1 — 2026-09-01
 
 Verification pass against primary sources. Six defects found and fixed, three of

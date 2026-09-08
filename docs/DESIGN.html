@@ -459,7 +459,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
   <tr><td class="qn zc-gray">fedora-43-xfce</td><td>stock</td><td>agent only — optional fallback</td><td class="dim">nothing by default</td><td class="ok">✓</td></tr>
   <tr><td class="qn zc-orange">tpl-sys</td><td>debian-13-xfce</td><td>qubes-core-agent-networking, -network-manager, qubes-usb-proxy, qubes-input-proxy-sender, firmware-linux, firmware-iwlwifi, unbound</td><td>sys-net · sys-firewall · sys-usb</td><td class="ok">✓ held</td></tr>
   <tr><td class="qn zc-orange">tpl-proxy</td><td>debian-13-xfce</td><td>squid-openssl, openssl</td><td>sys-proxy</td><td class="ok">✓ held</td></tr>
-  <tr><td class="qn zc-orange">tpl-ids</td><td>debian-13-xfce</td><td>suricata, suricata-update, jq, zeek-8.0 (OBS)</td><td>sys-ids · sys-dpi</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-orange">tpl-ids</td><td>debian-13-xfce</td><td>suricata, suricata-update, jq, zeek-lts, the 8.0 LTS line (OBS)</td><td>sys-ids · sys-dpi</td><td class="ok">✓ held</td></tr>
   <tr><td class="qn zc-yellow">tpl-kali</td><td>debian-13-xfce</td><td>kali-rolling repo, kali-linux-default, <strong>maltego</strong></td><td>kali-clear · kali-tor</td><td class="ok">✓ held</td></tr>
   <tr><td class="qn zc-green">tpl-personal</td><td>debian-13-xfce</td><td>libreoffice (full suite), de-CH language + spelling, thunderbird, keepassxc, gimp, vlc, pdfarranger</td><td>personal · work · case-* · vault · dvm-offline</td><td class="ok">✓ held</td></tr>
   <tr><td class="qn zc-blue">tpl-wazuh</td><td>debian-13-xfce</td><td>Wazuh repo prepared; manager stack installs in the StandaloneVM</td><td>wazuh-srv (standalone clone)</td><td class="ok">✓ self</td></tr>
@@ -733,7 +733,7 @@ sequenceDiagram
 <pre class="conf">destination_vm: sys-usb
 destination_path: /mnt/backup
 compression: true
-passphrase_file: /root/.backup-pass
+passphrase_text: /root/.backup-pass
 include:
  - dom0
  - vault
@@ -776,7 +776,7 @@ include:
 603374c107a90a69d983dbcb4d31e0d6eedfc325   <span class="cm"># SHA1 of the keyring file, published 2025-04-28</span>
 
 deb [<span class="hl">signed-by=/usr/share/keyrings/kali-archive-keyring.gpg</span>] \
-    http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware
+    https://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware
 </pre>
 <p class="sub">The build treats the <strong>fingerprint as authoritative and the checksum as advisory</strong>. A fingerprint identifies the key and only changes when Kali rolls one — a mismatch stops the build. A checksum identifies the <em>file</em> and changes whenever the keyring is regenerated for any reason — a mismatch warns and asks you to re-verify. Getting this the wrong way round produces either false alarms or false confidence. The repository line now pins trust with <code>signed-by=</code> rather than relying on the global trust store.</p>
 

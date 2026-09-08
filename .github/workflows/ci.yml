@@ -1,0 +1,37 @@
+name: checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Monday 06:00 UTC. docs/GUIDE.md used to ask a human to check the Zeek OBS
+    # key and the Wazuh release every month; this does it instead.
+    - cron: "0 6 * * 1"
+
+jobs:
+  harness:
+    name: fake-dom0 harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile both scripts
+        run: python3 -m py_compile golden_image.py build_iso.py
+      - name: Run the harness
+        run: ./tests/run_tests.py
+
+  supply-chain:
+    name: supply chain drift
+    runs-on: ubuntu-latest
+    # Network-dependent: informational on a normal push, blocking on schedule.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compare pinned keys and versions against upstream
+        run: ./build_iso.py check-upstream

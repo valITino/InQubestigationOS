@@ -37,35 +37,53 @@ If the key lives on a smartcard or a different machine, build unsigned and sign
 afterwards on the machine that holds it:
 
     gpg --local-user <fingerprint> --detach-sign --armor \
-        --output QubesOS-Cybercrime-Investigator.iso.asc \
-        QubesOS-Cybercrime-Investigator.iso
+        --output InQubestigationOS.iso.asc \
+        InQubestigationOS.iso
 
 ## Creating the key, if you have not yet
 
-    gpg --quick-generate-key "Kapo Cyber Image Signing <cyber@example.ch>" \
-        rsa4096 sign 3y
-    gpg --fingerprint
+    ./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"
+
+That generates an rsa4096 signing key with a three-year expiry, writes the
+fingerprint into `iso-build.json` for you, exports the public key beside the
+ISO, and writes `FINGERPRINT.txt` — the sheet formatted to be read out over the
+phone. Nothing to copy by hand, so nothing to mistype.
 
 Three-year expiry is deliberate — an image-signing key should outlive a build
 cycle but not outlive the team that made it. Generate it on the build host, or
 on an offline machine and import the secret key there.
 
+Already have a unit key in this keyring? Adopt it instead of making another:
+
+    ./build_iso.py gen-key --use-key auto          # if there is exactly one
+    ./build_iso.py gen-key --use-key <fingerprint> # otherwise
+
+`./build_iso.py doctor` then confirms the secret key is present and warns if it
+expires within 90 days, before a multi-hour build rather than after it.
+
 ## What the build produces
 
 | File | Purpose |
 |---|---|
-| `QubesOS-Cybercrime-Investigator.iso` | The image |
+| `InQubestigationOS.iso` | The image |
 | `…iso.sha256` | Integrity check |
 | `…iso.asc` | Detached signature |
 | `unit-signing-key.asc` | Your public key, exported for colleagues |
 | `BUILD-RECORD.txt` | Build date, tier, templates, hashes, expiry warning |
+| `verify-iso.sh` | One-command verification, for colleagues |
+| `FINGERPRINT.txt` | The fingerprint, laid out to be read aloud |
 
-Colleagues verify with:
+Colleagues verify with one command — `verify-iso.sh` is generated beside the
+image and checks the checksum, imports the key and verifies the signature, then
+prints the fingerprint they must compare against the one you gave them:
 
-    sha256sum -c QubesOS-Cybercrime-Investigator.iso.sha256
+    ./verify-iso.sh
+
+Or by hand:
+
+    sha256sum -c InQubestigationOS.iso.sha256
     gpg --import unit-signing-key.asc
-    gpg --verify QubesOS-Cybercrime-Investigator.iso.asc \
-                 QubesOS-Cybercrime-Investigator.iso
+    gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
 
 ## The part that actually matters
 
