@@ -1528,8 +1528,10 @@ def doctor(x: Ctx) -> int:
             c.append(Check(f"{ce} usable without sudo", FAIL,
                            "group membership not active in this shell" if in_group
                            else "not a member of the group",
-                           "./build_iso.py setup-host  (it re-execs through "
-                           "'sg' so you do not have to log out)"))
+                           "./build_iso.py setup-host  (it adds you to the group "
+                           "and, if that is all that is missing, tells you the "
+                           "'sg docker -c ...' line to use in THIS shell instead "
+                           "of logging out)"))
     if ce == "podman":
         c.append(Check("container engine builds DEB packages", WARN,
                        "upstream states the podman executor cannot",

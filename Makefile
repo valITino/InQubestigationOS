@@ -62,6 +62,22 @@ check:  ## run the whole test suite (no Qubes machine needed)
 check-docs:  ## check the documentation still matches the code
 	./tests/doc_checks.py
 
+.PHONY: check-config
+check-config:  ## check the code and its configuration agree
+	./tests/config_checks.py
+
+.PHONY: rotate escrow shred
+rotate:  ## (on the laptop) new secrets, applied everywhere
+	sudo ./golden_image.py --rotate-credentials
+escrow:  ## (on the laptop) copy credentials into the offline vault qube
+	sudo ./golden_image.py --escrow-credentials
+shred:  ## (on the laptop) destroy the dom0 copy — refuses without an escrow record
+	sudo ./golden_image.py --shred-credentials
+
+.PHONY: verify
+verify:  ## (on the laptop) run the acceptance tests
+	sudo ./golden_image.py --verify
+
 .PHONY: clean
 clean:  ## remove local build state and caches
 	rm -rf __pycache__ tests/__pycache__ .pytest_cache
