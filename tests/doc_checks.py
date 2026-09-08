@@ -20,6 +20,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").glob("*.md"))
+# The design specification is HTML, which is exactly why it drifted: it was the
+# one document nothing checked. Its prose is scanned the same way as the .md
+# files, with tags stripped.
+HTML_DOCS = sorted((ROOT / "docs").glob("*.html"))
 
 FAILED: list[str] = []
 PASSED: list[str] = []
@@ -188,6 +192,42 @@ def check_config_keys() -> None:
                   key in known, "not a key in either DEFAULT_CONFIG")
 
 
+def html_text(path: Path) -> str:
+    t = re.sub(r"<(script|style)\b.*?</\1>", " ", path.read_text(), flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return (t.replace("&lt;", "<").replace("&gt;", ">")
+             .replace("&amp;", "&").replace("&nbsp;", " "))
+
+
+def check_html_docs() -> None:
+    """The design spec publishes version stamps, verification dates and test
+    results. Nothing checked it, so it kept publishing the previous release's."""
+    gi = default_config("golden_image.py")
+    ver, wz = gi["image_version"], gi["wazuh"]
+    for doc in HTML_DOCS:
+        t = html_text(doc)
+        stamps = set(re.findall(r"Build specification · v(\d+\.\d+)", t))
+        check(f"{doc.name}: version stamp matches image_version",
+              stamps == {ver} if stamps else True,
+              f"stamped {', '.join(sorted(stamps))}, image_version is {ver}")
+        check(f"{doc.name}: no stale product name",
+              "QubesOS-Cybercrime-Investigator" not in t)
+        check(f"{doc.name}: does not present custom-prerouting as a live chain",
+              not re.search(r"nft [^\n]*custom-prerouting", t))
+        # As a config line, not in prose explaining why it was wrong.
+        check(f"{doc.name}: the backup profile key is the one qvm-backup accepts",
+              not re.search(r"passphrase_file\s*:", t),
+              "qubes-core-admin accepts passphrase_text or passphrase_vm only")
+        check(f"{doc.name}: pins the same Kali key as the code",
+              gi["kali"]["key_fpr"] in t.replace(" ", "") or
+              gi["kali"]["key_fpr"] in t)
+        check(f"{doc.name}: names the pinned Wazuh version",
+              wz["version"] in t)
+        check(f"{doc.name}: does not quote a superseded Zeek package",
+              "zeek-8.0" not in t,
+              "zeek-8.0 is frozen upstream at 8.0.1-0; the LTS line is zeek-lts")
+
+
 def check_versions() -> None:
     gi = default_config("golden_image.py")
     ver = gi["image_version"]
@@ -306,6 +346,7 @@ def check_no_secrets() -> None:
 
 def main() -> int:
     check_paths()
+    check_html_docs()
     check_cli()
     check_config_keys()
     check_versions()

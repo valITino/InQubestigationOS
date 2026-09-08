@@ -174,7 +174,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
 <div class="wrap">
 
 <header class="masthead">
-  <div class="doc-id">Kapo Cyber · Build specification · v2.1 · 2026-09-01</div>
+  <div class="doc-id">Kapo Cyber · Build specification · v2.2 · 2026-09-08</div>
   <h1>InQubestigationOS<br><span style='font-size:.62em;font-weight:500;color:var(--ink-2)'>Cybercrime investigator workstation</span></h1>
   <p class="lede" style="margin-top:16px">Reference design and verified build for the team-standard laptop. One inspected road for every clearnet connection, one anonymous road for Tor, endpoint telemetry in every compartment, reproducible from a stock installer or a custom ISO.</p>
   <div class="chips">
@@ -222,7 +222,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
 
 <p class="sub" style="margin-top:18px">Callouts carry a fixed meaning throughout:</p>
 <div class="cal note"><div class="ct"><span class="tag">verified</span> Confirmed against a primary source</div>
-<p>Official Qubes documentation, a QubesOS repository, or vendor documentation, checked on 2026-09-01. The source is named.</p></div>
+<p>Official Qubes documentation, a QubesOS repository, or vendor documentation, checked on 2026-09-08. The source is named.</p></div>
 <div class="cal fix"><div class="ct"><span class="tag">corrected</span> This was wrong in an earlier revision</div>
 <p>A defect found during verification, with what it would have broken. Recorded rather than quietly patched, so nobody reintroduces it.</p></div>
 <div class="cal warn"><div class="ct"><span class="tag">decision</span> A trade-off someone must own</div>
@@ -452,11 +452,11 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
 </div>
 
 <h2 id="templates"><span class="num">05</span>Template inventory — an agent in every one</h2>
-<p class="section-note">Nine templates, all Debian except the optional Fedora fallback. Every one carries the Wazuh agent, installed <em>disabled</em> and <em>version-held</em>, enabled per qube at enrollment — so template updates never beacon and an agent can never overtake the manager.</p>
+<p class="section-note">Nine templates in service, all Debian. Every one carries the Wazuh agent, installed <em>disabled</em> and <em>version-held</em> at the pinned version, started per qube at enrollment from <code>/rw/config</code> — so template updates never beacon, an agent can never overtake the manager, and the agent survives a reboot (<code>systemctl enable</code> does not, in an AppVM). The stock Fedora template is left untouched unless <code>use_fedora_template</code> says it is part of your estate, in which case it receives an agent and the acceptance tests cover it too.</p>
 <div class="tw"><table>
   <tr><th>Template</th><th>Built from</th><th>Payload on top of base</th><th>Backs</th><th>Agent</th></tr>
   <tr><td class="qn zc-gray">debian-13-xfce</td><td>stock</td><td>agent only — pristine clone source</td><td>clone source, untrusted</td><td class="ok">✓ held</td></tr>
-  <tr><td class="qn zc-gray">fedora-43-xfce</td><td>stock</td><td>agent only — optional fallback</td><td class="dim">nothing by default</td><td class="ok">✓</td></tr>
+  <tr><td class="qn zc-gray">fedora-43-xfce</td><td>stock</td><td class="dim">untouched unless use_fedora_template</td><td class="dim">nothing by default</td><td class="dim">— not in service</td></tr>
   <tr><td class="qn zc-orange">tpl-sys</td><td>debian-13-xfce</td><td>qubes-core-agent-networking, -network-manager, qubes-usb-proxy, qubes-input-proxy-sender, firmware-linux, firmware-iwlwifi, unbound</td><td>sys-net · sys-firewall · sys-usb</td><td class="ok">✓ held</td></tr>
   <tr><td class="qn zc-orange">tpl-proxy</td><td>debian-13-xfce</td><td>squid-openssl, openssl</td><td>sys-proxy</td><td class="ok">✓ held</td></tr>
   <tr><td class="qn zc-orange">tpl-ids</td><td>debian-13-xfce</td><td>suricata, suricata-update, jq, zeek-lts, the 8.0 LTS line (OBS)</td><td>sys-ids · sys-dpi</td><td class="ok">✓ held</td></tr>
@@ -658,7 +658,7 @@ systemctl disable wazuh-agent                      <span class="cm"># templates 
 <span class="hl">echo "wazuh-agent hold" | dpkg --set-selections</span>    <span class="cm"># freeze the version</span>
 sed -i 's|^deb |#deb |' /etc/apt/sources.list.d/wazuh.list
 </pre>
-<p class="sub">Upgrade order when the time comes: <strong><code>wazuh-srv</code> first</strong>, then release the holds and upgrade the agents. Never the reverse. Acceptance test 4b asserts the hold is present across all Debian templates.</p>
+<p class="sub">Upgrade order when the time comes: <strong><code>wazuh-srv</code> first</strong>, then release the holds and upgrade the agents. Never the reverse. Acceptance test group 6 asserts the hold is present across all Debian templates.</p>
 
 <h3>Transport map</h3>
 <div class="tw"><table>
@@ -729,11 +729,11 @@ sequenceDiagram
 <div class="cal fix"><div class="ct"><span class="tag">corrected</span> <code>qvm-backup</code> has no <code>--yes</code> flag</div>
 <p>The previous revision's timer would have hung waiting for confirmation, every Sunday at 03:00, forever — the kind of failure nobody notices until they need a restore. <strong>Profile mode is the documented non-interactive path</strong>, and <code>--profile</code> is mutually exclusive with all other options.</p></div>
 
-<div class="filehead">dom0 · /etc/qubes/backup/golden-image.conf  (mode 0600 — holds the passphrase path)</div>
+<div class="filehead">dom0 · /etc/qubes/backup/golden-image.conf  (mode 0600 — holds the passphrase)</div>
 <pre class="conf">destination_vm: sys-usb
 destination_path: /mnt/backup
 compression: true
-passphrase_text: /root/.backup-pass
+passphrase_text: &lt;the passphrase itself&gt;
 include:
  - dom0
  - vault
@@ -760,7 +760,7 @@ include:
 </ul>
 
 <h2 id="supply"><span class="num">12</span>Supply chain</h2>
-<p class="section-note">Three templates pull packages from outside Debian. Each repository was verified against the vendor's own documentation on 2026-09-01, and the build checks the Kali fingerprint before installing a single Kali package — a mismatch aborts rather than warning and continuing.</p>
+<p class="section-note">Three templates pull packages from outside Debian. Each repository was verified against the vendor's own documentation on 2026-09-08 — and re-checked automatically by <code>./build_iso.py check-upstream</code>, which CI runs weekly. The build checks the Kali, Wazuh and openSUSE Build Service fingerprints before installing a single Kali package — a mismatch aborts rather than warning and continuing.</p>
 <div class="tw"><table>
   <tr><th>Component</th><th>Repository</th><th>Key</th><th>Verified against</th></tr>
   <tr><td class="qn zc-yellow">Kali</td><td class="mono" style="font-size:11.5px">http.kali.org/kali kali-rolling</td><td class="mono" style="font-size:11.5px">archive.kali.org/archive-keyring.gpg</td><td>kali.org signing-key announcement, cross-checked on the Ubuntu keyserver</td></tr>
@@ -836,31 +836,33 @@ sudo ./golden_image.py --verify         <span class="cm"># acceptance tests only
   <tr><th>Test</th><th>Result</th></tr>
   <tr><td>Both scripts compile</td><td class="ok">pass</td></tr>
   <tr><td>Dry run, all twelve phases</td><td class="ok">180 actions planned, no aborts</td></tr>
-  <tr><td>Real run against a fake-dom0 harness</td><td class="ok">exit 0, 11/12 phases marked</td></tr>
+  <tr><td>Real run against a fake-dom0 harness</td><td class="ok">all twelve phases run; the exit code matches the test summary</td></tr>
   <tr><td>Phase 12 refuses to mark complete when tests fail</td><td class="ok">pass</td></tr>
   <tr><td>Generated config files captured and validated</td><td class="ok">58 / 58 checks</td></tr>
   <tr><td>systemd unit structural validation</td><td class="ok">pass</td></tr>
   <tr><td>Credentials mode 600, four unique secrets</td><td class="ok">pass</td></tr>
 </table></div>
-<p class="sub">The 58 checks cover nftables brace balance, chain types and hooks against the valid sets, <code>redirect</code> used only in a nat prerouting context, absence of the non-existent <code>custom-prerouting</code>, nft set spacing, the add-then-delete idiom and <code>dstnat</code> priority in the DNS script, Squid peek-then-splice with no decryption plus <code>%&gt;a</code> attribution, unbound DoT syntax and non-open-resolver posture, Suricata <code>queue num</code> and genuine fail-closed with no <code>bypass</code> in any executable line, and no unsubstituted placeholders anywhere.</p>
+<p class="sub">The 59 checks cover nftables brace balance, chain types and hooks against the valid sets, <code>redirect</code> used only in a nat prerouting context, absence of the non-existent <code>custom-prerouting</code>, nft set spacing, the add-then-delete idiom and <code>dstnat</code> priority in the DNS script, Squid peek-then-splice with no decryption plus <code>%&gt;a</code> attribution, unbound DoT syntax and non-open-resolver posture, Suricata <code>queue num</code> and genuine fail-closed with no <code>bypass</code> in any executable line, and no unsubstituted placeholders anywhere.</p>
 
 <h2 id="verify"><span class="num">15</span>Open verification</h2>
-<p class="section-note">What cannot be checked without a live Qubes 4.3.1 install and the issued hardware. Each prints as <code>[VERIFY]</code> at the moment it matters and is collected at the end of every run. None is architectural.</p>
+<p class="section-note">This list used to be nine items an operator had to confirm by hand on the issued machine. Every one of them that could become a test has: acceptance-test <strong>group 13</strong> runs them on the real hardware, and <code>--verify</code> exits non-zero if any fails. What is left below is what genuinely needs a person.</p>
 <ul class="checks">
-  <li><strong>DNS survives a reboot.</strong> <code>nft list chain ip qubes dnat-dns</code> should show the golden-image rule, not the default nameservers. This is the highest-value check in the list — it is the one that used to fail silently.</li>
-  <li><strong>Proxy counters increment under load.</strong> <code>nft list chain ip qubes custom-dnat-squid</code></li>
-  <li><strong>Backup profile schema.</strong> One manual <code>sudo qvm-backup --profile golden-image</code>. If the keys are rejected, generate a reference with <code>--save-profile</code> and copy its key names.</li>
-  <li><strong>Wi-Fi in a Debian <code>sys-net</code></strong> on the issued NIC — drivers come from the dom0 kernel, firmware from the template.</li>
-  <li><code>qvm-prefs &lt;vm&gt; ip</code> accepted on your build (used to pin the SIEM address).</li>
-  <li><code>qubes.ConnectTCP</code> policy grammar and <code>qvm-connect-tcp</code> port ordering.</li>
-  <li>Squid peek/splice directive names against the shipped Squid 6.13 configuration.</li>
-  <li>Zeek install prefix — the configs assume <code>/opt/zeek</code>.</li>
-  <li>pykickstart merging two <code>%packages</code> sections (standard Anaconda behaviour, not confirmed against a Qubes-specific source).</li>
-  <li>The signature on the qubes-builderv2 checkout itself — the builder verifies what it fetches; nothing verifies the builder for you.</li>
+  <li><strong>Now a test — DNS survives a reboot.</strong> Group 13 reads <code>nft list chain ip qubes dnat-dns</code> back and fails if it does not carry the golden-image rule. This was the highest-value check in the list, and the one that used to fail silently; a <code>golden-dns.service</code> ordered after <code>qubes-network.service</code> now re-applies the chain after the service that regenerates it.</li>
+  <li><strong>Now a test — proxy counters increment.</strong> Group 13 reads the <code>custom-dnat-squid</code> counters after generating traffic through the chain.</li>
+  <li><strong>Now a test — backup profile schema.</strong> Group 13 generates a reference profile with <code>--save-profile</code> and compares key names. No backup is taken. (Pass 2 found the profile used <code>passphrase_file</code>, which <code>qvm-backup</code> rejects outright.)</li>
+  <li><strong>Now a test — Wi-Fi in a Debian <code>sys-net</code>.</strong> Group 13 looks for a wireless interface and for firmware load failures in the kernel log.</li>
+  <li><strong>Now a test</strong> — <code>qvm-prefs &lt;vm&gt; ip</code>, <code>qubes.ConnectTCP</code> grammar and <code>qvm-connect-tcp</code> argument order: group 13 opens the dashboard from <code>work</code> over qrexec and fetches from it, which exercises all three at once.</li>
+  <li><strong>Now a test — Squid peek/splice.</strong> Group 13 runs <code>squid -k parse</code> against the shipped build.</li>
+  <li><strong>Now handled at boot — Zeek install prefix.</strong> The rc hook discovers <code>zeekctl</code> rather than assuming <code>/opt/zeek</code>, and logs a line if it is somewhere else.</li>
+  <li><strong>Now a test — the Tor branch really uses Tor.</strong> Group 13 asks <code>check.torproject.org/api/ip</code> from <code>kali-tor</code> and fails if <code>IsTor</code> is false.</li>
+  <li><strong>Still yours: the builder itself.</strong> The signature on the qubes-builderv2 checkout — the builder verifies what it fetches; nothing verifies the builder for you.</li>
+  <li><strong>Still yours: an end-to-end run.</strong> Neither script has been run against a live Qubes 4.3.1 system. Both run twelve phases against a fake-dom0 harness on every push, which is not the same thing.</li>
+  <li><strong>Still yours: the Wazuh certificate layout.</strong> The paths against the single-node guide for the pinned version — the layout changes between series, and a wrong one looks like a working install until the indexer will not start.</li>
+  <li><strong>Still yours: judgement.</strong> Whether the Kali apt pin priorities suit your unit's tool set, and whether a given machine is fit to issue.</li>
 </ul>
 
 <hr class="rule">
-<p class="sub" style="color:var(--ink-3)">Fig. 1 is self-contained SVG and always renders. Figs. 2–3 render via Mermaid from a CDN; offline they display as readable source that can be pasted into the team wiki. Facts marked <em>verified</em> were checked against primary sources on 2026-09-01 — re-verify before each image version bump and record the date in VERIFICATION.md.</p>
+<p class="sub" style="color:var(--ink-3)">Fig. 1 is self-contained SVG and always renders. Figs. 2–3 render via Mermaid from a CDN; offline they display as readable source that can be pasted into the team wiki. Facts marked <em>verified</em> were checked against primary sources on 2026-09-08. Re-verification is no longer a habit to keep: <code>./build_iso.py check-upstream</code> compares every pinned key, expiry and version against its source, records the result in <code>supply-chain.lock.json</code>, and fails CI when anything moves.</p>
 
 </div>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>

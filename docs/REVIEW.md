@@ -180,7 +180,15 @@ established that it does not exist. The README described a `.gitignore` that was
 not in the repository, and both the README and REVIEW.md published test results
 from a harness that was not committed.
 
-All of this is now asserted by `tests/doc_checks.py`, which fails CI: every path a
+`docs/DESIGN.html` was the worst of it, and for a structural reason: it is the
+only document that is not Markdown, so the first version of the checker never
+opened it. Every `.md` file went green while the design specification carried on
+publishing the previous release's version stamp, verification date and test
+results — including a backup profile with the key `qvm-backup` rejects and an
+"open verification" list of nine items that had all become tests. The checker
+reads it now.
+
+All of this is asserted by `tests/doc_checks.py`, which fails CI: every path a
 doc references must exist, every flag and subcommand must be real, every config
 key must resolve in the right `DEFAULT_CONFIG`, the version stamps must agree,
 and the two scripts must pin the same fingerprints as each other and as the
