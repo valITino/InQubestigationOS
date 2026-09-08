@@ -68,6 +68,8 @@ DEFAULT_CONFIG: dict = {
     #       and a hard dependency on connectivity at install time. Fallback only.
     "tier": 2,
 
+    # "auto" picks the largest writable local filesystem with room for the
+    # build, so "somewhere with 250 GB free" stops being something to work out.
     "work_dir": str(Path.home() / "investigator-iso"),
     # docker, not podman: upstream states the podman executor currently cannot
     # build DEB packages, and every custom template here is Debian.
@@ -1969,8 +1971,46 @@ def config_set(x: Ctx, dotted: str, raw: str, quiet: bool = False) -> int:
     return 0
 
 
+def largest_writable_mount(need_gb: int) -> Path | None:
+    """The biggest local filesystem with room for the build, or None."""
+    best, best_free = None, -1
+    try:
+        mounts = Path("/proc/mounts").read_text().splitlines()
+    except OSError:
+        return None
+    for line in mounts:
+        f = line.split()
+        if len(f) < 3 or not f[0].startswith("/dev/"):
+            continue
+        if f[2] in ("squashfs", "iso9660", "vfat", "tmpfs", "overlay"):
+            continue
+        mp = Path(f[1])
+        free = _free_gb(mp)
+        if free is None or free < need_gb or not os.access(mp, os.W_OK):
+            continue
+        if free > best_free:
+            best, best_free = mp, free
+    return best
+
+
 def resolve_auto_values(x: Ctx) -> None:
     """Derive the settings the guide used to make the operator match by hand."""
+    if str(x.c.get("work_dir", "")).lower() == "auto":
+        need = 250 if int(x.c["tier"]) == 2 else 100
+        mp = largest_writable_mount(need)
+        if mp is None:
+            raise Fatal(f"work_dir is 'auto' but no writable filesystem has "
+                        f"{need}G free. Point it somewhere explicitly:\n"
+                        f"     ./build_iso.py --set work_dir=/path/with/space")
+        chosen = mp / "investigator-iso"
+        x.c["work_dir"] = str(chosen)
+        x.work = chosen
+        x.builder = chosen / "qubes-builderv2"
+        x.component = chosen / "qubes-template-investigator"
+        x.out_dir = chosen / "output"
+        x.log = chosen / "build.log"
+        x.state = chosen / ".state"
+        x.info(f"work_dir resolved to {chosen} ({_free_gb(mp)}G free)")
     if str(x.c.get("mock_config", "")).lower() in ("", "auto"):
         rel = str(x.c["qubes_release"]).lstrip("rR")
         # The Mock chroot must match the HOST distribution of the Qubes release,
@@ -2307,6 +2347,11 @@ cd "$(dirname "$0")"
 ISO={shlex.quote(x.c['iso_name'])}
 FPR={shlex.quote(fp)}
 
+# The fingerprint you were given through a channel INDEPENDENT of this media.
+# Pass it and the comparison stops being something you do by eye:
+#     ./verify-iso.sh <fingerprint>       or   EXPECT_FPR=... ./verify-iso.sh
+EXPECT=$(printf '%s' "${{1:-${{EXPECT_FPR:-}}}}" | tr -d ' ' | tr 'a-f' 'A-F')
+
 printf '  checksum ... '
 sha256sum -c "$ISO.sha256" >/dev/null
 printf 'ok\\n'
@@ -2333,8 +2378,20 @@ if [ -n "$FPR" ] && [ -f "$ISO.asc" ]; then
         printf '  Stop. Do not install this image.\\n\\n'
         exit 1
     fi
-    printf '\\n  COMPARE that fingerprint against the one you were given through a\\n'
-    printf '  channel INDEPENDENT of this media. If they differ, stop.\\n\\n'
+    if [ -n "$EXPECT" ]; then
+        if [ "$signer" = "$EXPECT" ]; then
+            printf '  Matches the fingerprint you supplied.\\n\\n'
+        else
+            printf '  Expected:   %s\\n' "$EXPECT"
+            printf '\\n  *** MISMATCH. Do not install this image. ***\\n\\n'
+            exit 1
+        fi
+    else
+        printf '\\n  COMPARE that fingerprint against the one you were given through a\\n'
+        printf '  channel INDEPENDENT of this media. If they differ, stop.\\n'
+        printf '  Or let the script compare it for you:\\n'
+        printf '      ./verify-iso.sh <fingerprint>\\n\\n'
+    fi
 else
     printf '\\n  WARNING: this image is UNSIGNED. Do not install it.\\n\\n'
     exit 1
@@ -2342,6 +2399,66 @@ fi
 """)
     script.chmod(0o755)
     x.ok(f"verification script written: {script.name}")
+
+
+# ---------------------------------------------------------------------------
+#  sign — for the key that lives somewhere else
+#
+#  docs/SIGNING.md says: if the key is on a smartcard or a different machine,
+#  build unsigned and sign afterwards on the machine that holds it. That was
+#  three commands typed from memory on a machine that has never seen this
+#  repository, and it left the checksum, the exported public key, the
+#  fingerprint sheet and verify-iso.sh unregenerated.
+# ---------------------------------------------------------------------------
+def sign_iso(x: Ctx) -> int:
+    x.phase("sign", "sign an image built elsewhere")
+    iso = Path(getattr(x.args, "iso", None) or (x.out_dir / x.c["iso_name"]))
+    if not iso.is_file():
+        raise Fatal(f"no image at {iso} — pass --iso <path>")
+    fpr = (getattr(x.args, "use_key", None) or x.c["iso_sign_key"] or "").replace(
+        " ", "").upper()
+    if not re.fullmatch(r"[0-9A-F]{40}", fpr or ""):
+        raise Fatal("no signing key. Pass --use-key <fingerprint>, or set "
+                    "iso_sign_key with ./build_iso.py gen-key.")
+    if not x.quiet("gpg", "--list-secret-keys", fpr):
+        raise Fatal(f"no SECRET key for {fpr} in this keyring. This command is "
+                    f"meant to run on the machine that holds the key.")
+    x.c["iso_sign_key"] = fpr
+    if iso.parent != x.out_dir:
+        x.out_dir = iso.parent
+
+    import hashlib
+    h = hashlib.sha256()
+    with iso.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    sha = iso.parent / f"{iso.name}.sha256"
+    if sha.is_file() and sha.read_text().split()[0] != digest:
+        raise Fatal(f"{iso.name} does not match {sha.name}. The image changed "
+                    f"after it was built; do not sign it.")
+    if x.args.dry_run:
+        x.info(f"[dry-run] sign {iso} with {fpr} and regenerate the bundle")
+        return 0
+    sha.write_text(f"{digest}  {iso.name}\n")
+    sig = iso.parent / f"{iso.name}.asc"
+    sig.unlink(missing_ok=True)
+    x.info("signing (gpg hashes the whole image — expect minutes)")
+    x.run("gpg", "--batch", "--yes", "--local-user", fpr, "--detach-sign",
+          "--armor", "--output", str(sig), str(iso), live=True)
+    x.ok(f"signed: {sig.name}")
+    # Everything that has to travel with, or beside, the signature.
+    x.export_pubkey()
+    write_verify_script(x, digest)
+    write_fingerprint_sheet(x, fpr)
+    print(f"""
+  Copy back to the build host, or hand out from here:
+    {iso.name}, {sha.name}, {sig.name}
+    unit-signing-key.asc, verify-iso.sh
+  And, through a channel independent of all of those:
+    {iso.parent / 'FINGERPRINT.txt'}
+""")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2494,8 +2611,29 @@ def write_usb(x: Ctx) -> int:
                 h.update(chunk)
                 remaining -= len(chunk)
     except PermissionError:
-        x.warn(f"cannot read {dev_path} back without root — re-run readback with sudo")
-        return 0
+        # Elevate, exactly as the write already does. Skipping the readback is
+        # skipping the check that a stick wrote without error and reads back
+        # wrong — the failure that otherwise shows up at the install.
+        x.info("reading back through sudo")
+        h = hashlib.sha256()
+        proc = subprocess.Popen(
+            _sudo(["dd", f"if={dev_path}", "bs=4M", "iflag=fullblock",
+                   f"count={(iso.stat().st_size + (1 << 22) - 1) // (1 << 22)}"]),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        assert proc.stdout
+        remaining = iso.stat().st_size
+        while remaining > 0:
+            chunk = proc.stdout.read(min(1 << 22, remaining))
+            if not chunk:
+                break
+            h.update(chunk)
+            remaining -= len(chunk)
+        proc.stdout.close()
+        proc.wait()
+        if remaining > 0:
+            x.warn("could not read the device back even with sudo — verify the "
+                   "stick by hand before distributing it")
+            return 0
     if h.hexdigest() == want_digest(x):
         x.ok("readback matches the image byte for byte")
     else:
@@ -2572,13 +2710,14 @@ lifecycle
   templates        build the five investigator templates
   iso              build, checksum and sign the ISO
   all              templates, then the ISO
+  sign             sign an image on the machine that holds the key
   write-usb        verify the image and write it to removable media
   list-kickstarts  show what the fetched Qubes sources offer
 """)
     p.add_argument("action", nargs="?", default="iso",
                    choices=["iso", "templates", "all", "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
-                            "write-usb", "config"],
+                            "write-usb", "config", "sign"],
                    help="what to do (default: iso)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true", help="skip the warning prompt")
@@ -2602,6 +2741,8 @@ lifecycle
     u.add_argument("--device", metavar="/dev/sdX", help="target device")
     u.add_argument("--allow-fixed-disk", action="store_true",
                    help="permit a non-removable target (destroys it)")
+    p.add_argument("--iso", metavar="PATH",
+                   help="sign: the image to sign (default: the built one)")
     c = p.add_argument_group("check-upstream")
     c.add_argument("--update", action="store_true",
                    help="record what upstream currently offers as the new baseline")
@@ -2655,6 +2796,8 @@ lifecycle
             return gen_key(x)
         if args.action == "check-upstream":
             return check_upstream(x)
+        if args.action == "sign":
+            return sign_iso(x)
         if args.action == "write-usb":
             return write_usb(x)
 
@@ -2666,6 +2809,7 @@ lifecycle
             print(f"  @QUBES_TEMPLATES@ marker: {'PRESENT' if marker else 'ABSENT'}")
             return 0
 
+        resolve_auto_values(x)
         payload = preflight(x, tier2)
         if not x.done("builder") or args.dry_run:
             setup_builder(x)

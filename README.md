@@ -135,7 +135,11 @@ Most of those steps are now commands or timers.
 | Merge duplicate `templates:`/`components:` blocks in builder.yml by hand | merged properly, then verified with `qb config get-var` |
 | Re-verify three signing keys and a version, monthly, from the docs | `./build_iso.py check-upstream`, weekly in CI, with a committed baseline |
 | Read the Qubes bulletin list and decide whether to rebuild | the same command classifies new bulletins by whether they touch dom0/Xen |
-| `dd` to a device you hope is the right one | `./build_iso.py write-usb` — verifies the signature, refuses fixed disks, reads the stick back |
+| `dd` to a device you hope is the right one | `./build_iso.py write-usb` — verifies the signature, refuses fixed disks, reads the stick back (elevating if it must) |
+| "Build unsigned and sign afterwards on the machine that holds the key" | `./build_iso.py sign` — re-checksums, signs, and regenerates everything that travels with the signature |
+| Compare the printed fingerprint against the one you were given, by eye | `./verify-iso.sh <fingerprint>` compares them and exits non-zero |
+| Pick a `work_dir` "somewhere with 250 GB free" | `--set work_dir=auto` |
+| Decide whether this machine has the RAM for a local SIEM | `wazuh.mode: auto` |
 | Three verification commands emailed to colleagues | `verify-iso.sh` and `FINGERPRINT.txt`, generated beside the image |
 | "Confirm by hand the four things the tests cannot check" | acceptance-test group 13 |
 | Read credentials.json, rotate four secrets in a web UI, escrow, `shred -u` | `--rotate-credentials`, `--escrow-credentials`, `--shred-credentials` — or `--handover` for all three |

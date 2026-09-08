@@ -131,7 +131,21 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
 - `--refresh-repo-keys` re-fetches and re-verifies the pinned Zeek, Kali and
   Wazuh keys, rolling back if a fetched key does not match its fingerprint.
 - `check-upstream` performs the independent keyserver cross-check
-  docs/VERIFICATION.md asks for, on every run rather than "on first build".
+  docs/VERIFICATION.md asks for, on every run rather than "on first build";
+  the Monday CI job runs it with `--update` so the baseline moves with the
+  world while the exit code still reflects the findings.
+- `./build_iso.py sign` replaces the three commands SIGNING.md gave for a key
+  on a smartcard or another machine, and regenerates the checksum, public key,
+  fingerprint sheet and verify-iso.sh that those three left stale.
+- `verify-iso.sh <fingerprint>` compares the signer against the fingerprint the
+  colleague was given out of band, instead of asking them to do it by eye.
+- `work_dir: auto` picks the largest writable filesystem with room for the
+  build; `wazuh.mode: auto` decides local-or-central from the machine's RAM.
+- Acceptance group 13 asserts the five dom0 maintenance timers are enabled. A
+  laptop could otherwise be issued with no backups, no updates and no
+  self-checks, and pass — phase 10 only warns when it cannot enable one.
+- The key-expiry watch raises a login banner naming
+  `--refresh-repo-keys`, rather than only writing to the journal.
 - `CREDENTIALS-README.txt` described a four-part manual rotation that
   `--rotate-credentials` had replaced, and told the operator to hand-write the
   files the tooling now writes.

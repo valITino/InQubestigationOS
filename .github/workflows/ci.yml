@@ -41,4 +41,18 @@ jobs:
         with:
           python-version: "3.13"
       - name: Compare pinned keys and versions against upstream
-        run: ./build_iso.py check-upstream
+        # --update on the scheduled run so the baseline moves forward with the
+        # world; the exit code still reflects the findings, so a rotated key or
+        # a dom0 security bulletin fails the job either way.
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ./build_iso.py check-upstream --update
+          else
+            ./build_iso.py check-upstream
+          fi
+      - name: Upload the refreshed baseline
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-lock
+          path: supply-chain.lock.json

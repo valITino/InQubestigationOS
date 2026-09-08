@@ -164,7 +164,13 @@ DEFAULT_CONFIG: dict = {
         # templates update weekly, so an unpinned agent WILL overtake the
         # manager and every agent stops reporting. Do not disable casually.
         "pin_agent": True,
-        "mode": "local",            # "local" | "central"
+        # "local"   — a wazuh-srv qube on this machine.
+        # "central"  — agents report to central_address instead.
+        # "auto"     — local if the machine has the RAM for it (phase 1 already
+        #              measures that), central otherwise, and it says which it
+        #              chose. A 16 GB laptop running a local indexer is a laptop
+        #              that swaps during casework.
+        "mode": "local",            # "local" | "central" | "auto"
         "central_address": "",
         "ip": "10.137.0.50",
         "port_events": 1514,
@@ -651,8 +657,25 @@ class Provisioner:
                           if l.startswith("MemTotal")).split()[1])
             gb = kb // 1024 // 1024
             o.info(f"system RAM: {gb}G")
-            if gb < 16:
-                o.warn("under 16G RAM — use wazuh.mode='central' rather than a local SIEM qube")
+            if self.c["wazuh"]["mode"] == "auto":
+                if gb >= 16:
+                    self.c["wazuh"]["mode"] = "local"
+                    o.ok(f"wazuh.mode=auto resolved to 'local' ({gb}G RAM)")
+                elif self.c["wazuh"]["central_address"]:
+                    self.c["wazuh"]["mode"] = "central"
+                    o.ok(f"wazuh.mode=auto resolved to 'central' ({gb}G RAM) — "
+                         f"agents will report to "
+                         f"{self.c['wazuh']['central_address']}")
+                else:
+                    raise Fatal(
+                        f"wazuh.mode is 'auto' and this machine has {gb}G RAM, "
+                        f"which is too little for a local indexer.\n"
+                        "     Set wazuh.central_address to a central manager, or "
+                        "force wazuh.mode='local'\n     and accept that the SIEM "
+                        "will compete with casework for memory.")
+            elif gb < 16 and self.c["wazuh"]["mode"] == "local":
+                o.warn("under 16G RAM with a local SIEM qube — consider "
+                       "wazuh.mode='central', or 'auto' to decide per machine")
         except (OSError, StopIteration, ValueError):
             pass
 
@@ -2944,6 +2967,18 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
 
         # 6. The backup profile schema is accepted.
         self._t_backup_profile()
+
+        # 6b. The maintenance this laptop is supposed to do for itself. Phase 10
+        #     warns when it cannot enable a timer, and a warning does not block —
+        #     so a laptop could be issued with no backups, no updates and no
+        #     self-checks, and pass.
+        for unit in ("golden-backup.timer", "golden-template-update.timer",
+                     "golden-selfcheck.timer", "golden-restore-test.timer",
+                     "golden-staleness.timer"):
+            on = r.quiet("systemctl", "is-enabled", unit)
+            self._t("pass" if on else "fail",
+                    f"{unit} is enabled" if on else
+                    f"{unit} is NOT enabled — this machine will not maintain itself")
 
         # 7. Wi-Fi. Drivers come from the dom0 kernel but firmware comes from the
         #    Debian template, and that is the one place the Debian switch bites.

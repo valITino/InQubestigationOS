@@ -33,12 +33,16 @@ happens there. The script checks this before starting a multi-hour build:
 
     gpg --list-secret-keys <fingerprint>
 
-If the key lives on a smartcard or a different machine, build unsigned and sign
-afterwards on the machine that holds it:
+If the key lives on a smartcard or a different machine, build unsigned, copy the
+image to the machine that holds the key, and sign it there:
 
-    gpg --local-user <fingerprint> --detach-sign --armor \
-        --output InQubestigationOS.iso.asc \
-        InQubestigationOS.iso
+    ./build_iso.py sign --iso /path/to/InQubestigationOS.iso --use-key <fingerprint>
+
+That re-checksums the image and refuses if it no longer matches its `.sha256` —
+an image that changed after it was built must not be signed — then signs it and
+regenerates everything that travels with the signature: the checksum file, the
+exported public key, `verify-iso.sh` and `FINGERPRINT.txt`. Doing it as three
+commands by hand left those four stale.
 
 ## Creating the key, if you have not yet
 
