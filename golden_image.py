@@ -2293,12 +2293,21 @@ systemctl start {unit}.mount 2>/dev/null || true
 # Golden image — weekly updates. Templates first; dom0 is reported, never
 # applied unattended, because a dom0 update can require a reboot and an
 # investigator's laptop is not the place to discover that at 02:00.
+#
+# Which updater exists, and which flags it takes, varies across 4.3 point
+# releases — so ask, rather than assume, exactly as the firewall code asks
+# about 'qvm-firewall reset'.
 set -u
 if command -v qubes-vm-update >/dev/null; then
-    qubes-vm-update --all --show-output 2>&1 | logger -t golden-image
-else
+    opts=""
+    qubes-vm-update --help 2>&1 | grep -q -- --show-output && \
+        opts="$opts --show-output"
+    qubes-vm-update --all $opts 2>&1 | logger -t golden-image
+elif command -v qubesctl >/dev/null; then
     qubesctl --show-output --skip-dom0 --templates state.sls update.qubes-vm \
         2>&1 | logger -t golden-image
+else
+    logger -t golden-image "no template updater found — update by hand"
 fi
 if qubes-dom0-update --check-only >/dev/null 2>&1; then
     logger -t golden-image "dom0 updates are available — apply them by hand"
@@ -2347,7 +2356,6 @@ fi
 # the qubes appear, then delete them.
 set -u
 PROFILE=golden-image
-PREFIX=restoretest-
 LOG=/var/log/golden-image-restore-test.log
 exec >> "$LOG" 2>&1
 echo "=== $(date '+%F %T') restore verification"
@@ -2362,10 +2370,13 @@ if [ -z "$SET" ]; then
 fi
 echo "set: $SET"
 
-# vault is small and offline, so it is the cheapest meaningful proof that the
-# passphrase, the media and the archive all still work together.
-if qvm-backup-restore --passphrase-file /root/.backup-pass \
-       --rename-conflicting --verify-only "$DEST_VM:$SET" vault; then
+# --verify-only reads the whole archive and checks its integrity without
+# creating a single qube, so this is safe to run unattended on a working
+# machine. vault is small and offline: the cheapest meaningful proof that the
+# passphrase, the media and the archive still work together.
+#   -d names the qube holding the backup; the positional is the path within it.
+if qvm-backup-restore --verify-only -d "$DEST_VM" \
+       --passphrase-file /root/.backup-pass "$SET" vault; then
     logger -t golden-image "restore test PASSED for $SET"
     rm -f /etc/motd.d/golden-image-restore
 else
@@ -2374,9 +2385,6 @@ else
     echo "  *** BACKUP RESTORE VERIFICATION FAILED — see $LOG ***" \
         > /etc/motd.d/golden-image-restore
 fi
-for vm in $(qvm-ls --raw-list | grep "^$PREFIX" || true); do
-    qvm-remove -f "$vm" || true
-done
 """)
 
         self._dom0_unit(
