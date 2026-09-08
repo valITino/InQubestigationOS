@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InQubestigationOS — design specification</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F6F7F5; --panel:#FFFFFF; --panel-2:#FBFCFA;
+  --ink:#131D18; --ink-2:#48544D; --ink-3:#88938C; --ink-4:#B2BAB5;
+  --line:#DFE4E0; --line-2:#EDF0EE;
+  --code-bg:#0E1512; --code-tx:#DCE7E0; --code-cm:#7FA48D; --code-hl:#F0C674;
+  --z-red:#AB2318; --z-orange:#BE640B; --z-yellow:#B08C05; --z-green:#2A7742;
+  --z-blue:#20629F; --z-purple:#663A99; --z-gray:#57616C; --z-black:#171717;
+  --ok-bg:#EAF4EC; --ok-bd:#2A7742;
+  --warn-bg:#FBF2E1; --warn-bd:#BE640B;
+  --fix-bg:#FBECEA; --fix-bd:#AB2318;
+  --note-bg:#E9F1F8; --note-bd:#20629F;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  background:var(--paper);color:var(--ink);
+  font:400 16px/1.68 "IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  padding:0 22px 96px;
+  font-feature-settings:"kern","liga";
+  text-rendering:optimizeLegibility;
+}
+.wrap{max-width:1080px;margin:0 auto}
+code,pre,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,monospace}
+code{font-size:.88em;background:var(--line-2);padding:.1em .35em;border-radius:3px}
+pre code{background:none;padding:0}
+
+h1{font-size:37px;font-weight:600;line-height:1.14;letter-spacing:-.022em}
+h2{font-size:25px;font-weight:600;margin:76px 0 4px;letter-spacing:-.016em;scroll-margin-top:20px}
+h2 .num{color:var(--ink-4);font-weight:500;margin-right:.5em;font-family:"IBM Plex Mono",monospace;font-size:.72em;letter-spacing:0}
+h3{font-size:17.5px;font-weight:600;margin:34px 0 6px;letter-spacing:-.008em}
+h4{font-size:15px;font-weight:600;margin:22px 0 4px;color:var(--ink-2)}
+p{max-width:74ch;margin:11px 0}
+.lede{font-size:18px;line-height:1.6;color:var(--ink-2);max-width:70ch}
+.section-note{color:var(--ink-2);font-size:15.5px;max-width:74ch;margin:10px 0 20px}
+.sub{font-size:14.5px;color:var(--ink-2);max-width:76ch}
+a{color:var(--z-blue);text-decoration-thickness:1px;text-underline-offset:2px}
+
+/* ── Masthead ───────────────────────────────────────────── */
+.masthead{border-bottom:3px solid var(--ink);padding:48px 0 26px}
+.doc-id{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--ink-2);
+  letter-spacing:.04em;margin-bottom:16px;text-transform:uppercase}
+.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:22px}
+.chip{font-family:"IBM Plex Mono",monospace;font-size:12px;border:1px solid var(--line);
+  background:var(--panel);border-radius:4px;padding:4px 9px;color:var(--ink-3);white-space:nowrap}
+.chip strong{color:var(--ink);font-weight:500}
+.chip.ok{border-color:var(--ok-bd);background:var(--ok-bg)}
+.chip.ok strong{color:#1D5730}
+
+/* ── Nav ────────────────────────────────────────────────── */
+nav.toc{margin:26px 0 0;padding:16px 0 0;border-top:1px solid var(--line)}
+nav.toc ol{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:2px 26px;counter-reset:t}
+nav.toc a{display:block;padding:3px 0;font-size:14px;color:var(--ink-2);text-decoration:none;border-bottom:1px solid transparent}
+nav.toc a:hover{color:var(--ink);border-bottom-color:var(--line)}
+nav.toc a::before{counter-increment:t;content:counter(t,decimal-leading-zero);
+  font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--ink-4);margin-right:9px}
+
+/* ── Zone system ────────────────────────────────────────── */
+.zone{border-left:5px solid var(--z-gray)}
+.zc-red{border-left-color:var(--z-red)} .zc-orange{border-left-color:var(--z-orange)}
+.zc-yellow{border-left-color:var(--z-yellow)} .zc-green{border-left-color:var(--z-green)}
+.zc-blue{border-left-color:var(--z-blue)} .zc-purple{border-left-color:var(--z-purple)}
+.zc-gray{border-left-color:var(--z-gray)} .zc-black{border-left-color:var(--z-black)}
+.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(238px,1fr));gap:9px;margin:20px 0 4px}
+.legend .zone{background:var(--panel);border:1px solid var(--line);border-left-width:5px;
+  border-radius:0 6px 6px 0;padding:11px 14px}
+.zname{font-weight:600;font-size:14.5px;letter-spacing:-.005em}
+.zdesc{font-size:13.5px;color:var(--ink-2);margin-top:1px}
+.zq{font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--ink-3);margin-top:4px;line-height:1.45}
+
+/* ── Cards & hops ───────────────────────────────────────── */
+.card{background:var(--panel);border:1px solid var(--line);border-left-width:5px;
+  border-radius:0 8px 8px 0;padding:17px 21px;margin:13px 0}
+.hopgrid{counter-reset:hop;display:grid;gap:11px;margin-top:18px}
+.hop{position:relative;padding-left:68px}
+.hop::before{counter-increment:hop;content:counter(hop);position:absolute;left:19px;top:17px;
+  width:32px;height:32px;border:2px solid var(--ink);border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font:500 15px "IBM Plex Mono",monospace;background:var(--panel)}
+.hop h3{margin:0 0 3px;font-family:"IBM Plex Mono",monospace;font-size:16px}
+.hop .role{font-size:14.5px;color:var(--ink-2);max-width:70ch}
+.hop .facts{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--ink-3);
+  margin-top:7px;line-height:1.5}
+
+/* ── Tables ─────────────────────────────────────────────── */
+.tw{overflow-x:auto;margin:16px 0}
+table{width:100%;border-collapse:collapse;background:var(--panel);
+  border:1px solid var(--line);font-size:14.5px;min-width:520px}
+th{font-weight:600;text-align:left;border-bottom:2px solid var(--ink);
+  padding:10px 12px;font-size:13px;letter-spacing:.01em;background:var(--panel-2)}
+td{border-bottom:1px solid var(--line-2);padding:9px 12px;vertical-align:top}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--panel-2)}
+td.qn{font-family:"IBM Plex Mono",monospace;font-size:12.5px;white-space:nowrap;
+  border-left:5px solid var(--z-gray);font-weight:500}
+.ok{color:var(--z-green);font-weight:600}
+.no{color:var(--z-red);font-weight:600}
+.via{color:var(--z-purple);font-weight:600}
+.dim{color:var(--ink-3)}
+
+/* ── Code ───────────────────────────────────────────────── */
+.filehead{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--ink-2);
+  background:var(--panel);border:1px solid var(--line);border-bottom:none;
+  border-radius:6px 6px 0 0;display:inline-block;padding:5px 12px;margin:16px 0 0}
+.filehead + pre.conf{margin-top:0;border-top-left-radius:0}
+pre.conf{background:var(--code-bg);color:var(--code-tx);border-radius:8px;
+  padding:15px 18px;font-size:12.8px;line-height:1.6;overflow-x:auto;margin:12px 0}
+pre.conf .cm{color:var(--code-cm)}
+pre.conf .hl{color:var(--code-hl)}
+
+/* ── Callouts ───────────────────────────────────────────── */
+.cal{border:1px solid;border-left-width:5px;border-radius:0 8px 8px 0;
+  padding:14px 18px;margin:20px 0}
+.cal .ct{font-weight:600;font-size:14.5px;margin-bottom:3px;display:flex;align-items:baseline;gap:8px}
+.cal .ct .tag{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.06em;
+  text-transform:uppercase;padding:2px 6px;border-radius:3px;font-weight:600}
+.cal p{font-size:14.5px;max-width:74ch}
+.cal p:first-of-type{margin-top:5px}
+.warn{background:var(--warn-bg);border-color:var(--warn-bd)}
+.warn .ct{color:#7A4208} .warn .tag{background:var(--warn-bd);color:#fff}
+.fix{background:var(--fix-bg);border-color:var(--fix-bd)}
+.fix .ct{color:#7E1A11} .fix .tag{background:var(--fix-bd);color:#fff}
+.note{background:var(--note-bg);border-color:var(--note-bd)}
+.note .ct{color:#154B79} .note .tag{background:var(--note-bd);color:#fff}
+.good{background:var(--ok-bg);border-color:var(--ok-bd)}
+.good .ct{color:#1D5730} .good .tag{background:var(--ok-bd);color:#fff}
+
+/* ── Checklists ─────────────────────────────────────────── */
+ul.checks{list-style:none;margin:14px 0}
+ul.checks li{padding:8px 0 8px 30px;position:relative;border-bottom:1px solid var(--line-2);
+  max-width:82ch;font-size:14.5px}
+ul.checks li::before{content:"";position:absolute;left:2px;top:13px;width:13px;height:13px;
+  border:2px solid var(--ink-3);border-radius:3px}
+ul.plain{list-style:none;margin:10px 0}
+ul.plain li{padding:4px 0 4px 18px;position:relative;font-size:14.5px;max-width:76ch}
+ul.plain li::before{content:"—";position:absolute;left:0;color:var(--ink-4)}
+
+/* ── Figures ────────────────────────────────────────────── */
+figure{margin:22px 0}
+figure .frame{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}
+figcaption{font-size:13.5px;color:var(--ink-2);margin-top:9px;max-width:82ch}
+pre.mermaid{background:var(--panel);font-size:12.5px;line-height:1.5;color:var(--ink-2);
+  border:1px solid var(--line);border-radius:8px;padding:16px;overflow-x:auto}
+
+hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
+
+@media print{
+  body{padding:0;background:#fff;font-size:10.5pt}
+  nav.toc{display:none}
+  pre.conf{background:#F2F4F2;color:#1a1a1a;border:1px solid var(--line)}
+  pre.conf .cm{color:#5c7a68} pre.conf .hl{color:#8a6d1f}
+  .masthead{padding-top:0}
+  h2{page-break-after:avoid;margin-top:34px}
+  .card,figure,table,pre.conf,.cal,.hop{page-break-inside:avoid}
+  a{text-decoration:none;color:var(--ink)}
+}
+@media (max-width:760px){
+  body{padding:0 15px 60px} h1{font-size:28px} h2{font-size:21px;margin-top:52px}
+  .hop{padding-left:58px} .hop::before{left:14px}
+  .lede{font-size:16.5px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <div class="doc-id">Kapo Cyber · Build specification · v2.1 · 2026-09-01</div>
+  <h1>InQubestigationOS<br><span style='font-size:.62em;font-weight:500;color:var(--ink-2)'>Cybercrime investigator workstation</span></h1>
+  <p class="lede" style="margin-top:16px">Reference design and verified build for the team-standard laptop. One inspected road for every clearnet connection, one anonymous road for Tor, endpoint telemetry in every compartment, reproducible from a stock installer or a custom ISO.</p>
+  <div class="chips">
+    <span class="chip">repo <strong>InQubestigationOS</strong></span>
+    <span class="chip">base <strong>Qubes OS 4.3.1</strong></span>
+    <span class="chip">dom0 <strong>Fedora 41 · Xen 4.19</strong></span>
+    <span class="chip ok">estate <strong>Debian 13 everywhere else</strong></span>
+    <span class="chip">siem <strong>Wazuh 4.14.7, agent in every template</strong></span>
+    <span class="chip ok">verified <strong>2026-09-01 · 58/58 checks</strong></span>
+  </div>
+
+  <nav class="toc">
+    <ol>
+      <li><a href="#zones">How to read this</a></li>
+      <li><a href="#policy">Distribution policy</a></li>
+      <li><a href="#topology">Network topology</a></li>
+      <li><a href="#chain">The egress chain</a></li>
+      <li><a href="#templates">Template inventory</a></li>
+      <li><a href="#qubes">Qube inventory</a></li>
+      <li><a href="#firewall">Firewall implementation</a></li>
+      <li><a href="#configs">Middlebox configuration</a></li>
+      <li><a href="#siem">Wazuh SIEM</a></li>
+      <li><a href="#packet">Life of a packet</a></li>
+      <li><a href="#backup">Weekly backup</a></li>
+      <li><a href="#supply">Supply chain</a></li>
+      <li><a href="#deploy">Deployment</a></li>
+      <li><a href="#corrections">Corrections log</a></li>
+      <li><a href="#verify">Open verification</a></li>
+    </ol>
+  </nav>
+</header>
+
+<h2 id="zones"><span class="num">01</span>How to read this document</h2>
+<p class="section-note">Qubes paints every window border with its qube's trust colour. This document reuses that exact system: the coloured edge on a card, a table row, or a diagram node tells you which trust zone it belongs to. If a colleague learns nothing else from this page, the colours on screen and the colours here mean the same thing.</p>
+<div class="legend">
+  <div class="zone zc-red"><div class="zname">red — hostile edge</div><div class="zdesc">Touches raw outside input</div><div class="zq">sys-net · sys-usb · untrusted · dvm-offline</div></div>
+  <div class="zone zc-orange"><div class="zname">orange — inspection stack</div><div class="zdesc">Middleboxes every packet crosses</div><div class="zq">sys-proxy · sys-ids · sys-dpi · sys-firewall</div></div>
+  <div class="zone zc-yellow"><div class="zname">yellow — exposed tooling</div><div class="zdesc">Attack tools, clearnet exit</div><div class="zq">kali-clear</div></div>
+  <div class="zone zc-purple"><div class="zname">purple — anonymity branch</div><div class="zdesc">Torified, never attributed</div><div class="zq">sys-whonix · kali-tor · anon-whonix</div></div>
+  <div class="zone zc-blue"><div class="zname">blue — monitoring</div><div class="zdesc">Sees everything, touched rarely</div><div class="zq">wazuh-srv</div></div>
+  <div class="zone zc-green"><div class="zname">green — daily work</div><div class="zdesc">Office, mail, admin</div><div class="zq">personal · work</div></div>
+  <div class="zone zc-gray"><div class="zname">gray — casework</div><div class="zdesc">One qube per investigation</div><div class="zq">case-*</div></div>
+  <div class="zone zc-black"><div class="zname">black — offline vault</div><div class="zdesc">No network interface exists</div><div class="zq">vault · dom0</div></div>
+</div>
+
+<p class="sub" style="margin-top:18px">Callouts carry a fixed meaning throughout:</p>
+<div class="cal note"><div class="ct"><span class="tag">verified</span> Confirmed against a primary source</div>
+<p>Official Qubes documentation, a QubesOS repository, or vendor documentation, checked on 2026-09-01. The source is named.</p></div>
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> This was wrong in an earlier revision</div>
+<p>A defect found during verification, with what it would have broken. Recorded rather than quietly patched, so nobody reintroduces it.</p></div>
+<div class="cal warn"><div class="ct"><span class="tag">decision</span> A trade-off someone must own</div>
+<p>Not a bug — a choice with consequences. Sign off on it deliberately.</p></div>
+
+<h2 id="policy"><span class="num">02</span>Distribution policy: Debian everywhere possible</h2>
+<div class="cal note"><div class="ct"><span class="tag">verified</span> dom0 is Fedora and cannot be changed</div>
+<p>Qubes OS builds dom0 on Fedora and ships no Debian dom0. On 4.3 that is Fedora 41. This is architecture, not a setting — there is no flag, no build option. Everything the image actually <em>runs</em>, however, is Debian.</p></div>
+
+<div class="tw"><table>
+  <tr><th>Component</th><th>Distribution</th><th>Note</th></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-black)">dom0</td><td>Fedora 41</td><td class="dim">Fixed by Qubes. Not changeable.</td></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-orange)">tpl-sys → sys-net, sys-firewall, sys-usb</td><td class="ok">Debian 13</td><td>Changed from Fedora in this revision</td></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-orange)">tpl-proxy, tpl-ids</td><td class="ok">Debian 13</td><td>Cloned from <code>debian-13-xfce</code></td></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-yellow)">tpl-kali, tpl-personal, tpl-wazuh</td><td class="ok">Debian 13</td><td>Cloned from <code>debian-13-xfce</code></td></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-purple)">sys-whonix, anon-whonix, kali-tor</td><td class="ok">Debian 13</td><td>Whonix 18 is built on Debian trixie</td></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-gray)">ISO build host</td><td class="ok">Debian 13 preferred</td><td>Fedora also supported by qubes-builderv2</td></tr>
+</table></div>
+
+<h3>Why Debian service qubes are safe</h3>
+<p>Verified against upstream rather than assumed. The Qubes Debian template installs <code>qubes-vm-recommended</code>, which depends on <code>qubes-core-agent-networking</code>, <code>qubes-core-agent-network-manager</code> and <code>qubes-usb-proxy</code> — exactly what <code>sys-net</code>, <code>sys-firewall</code> and <code>sys-usb</code> need. The template's own package list carries <code>firmware-linux</code>, <code>network-manager</code> and <code>nftables</code>. The provisioner installs these explicitly anyway, so a <em>minimal</em> Debian base works too.</p>
+
+<div class="cal warn"><div class="ct"><span class="tag">decision</span> Check Wi-Fi on the issued NIC before rollout</div>
+<p>Qubes gives most qubes a dom0-provided kernel, so NIC <em>drivers</em> come from Fedora regardless. Firmware blobs, however, are read from the template filesystem. <code>debian-13-xfce</code> is built with the firmware option and the provisioner adds <code>firmware-linux</code> and <code>firmware-iwlwifi</code>, but Debian firmware can lag Fedora's. This is the one place the Debian switch could bite. Test it on the actual laptop model.</p></div>
+
+<p>What this buys: one distribution across the estate, one package manager, one update cadence, one Wazuh repository type, one advisory feed. The dnf path is gone from the provisioner except for the Fedora template itself, which is now optional (<code>use_fedora_template</code> defaults to false — it still receives an agent, since the requirement was an agent in <em>every</em> template).</p>
+
+<h2 id="topology"><span class="num">03</span>Network topology</h2>
+<p class="section-note">The one rule of this image: <strong>there is exactly one road to the internet, and it runs through four orange checkpoints.</strong> Every clearnet qube — office, casework, tooling, even the SIEM — has <code>sys-proxy</code> as its netvm and no way around it. The single exception is the purple branch: Tor traffic joins at <code>sys-firewall</code>, bypassing proxy, IPS and DPI, because inspecting Tor is pointless and logging it against your own identity is harmful.</p>
+
+<figure>
+<div class="frame">
+<svg viewBox="0 0 1020 700" width="100%" role="img" aria-label="Golden image network topology" font-family="IBM Plex Sans, sans-serif">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="380" y="18" width="260" height="52" rx="26" fill="none" stroke="#57616C" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="510" y="45" text-anchor="middle" font-size="16" font-weight="600" fill="#131D18">Internet</text>
+  <text x="510" y="61" text-anchor="middle" font-size="11.5" fill="#88938C">clearnet · Tor network</text>
+
+  <text x="330" y="106" text-anchor="end" font-size="11.5" fill="#88938C">single egress road</text>
+
+  <g>
+    <rect x="385" y="92" width="250" height="54" rx="6" fill="#FBECEA" stroke="#AB2318" stroke-width="1.4"/>
+    <rect x="385" y="92" width="6" height="54" fill="#AB2318"/>
+    <text x="514" y="114" text-anchor="middle" font-size="14.5" font-weight="600" fill="#7E1A11" font-family="IBM Plex Mono, monospace">sys-net</text>
+    <text x="514" y="132" text-anchor="middle" font-size="11.5" fill="#9A4038">NIC · DHCP · untrusted edge</text>
+  </g>
+  <line x1="510" y1="92" x2="510" y2="74" stroke="#57616C" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <g>
+    <rect x="385" y="176" width="250" height="54" rx="6" fill="#FBF2E1" stroke="#BE640B" stroke-width="1.4"/>
+    <rect x="385" y="176" width="6" height="54" fill="#BE640B"/>
+    <text x="514" y="198" text-anchor="middle" font-size="14.5" font-weight="600" fill="#7A4208" font-family="IBM Plex Mono, monospace">sys-firewall</text>
+    <text x="514" y="216" text-anchor="middle" font-size="11.5" fill="#9A6428">dnat-dns → unbound → DoT 9.9.9.9</text>
+  </g>
+  <line x1="510" y1="176" x2="510" y2="150" stroke="#57616C" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <g>
+    <rect x="385" y="260" width="250" height="54" rx="6" fill="#FBF2E1" stroke="#BE640B" stroke-width="1.4"/>
+    <rect x="385" y="260" width="6" height="54" fill="#BE640B"/>
+    <text x="514" y="282" text-anchor="middle" font-size="14.5" font-weight="600" fill="#7A4208" font-family="IBM Plex Mono, monospace">sys-dpi</text>
+    <text x="514" y="300" text-anchor="middle" font-size="11.5" fill="#9A6428">Zeek 8.0 · conn/dns/TLS · file hashes</text>
+  </g>
+  <line x1="510" y1="260" x2="510" y2="234" stroke="#57616C" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <g>
+    <rect x="385" y="344" width="250" height="54" rx="6" fill="#FBF2E1" stroke="#BE640B" stroke-width="1.4"/>
+    <rect x="385" y="344" width="6" height="54" fill="#BE640B"/>
+    <text x="514" y="366" text-anchor="middle" font-size="14.5" font-weight="600" fill="#7A4208" font-family="IBM Plex Mono, monospace">sys-ids</text>
+    <text x="514" y="384" text-anchor="middle" font-size="11.5" fill="#9A6428">Suricata inline · NFQUEUE · fail-closed</text>
+  </g>
+  <line x1="510" y1="344" x2="510" y2="318" stroke="#57616C" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <g>
+    <rect x="385" y="428" width="250" height="54" rx="6" fill="#FBF2E1" stroke="#BE640B" stroke-width="1.4"/>
+    <rect x="385" y="428" width="6" height="54" fill="#BE640B"/>
+    <text x="514" y="450" text-anchor="middle" font-size="14.5" font-weight="600" fill="#7A4208" font-family="IBM Plex Mono, monospace">sys-proxy</text>
+    <text x="514" y="468" text-anchor="middle" font-size="11.5" fill="#9A6428">Squid intercept · per-qube attribution</text>
+  </g>
+  <line x1="510" y1="428" x2="510" y2="402" stroke="#57616C" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <line x1="120" y1="520" x2="900" y2="520" stroke="#B2BAB5" stroke-width="1.4"/>
+  <line x1="510" y1="520" x2="510" y2="486" stroke="#57616C" stroke-width="1.6" marker-end="url(#ah)"/>
+  <text x="906" y="518" font-size="11" fill="#88938C">netvm =</text>
+  <text x="906" y="532" font-size="11" fill="#88938C" font-family="IBM Plex Mono, monospace">sys-proxy</text>
+
+  <g>
+    <line x1="165" y1="548" x2="165" y2="520" stroke="#B2BAB5" stroke-width="1.2"/>
+    <rect x="110" y="548" width="110" height="50" rx="6" fill="#EAF4EC" stroke="#2A7742" stroke-width="1.3"/>
+    <rect x="110" y="548" width="5" height="50" fill="#2A7742"/>
+    <text x="167" y="569" text-anchor="middle" font-size="13" font-weight="600" fill="#1D5730" font-family="IBM Plex Mono, monospace">personal</text>
+    <text x="167" y="585" text-anchor="middle" font-size="10.5" fill="#3F7A52">LibreOffice</text>
+  </g>
+  <g>
+    <line x1="290" y1="548" x2="290" y2="520" stroke="#B2BAB5" stroke-width="1.2"/>
+    <rect x="235" y="548" width="110" height="50" rx="6" fill="#EAF4EC" stroke="#2A7742" stroke-width="1.3"/>
+    <rect x="235" y="548" width="5" height="50" fill="#2A7742"/>
+    <text x="292" y="569" text-anchor="middle" font-size="13" font-weight="600" fill="#1D5730" font-family="IBM Plex Mono, monospace">work</text>
+    <text x="292" y="585" text-anchor="middle" font-size="10.5" fill="#3F7A52">admin · dashboard</text>
+  </g>
+  <g>
+    <line x1="415" y1="548" x2="415" y2="520" stroke="#B2BAB5" stroke-width="1.2"/>
+    <rect x="360" y="548" width="110" height="50" rx="6" fill="#EFF1F0" stroke="#57616C" stroke-width="1.3"/>
+    <rect x="360" y="548" width="5" height="50" fill="#57616C"/>
+    <text x="417" y="569" text-anchor="middle" font-size="13" font-weight="600" fill="#39424A" font-family="IBM Plex Mono, monospace">case-*</text>
+    <text x="417" y="585" text-anchor="middle" font-size="10.5" fill="#6B747C">one per case</text>
+  </g>
+  <g>
+    <line x1="540" y1="548" x2="540" y2="520" stroke="#B2BAB5" stroke-width="1.2"/>
+    <rect x="485" y="548" width="110" height="50" rx="6" fill="#FBF6E0" stroke="#B08C05" stroke-width="1.3"/>
+    <rect x="485" y="548" width="5" height="50" fill="#B08C05"/>
+    <text x="542" y="569" text-anchor="middle" font-size="13" font-weight="600" fill="#6E5905" font-family="IBM Plex Mono, monospace">kali-clear</text>
+    <text x="542" y="585" text-anchor="middle" font-size="10.5" fill="#8C7620">scans · Maltego</text>
+  </g>
+  <g>
+    <line x1="665" y1="548" x2="665" y2="520" stroke="#B2BAB5" stroke-width="1.2"/>
+    <rect x="610" y="548" width="110" height="50" rx="6" fill="#FBECEA" stroke="#AB2318" stroke-width="1.3"/>
+    <rect x="610" y="548" width="5" height="50" fill="#AB2318"/>
+    <text x="667" y="569" text-anchor="middle" font-size="13" font-weight="600" fill="#7E1A11" font-family="IBM Plex Mono, monospace">untrusted</text>
+    <text x="667" y="585" text-anchor="middle" font-size="10.5" fill="#9A4038">junk browsing</text>
+  </g>
+  <g>
+    <line x1="790" y1="548" x2="790" y2="520" stroke="#B2BAB5" stroke-width="1.2"/>
+    <rect x="735" y="548" width="110" height="50" rx="6" fill="#E9F1F8" stroke="#20629F" stroke-width="1.3"/>
+    <rect x="735" y="548" width="5" height="50" fill="#20629F"/>
+    <text x="792" y="569" text-anchor="middle" font-size="13" font-weight="600" fill="#154B79" font-family="IBM Plex Mono, monospace">wazuh-srv</text>
+    <text x="792" y="585" text-anchor="middle" font-size="10.5" fill="#3D6E9E">SIEM · standalone</text>
+  </g>
+
+  <g>
+    <rect x="742" y="176" width="220" height="54" rx="6" fill="#F1EAF8" stroke="#663A99" stroke-width="1.4"/>
+    <rect x="742" y="176" width="6" height="54" fill="#663A99"/>
+    <text x="854" y="198" text-anchor="middle" font-size="14.5" font-weight="600" fill="#4A2A70" font-family="IBM Plex Mono, monospace">sys-whonix</text>
+    <text x="854" y="216" text-anchor="middle" font-size="11.5" fill="#6E52A0">Tor gateway · DNS inside Tor</text>
+  </g>
+  <path d="M742 203 L660 203" fill="none" stroke="#663A99" stroke-width="1.6"/>
+  <line x1="660" y1="203" x2="641" y2="203" stroke="#663A99" stroke-width="1.6" marker-end="url(#ah)"/>
+  <text x="700" y="194" text-anchor="middle" font-size="10.5" fill="#663A99">joins here — no inspection</text>
+
+  <g>
+    <rect x="742" y="270" width="220" height="50" rx="6" fill="#F1EAF8" stroke="#663A99" stroke-width="1.3"/>
+    <rect x="742" y="270" width="5" height="50" fill="#663A99"/>
+    <text x="854" y="291" text-anchor="middle" font-size="13" font-weight="600" fill="#4A2A70" font-family="IBM Plex Mono, monospace">kali-tor</text>
+    <text x="854" y="307" text-anchor="middle" font-size="10.5" fill="#6E52A0">OSINT · TCP only</text>
+  </g>
+  <line x1="854" y1="270" x2="854" y2="234" stroke="#663A99" stroke-width="1.4" marker-end="url(#ah)"/>
+  <g>
+    <rect x="742" y="344" width="220" height="50" rx="6" fill="#F1EAF8" stroke="#663A99" stroke-width="1.3"/>
+    <rect x="742" y="344" width="5" height="50" fill="#663A99"/>
+    <text x="854" y="365" text-anchor="middle" font-size="13" font-weight="600" fill="#4A2A70" font-family="IBM Plex Mono, monospace">anon-whonix</text>
+    <text x="854" y="381" text-anchor="middle" font-size="10.5" fill="#6E52A0">anonymous browsing</text>
+  </g>
+  <line x1="854" y1="344" x2="854" y2="324" stroke="#663A99" stroke-width="1.4" marker-end="url(#ah)"/>
+
+  <rect x="60" y="176" width="238" height="222" rx="8" fill="none" stroke="#88938C" stroke-width="1.2" stroke-dasharray="6 5"/>
+  <text x="76" y="200" font-size="12" font-weight="600" fill="#57616C">offline — no netvm exists</text>
+  <g>
+    <rect x="82" y="216" width="194" height="46" rx="6" fill="#EBEBEB" stroke="#171717" stroke-width="1.3"/>
+    <rect x="82" y="216" width="5" height="46" fill="#171717"/>
+    <text x="182" y="236" text-anchor="middle" font-size="13" font-weight="600" fill="#171717" font-family="IBM Plex Mono, monospace">vault</text>
+    <text x="182" y="252" text-anchor="middle" font-size="10.5" fill="#57616C">keys · credentials</text>
+  </g>
+  <g>
+    <rect x="82" y="272" width="194" height="46" rx="6" fill="#FBECEA" stroke="#AB2318" stroke-width="1.3"/>
+    <rect x="82" y="272" width="5" height="46" fill="#AB2318"/>
+    <text x="182" y="292" text-anchor="middle" font-size="13" font-weight="600" fill="#7E1A11" font-family="IBM Plex Mono, monospace">dvm-offline</text>
+    <text x="182" y="308" text-anchor="middle" font-size="10.5" fill="#9A4038">evidence opens here</text>
+  </g>
+  <g>
+    <rect x="82" y="328" width="194" height="46" rx="6" fill="#EBEBEB" stroke="#171717" stroke-width="1.3"/>
+    <rect x="82" y="328" width="5" height="46" fill="#171717"/>
+    <text x="182" y="348" text-anchor="middle" font-size="13" font-weight="600" fill="#171717" font-family="IBM Plex Mono, monospace">dom0</text>
+    <text x="182" y="364" text-anchor="middle" font-size="10.5" fill="#57616C">Fedora 41 · backup timer</text>
+  </g>
+
+  <g>
+    <rect x="60" y="428" width="238" height="54" rx="6" fill="#FBECEA" stroke="#AB2318" stroke-width="1.3"/>
+    <rect x="60" y="428" width="5" height="54" fill="#AB2318"/>
+    <text x="181" y="450" text-anchor="middle" font-size="13" font-weight="600" fill="#7E1A11" font-family="IBM Plex Mono, monospace">sys-usb</text>
+    <text x="181" y="468" text-anchor="middle" font-size="10.5" fill="#9A4038">USB isolation · backup disk · no netvm</text>
+  </g>
+
+  <text x="510" y="648" text-anchor="middle" font-size="11.5" fill="#20629F">every qube here runs a Wazuh agent reporting to wazuh-srv:1514 — transport map in §09</text>
+  <text x="510" y="668" text-anchor="middle" font-size="11.5" fill="#88938C">disposables (default-dvm) attach to the app bus like any clearnet qube</text>
+</svg>
+</div>
+<figcaption>Fig. 1 — Golden image topology. The centre spine is the mandatory clearnet road: four orange middleboxes in fixed order. Purple joins above the inspection stack; black and the offline red boxes have no road at all.</figcaption>
+</figure>
+
+<h2 id="chain"><span class="num">04</span>The egress chain, hop by hop</h2>
+<p class="section-note">Order is not cosmetic. The proxy sits first because every Qubes hop NATs — place it later and its logs would show the previous hop's address instead of the originating qube's. Being hop one makes it the attribution record. The IPS sits before the DPI so Zeek only records traffic that was allowed to exist. The firewall sits last as the single choke point owning DNS and segmentation for both branches.</p>
+<div class="hopgrid">
+  <div class="card zone zc-orange hop">
+    <h3>sys-proxy</h3>
+    <div class="role">Transparent Squid intercept. Logs every HTTP request and every TLS connection (SNI only, no decryption) <em>with the originating qube's IP</em> — this hop is the attribution record. Non-web TCP and UDP pass through unmodified but still traverse the rest of the chain.</div>
+    <div class="facts">tpl-proxy · netvm sys-ids · provides_network · 80→3128, 443→3129 · custom-dnat-squid + custom-input</div>
+  </div>
+  <div class="card zone zc-orange hop">
+    <h3>sys-ids</h3>
+    <div class="role">Suricata inline via NFQUEUE with drop verdicts — a real IPS, not a logger. Fail-closed: if Suricata dies the chain stops forwarding rather than passing traffic uninspected. ET Open ruleset, drop policy on high-confidence exploit and C2 categories only.</div>
+    <div class="facts">tpl-ids · netvm sys-dpi · queue num 0 (no bypass) · eve.json → Wazuh</div>
+  </div>
+  <div class="card zone zc-orange hop">
+    <h3>sys-dpi</h3>
+    <div class="role">Zeek 8.0 LTS in passive deep-inspection mode: connection records, DNS, HTTP, TLS fingerprints, SSH, extracted file hashes, x509. This is the flight recorder — when a case asks what a machine talked to in March, the answer lives here and in the SIEM.</div>
+    <div class="facts">tpl-ids · netvm sys-firewall · /opt/zeek · logs → Wazuh</div>
+  </div>
+  <div class="card zone zc-orange hop">
+    <h3>sys-firewall</h3>
+    <div class="role">Single choke point for both branches. Forces every clearnet DNS packet into a local validating resolver speaking DNS-over-TLS to Quad9. Enforces the inter-qube segmentation matrix. The Tor branch attaches here and is exempt from the DNS rules by design.</div>
+    <div class="facts">tpl-sys · netvm sys-net · unbound → 9.9.9.9:853 · dnat-dns replaced via qubes-firewall.d</div>
+  </div>
+  <div class="card zone zc-red hop">
+    <h3>sys-net</h3>
+    <div class="role">Holds the physical NIC via PCI passthrough, speaks DHCP to whatever hostile network the laptop is on, and is treated as compromised by default. Nothing terminates here; it only forwards.</div>
+    <div class="facts">tpl-sys · netvm none · PCI NIC attached</div>
+  </div>
+  <div class="card hop" style="border-left:5px solid var(--z-gray)">
+    <h3 style="font-family:'IBM Plex Sans',sans-serif">Internet</h3>
+    <div class="role">Clearnet exits carry the unit's address and full inspection records. Tor exits carry a Tor exit node's address and no local content records — two cleanly separated postures, chosen per task by picking the qube.</div>
+    <div class="facts">clearnet: attributed + inspected · Tor: anonymous + uninspected</div>
+  </div>
+</div>
+
+<h2 id="templates"><span class="num">05</span>Template inventory — an agent in every one</h2>
+<p class="section-note">Nine templates, all Debian except the optional Fedora fallback. Every one carries the Wazuh agent, installed <em>disabled</em> and <em>version-held</em>, enabled per qube at enrollment — so template updates never beacon and an agent can never overtake the manager.</p>
+<div class="tw"><table>
+  <tr><th>Template</th><th>Built from</th><th>Payload on top of base</th><th>Backs</th><th>Agent</th></tr>
+  <tr><td class="qn zc-gray">debian-13-xfce</td><td>stock</td><td>agent only — pristine clone source</td><td>clone source, untrusted</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-gray">fedora-43-xfce</td><td>stock</td><td>agent only — optional fallback</td><td class="dim">nothing by default</td><td class="ok">✓</td></tr>
+  <tr><td class="qn zc-orange">tpl-sys</td><td>debian-13-xfce</td><td>qubes-core-agent-networking, -network-manager, qubes-usb-proxy, qubes-input-proxy-sender, firmware-linux, firmware-iwlwifi, unbound</td><td>sys-net · sys-firewall · sys-usb</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-orange">tpl-proxy</td><td>debian-13-xfce</td><td>squid-openssl, openssl</td><td>sys-proxy</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-orange">tpl-ids</td><td>debian-13-xfce</td><td>suricata, suricata-update, jq, zeek-8.0 (OBS)</td><td>sys-ids · sys-dpi</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-yellow">tpl-kali</td><td>debian-13-xfce</td><td>kali-rolling repo, kali-linux-default, <strong>maltego</strong></td><td>kali-clear · kali-tor</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-green">tpl-personal</td><td>debian-13-xfce</td><td>libreoffice (full suite), de-CH language + spelling, thunderbird, keepassxc, gimp, vlc, pdfarranger</td><td>personal · work · case-* · vault · dvm-offline</td><td class="ok">✓ held</td></tr>
+  <tr><td class="qn zc-blue">tpl-wazuh</td><td>debian-13-xfce</td><td>Wazuh repo prepared; manager stack installs in the StandaloneVM</td><td>wazuh-srv (standalone clone)</td><td class="ok">✓ self</td></tr>
+  <tr><td class="qn zc-purple">whonix-gateway-18<br>whonix-workstation-18</td><td>stock Whonix</td><td>agent only</td><td>sys-whonix · anon-whonix</td><td class="ok">✓ qrexec</td></tr>
+</table></div>
+
+<div class="cal note"><div class="ct"><span class="tag">verified</span> Qubes 4.3 template naming</div>
+<p>4.3 shipped with Fedora 42; <code>fedora-43</code> was added 2026-02 and <code>fedora-44</code> in 2026-07, so <strong>42, 43 and 44 all exist</strong> for 4.3 — choose deliberately rather than assuming "latest". <code>debian-13-xfce</code> is the default Debian template; bare <code>debian-13</code> is the GNOME build. The ISO builder derives these names from <code>comps-dom0.xml</code> rather than hardcoding them.</p></div>
+
+<h2 id="qubes"><span class="num">06</span>Qube inventory</h2>
+<div class="tw"><table>
+  <tr><th>Qube</th><th>Class</th><th>Template</th><th>netvm</th><th>Auto</th><th>Purpose</th></tr>
+  <tr><td class="qn zc-red">sys-net</td><td>AppVM · net</td><td>tpl-sys</td><td class="mono">none</td><td>yes</td><td>NIC, DHCP, hostile edge</td></tr>
+  <tr><td class="qn zc-orange">sys-firewall</td><td>AppVM · net</td><td>tpl-sys</td><td class="mono">sys-net</td><td>yes</td><td>DNS enforcement, segmentation</td></tr>
+  <tr><td class="qn zc-orange">sys-dpi</td><td>AppVM · net</td><td>tpl-ids</td><td class="mono">sys-firewall</td><td>yes</td><td>Zeek flight recorder</td></tr>
+  <tr><td class="qn zc-orange">sys-ids</td><td>AppVM · net</td><td>tpl-ids</td><td class="mono">sys-dpi</td><td>yes</td><td>Suricata inline IPS</td></tr>
+  <tr><td class="qn zc-orange">sys-proxy</td><td>AppVM · net</td><td>tpl-proxy</td><td class="mono">sys-ids</td><td>yes</td><td>Squid intercept + attribution</td></tr>
+  <tr><td class="qn zc-purple">sys-whonix</td><td>AppVM · net</td><td>whonix-gateway-18</td><td class="mono">sys-firewall</td><td>yes</td><td>Tor gateway</td></tr>
+  <tr><td class="qn zc-red">sys-usb</td><td>AppVM</td><td>tpl-sys</td><td class="mono">none</td><td>yes</td><td>USB isolation, backup disk</td></tr>
+  <tr><td class="qn zc-blue">wazuh-srv</td><td><strong>Standalone</strong></td><td>clone of tpl-wazuh</td><td class="mono">sys-proxy</td><td>yes</td><td>Manager · indexer · dashboard · 10.137.0.50</td></tr>
+  <tr><td class="qn zc-green">personal</td><td>AppVM</td><td>tpl-personal</td><td class="mono">sys-proxy</td><td>no</td><td>Office and mail</td></tr>
+  <tr><td class="qn zc-green">work</td><td>AppVM</td><td>tpl-personal</td><td class="mono">sys-proxy</td><td>no</td><td>Admin, dashboard access</td></tr>
+  <tr><td class="qn zc-gray">case-&lt;name&gt;</td><td>AppVM</td><td>tpl-personal</td><td class="mono">sys-proxy</td><td>no</td><td>One qube per investigation</td></tr>
+  <tr><td class="qn zc-yellow">kali-clear</td><td>AppVM</td><td>tpl-kali</td><td class="mono">sys-proxy</td><td>no</td><td>Scans, active tooling, Maltego</td></tr>
+  <tr><td class="qn zc-red">untrusted</td><td>AppVM</td><td>debian-13-xfce</td><td class="mono">sys-proxy</td><td>no</td><td>Junk browsing</td></tr>
+  <tr><td class="qn zc-purple">kali-tor</td><td>AppVM</td><td>tpl-kali</td><td class="mono">sys-whonix</td><td>no</td><td>Tor-routed OSINT (TCP only)</td></tr>
+  <tr><td class="qn zc-purple">anon-whonix</td><td>AppVM</td><td>whonix-workstation-18</td><td class="mono">sys-whonix</td><td>no</td><td>Anonymous browsing</td></tr>
+  <tr><td class="qn zc-black">vault</td><td>AppVM</td><td>tpl-personal</td><td class="mono">none</td><td>no</td><td>Keys, credentials — offline</td></tr>
+  <tr><td class="qn zc-red">dvm-offline</td><td>AppVM · dvm</td><td>tpl-personal</td><td class="mono">none</td><td>no</td><td>Disposable for opening evidence</td></tr>
+  <tr><td class="qn zc-red">default-dvm</td><td>AppVM · dvm</td><td>stock</td><td class="mono">sys-proxy</td><td>no</td><td>Networked disposables</td></tr>
+</table></div>
+<p class="sub"><strong>Evidence rule for the team.</strong> Any file arriving from outside — download, USB, email attachment — is opened first in a <code>dvm-offline</code> disposable. It has no network, it is destroyed on close, and its template carries the full office suite so anything renders.</p>
+
+<h2 id="firewall"><span class="num">07</span>Firewall implementation</h2>
+<p class="section-note">This section was rewritten after verification against the official Qubes firewall documentation and two upstream issues. The previous revision would have failed silently in three separate places.</p>
+
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> There is no <code>custom-prerouting</code> chain</div>
+<p>The Squid redirect was written into a chain that does not exist. The documented user hooks are <strong><code>custom-forward</code> and <code>custom-input</code> only</strong>; for NAT you must create your own chain. A request to add a <code>custom-nat</code> chain is still open upstream (qubes-issues #8629).</p></div>
+
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> Squid would have received nothing</div>
+<p>Redirected packets terminate <strong>locally</strong> on <code>sys-proxy</code>, so they take the input path, not forward. The old rules only touched forward chains — traffic would have been dropped one hop before Squid, with every config file looking correct. The <code>custom-input</code> accept below is the fix.</p></div>
+
+<h3>sys-proxy — intercept</h3>
+<div class="filehead">sys-proxy · /rw/config/qubes-firewall-user-script</div>
+<pre class="conf">#!/bin/sh
+<span class="cm"># Create our own nat chain — the documented pattern from the Qubes firewall</span>
+<span class="cm"># docs. Idempotent: 2>/dev/null swallows "chain exists" on restart.</span>
+nft add chain ip qubes <span class="hl">custom-dnat-squid</span> \
+    '{ type nat hook prerouting priority filter + 1 ; policy accept; }' 2>/dev/null
+
+<span class="cm"># Redirect downstream web traffic into Squid. Other ports are untouched and</span>
+<span class="cm"># continue up the chain, still inspected by Suricata and Zeek.</span>
+nft add rule ip qubes custom-dnat-squid iifname "vif*" tcp dport 80  redirect to :3128
+nft add rule ip qubes custom-dnat-squid iifname "vif*" tcp dport 443 redirect to :3129
+
+<span class="cm"># Without this the redirected packets never reach the Squid sockets.</span>
+nft add rule ip qubes <span class="hl">custom-input</span> iifname "vif*" tcp dport { 3128, 3129 } counter accept
+
+<span class="cm"># Sibling qubes meet here first: agent traffic to the SIEM, nothing else.</span>
+nft add rule ip qubes custom-forward ip daddr 10.137.0.50 tcp dport { 1514, 1515 } counter accept
+</pre>
+
+<h3>sys-firewall — DNS enforcement</h3>
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> DNS rules were written into a chain Qubes regenerates</div>
+<p>The old code ran <code>nft flush chain ip qubes dnat-dns</code> from the user script. Two problems: modifying Qubes-managed chains is explicitly unsupported, and <code>qubes-setup-dnat-to-ns</code> <strong>rewrites <code>dnat-dns</code> when the network comes up</strong>, silently discarding the rules. DNS enforcement would have appeared configured and quietly not applied — the worst failure mode in the whole design, because it looks fine until someone audits egress.</p></div>
+
+<p>The working pattern (qubes-issues #9056) replaces the chain wholesale from an <code>nft -f</code> script in <code>/rw/config/qubes-firewall.d/</code>, which runs as part of qubes-firewall startup:</p>
+<div class="filehead">sys-firewall · /rw/config/qubes-firewall.d/10-golden-dns  (mode 0755)</div>
+<pre class="conf">#!/usr/sbin/nft -f
+<span class="cm"># mode: dot — redirect downstream DNS to the local unbound, which forwards</span>
+<span class="cm"># over TLS to 9.9.9.9. Query contents never cross the wire in clear.</span>
+<span class="cm">#</span>
+<span class="cm"># The Tor branch is exempt STRUCTURALLY: sys-whonix resolves inside Tor and</span>
+<span class="cm"># never emits port 53 toward this qube. DO NOT add DNS rules for it. Ever.</span>
+add chain ip qubes dnat-dns
+delete chain ip qubes dnat-dns
+table ip qubes {
+    chain dnat-dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "vif*" meta l4proto { tcp, udp } th dport 53 <span class="hl">redirect to :53</span>
+    }
+}
+</pre>
+<p class="sub"><code>redirect</code> rather than <code>dnat to 127.0.0.1</code> avoids needing <code>route_localnet</code>. The add-then-delete idiom guarantees the delete succeeds whether or not the chain already exists.</p>
+
+<div class="filehead">sys-firewall · /rw/config/qubes-firewall-user-script</div>
+<pre class="conf">#!/bin/sh
+<span class="cm"># Let downstream DNS reach the local resolver after the redirect above.</span>
+nft add rule ip qubes custom-input iifname "vif*" meta l4proto { tcp, udp } th dport 53 counter accept
+
+<span class="cm"># Nothing raw on port 53 leaves upstream: kills clients with hardcoded</span>
+<span class="cm"># resolvers. Legitimate queries were already translated and never reach here.</span>
+nft add rule ip qubes custom-forward meta l4proto { tcp, udp } th dport 53 counter drop
+
+<span class="cm"># Segmentation: qube-to-qube stays denied except the SIEM flows above.</span>
+nft add rule ip qubes custom-forward ip saddr 10.137.0.0/16 ip daddr 10.137.0.0/16 counter drop
+nft add rule ip qubes custom-forward ip saddr 10.138.0.0/16 ip daddr 10.137.0.0/16 counter drop
+</pre>
+
+<h3>Segmentation matrix</h3>
+<p>Default stance: <strong>deny all qube-to-qube traffic</strong> (the Qubes default, unchanged). The complete list of permitted inter-qube flows — everything not listed is dropped:</p>
+<div class="tw"><table>
+  <tr><th>From</th><th>To</th><th>Port / transport</th><th>Purpose</th></tr>
+  <tr><td>any agent qube, clearnet</td><td>wazuh-srv 10.137.0.50</td><td class="mono">TCP 1514</td><td>Agent events</td></tr>
+  <tr><td>any agent qube, clearnet</td><td>wazuh-srv 10.137.0.50</td><td class="mono">TCP 1515</td><td>One-time enrollment</td></tr>
+  <tr><td>work</td><td>wazuh-srv</td><td class="mono">qrexec ConnectTCP 443</td><td>Dashboard</td></tr>
+  <tr><td class="via">Tor branch</td><td>wazuh-srv</td><td class="mono via">qrexec ConnectTCP 1514</td><td>Telemetry, no network path</td></tr>
+</table></div>
+
+<h2 id="configs"><span class="num">08</span>Middlebox configuration</h2>
+<p class="section-note">Everything below persists across qube reboots via bind-dirs or <code>/rw/config</code>; nothing lives only in a running AppVM.</p>
+
+<h3>Squid — peek, do not decrypt</h3>
+<p>Squid runs in intercept mode: web traffic is redirected into it invisibly, everything else flows past. TLS is <strong>peeked, then spliced</strong> — Squid reads the SNI hostname and passes the encrypted stream on untouched. Full interception with a unit CA in every template is possible but is a legal and procedural decision, not a technical default; the hooks are present and left off.</p>
+<div class="filehead">tpl-proxy · /etc/squid/squid.conf (core directives)</div>
+<pre class="conf">http_port  3128 intercept
+https_port 3129 intercept ssl-bump generate-host-certificates=off \
+           tls-cert=/etc/squid/placeholder.pem
+
+acl step1 at_step SslBump1
+ssl_bump peek step1        <span class="cm"># read the SNI</span>
+ssl_bump splice all        <span class="cm"># pass through encrypted — NO decryption</span>
+
+acl localqubes src 10.137.0.0/16 10.138.0.0/16
+http_access allow localqubes
+http_access deny all
+cache deny all             <span class="cm"># investigators do not want cached evidence</span>
+
+logformat attrib %ts.%03tu <span class="hl">%&gt;a</span> %Ss/%03&gt;Hs %rm %ru %ssl::&gt;sni
+access_log daemon:/var/log/squid/access.log attrib
+</pre>
+<div class="cal note"><div class="ct"><span class="tag">verified</span> A certificate is required even for splice-only</div>
+<p><code>squid-openssl</code> is present in Debian 13 (Squid 6.13) and is the SSL-Bump-capable build; it cannot be co-installed with plain <code>squid</code>. Even when only splicing, the <code>ssl-bump</code> port needs a <code>tls-cert=</code> present so Squid can parse the ClientHello — hence the self-signed placeholder, which is never used to sign anything. <code>%&gt;a</code> is the attribution field: the originating qube's address.</p></div>
+
+<h3>Suricata — inline IPS, fail-closed</h3>
+<div class="filehead">sys-ids · /rw/config/qubes-firewall-user-script</div>
+<pre class="conf">#!/bin/sh
+<span class="cm"># Every forwarded packet is queued to Suricata for an accept/drop verdict.</span>
+<span class="cm"># Deliberately NO "bypass": Suricata down means the chain stops.</span>
+nft insert rule ip qubes custom-forward counter <span class="hl">queue num 0</span>
+</pre>
+<div class="cal warn"><div class="ct"><span class="tag">decision</span> Fail-closed over availability</div>
+<p>Without <code>bypass</code>, the kernel <strong>drops</strong> packets when nothing is listening on the queue. A Suricata crash therefore halts the inspected chain rather than passing traffic uninspected. <code>Restart=always</code> with <code>RestartSec=2</code> bounds the outage to seconds. Setting <code>ips_failure_mode: "open"</code> adds <code>bypass</code> and reverses this — change it knowingly, not by accident.</p></div>
+
+<h3>Zeek — flight recorder</h3>
+<pre class="conf"><span class="cm"># /opt/zeek/etc/node.cfg</span>
+[zeek]
+type=standalone
+host=localhost
+interface=eth0     <span class="cm"># post-IPS; per-qube attribution lives in the Squid log</span>
+
+<span class="cm"># /rw/config/qubes-bind-dirs.d/50_golden_dpi.conf</span>
+binds+=( '/opt/zeek/etc' )
+binds+=( '/opt/zeek/logs' )
+</pre>
+<p class="sub">Because each Qubes hop NATs, Zeek on <code>eth0</code> sees <em>what</em> left the chain but not <em>which</em> qube sent it. Per-qube attribution comes from Squid (pre-NAT, hop one) and from the endpoint agents. Zeek 8.0 is the current LTS line; it will not jump to a new LTS on its own, which matters when the logs are evidence.</p>
+
+<h3>unbound — DNS over TLS</h3>
+<div class="filehead">sys-firewall · /etc/unbound/unbound.conf.d/golden-image.conf</div>
+<pre class="conf">server:
+    interface: 0.0.0.0
+    access-control: 127.0.0.0/8    allow
+    access-control: 10.137.0.0/16  allow
+    access-control: 10.138.0.0/16  allow
+    <span class="hl">access-control: 0.0.0.0/0      refuse</span>   <span class="cm"># not an open resolver</span>
+    do-not-query-localhost: no
+    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    <span class="hl">forward-first: no</span>                    <span class="cm"># never fall back to cleartext</span>
+    forward-addr: 9.9.9.9@853#dns.quad9.net
+    forward-addr: 149.112.112.112@853#dns.quad9.net
+</pre>
+<p class="sub">The <code>addr@port#hostname</code> form pins the certificate name. Investigator DNS queries are themselves sensitive metadata and should not cross the wire in plaintext. DoH cannot be fully blocked without breaking the web; Suricata's ruleset flags known DoH endpoints instead, giving detection where prevention is impractical.</p>
+
+<h3>bind-dirs</h3>
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> Agents would have lost their identity every reboot</div>
+<p><code>/var/ossec</code> was declared in bind-dirs, but <code>/rw/bind-dirs/var/ossec</code> was never seeded. When the directory does not already exist there, the first-boot copy fails and the agent re-enrolls as a <em>new</em> agent on every reboot — quietly filling the SIEM with duplicate hosts. The provisioner now pre-creates it. File names also follow the documented <code>NN_name.conf</code> convention.</p></div>
+<pre class="conf"><span class="cm"># /rw/config/qubes-bind-dirs.d/50_golden_wazuh.conf</span>
+binds+=( '/var/ossec' )
+
+<span class="cm"># run once before the bind takes effect:</span>
+mkdir -p /rw/bind-dirs/var
+[ -d /rw/bind-dirs/var/ossec ] || cp -a /var/ossec /rw/bind-dirs/var/ossec
+</pre>
+
+<h2 id="siem"><span class="num">09</span>Wazuh SIEM</h2>
+<p class="section-note">Coverage is total: every template ships the agent, every running qube enrolls under its own name, so the dashboard shows per-compartment telemetry rather than one blurred host. Two transports exist because the purple branch must never speak clearnet.</p>
+
+<div class="cal warn"><div class="ct"><span class="tag">decision</span> Version pinning is not optional</div>
+<p>Wazuh guarantees compatibility only when the <strong>manager version is at least the agent version</strong>. Every template here updates weekly, so an unpinned agent would eventually overtake the manager and <em>every agent on the laptop would stop reporting</em> — silently, on an unpredictable date, most likely discovered when someone went looking for evidence that was never collected. For an investigator workstation that is the worst possible failure: monitoring that looks healthy and is not.</p></div>
+<div class="filehead">applied in every template</div>
+<pre class="conf">apt-get install -y wazuh-agent
+systemctl disable wazuh-agent                      <span class="cm"># templates never beacon</span>
+<span class="hl">echo "wazuh-agent hold" | dpkg --set-selections</span>    <span class="cm"># freeze the version</span>
+sed -i 's|^deb |#deb |' /etc/apt/sources.list.d/wazuh.list
+</pre>
+<p class="sub">Upgrade order when the time comes: <strong><code>wazuh-srv</code> first</strong>, then release the holds and upgrade the agents. Never the reverse. Acceptance test 4b asserts the hold is present across all Debian templates.</p>
+
+<h3>Transport map</h3>
+<div class="tw"><table>
+  <tr><th>Compartment</th><th>Agent</th><th>Transport to manager</th></tr>
+  <tr><td class="qn zc-green">personal · work · case-* · kali-clear · untrusted · dvms</td><td class="ok">enabled</td><td>Network, TCP 1514 → 10.137.0.50 (permitted at sys-proxy)</td></tr>
+  <tr><td class="qn zc-orange">sys-proxy · sys-ids · sys-dpi · sys-firewall · sys-net · sys-usb</td><td class="ok">enabled</td><td>Network — also ships Squid, Suricata eve.json, Zeek and nft logs</td></tr>
+  <tr><td class="qn zc-purple">sys-whonix · kali-tor · anon-whonix</td><td class="ok">enabled</td><td class="via">qrexec ConnectTCP → agent talks to 127.0.0.1:1514, dom0 pipes it to wazuh-srv. Never touches the network stack, never enters Tor, never leaks clearnet from the purple zone.</td></tr>
+  <tr><td class="qn zc-black">vault · dvm-offline</td><td class="dim">installed, dormant</td><td class="dim">None exists — offline is offline.</td></tr>
+  <tr><td class="qn zc-black">dom0</td><td class="no">no</td><td class="dim">dom0 has no network by design; bridging it for telemetry would be the worst trade in the image.</td></tr>
+</table></div>
+
+<div class="cal warn"><div class="ct"><span class="tag">decision</span> Recorded risk — accepted by design authority</div>
+<p>Telemetry from the purple branch reaches the same index as attributed telemetry. Inside your own SIEM this correlates anonymous activity with the device. The qrexec transport keeps that correlation <em>local to the laptop</em> — nothing beacons clearnet from a Tor context — which is the acceptable version of "agents everywhere". If a case demands zero linkage, the per-case procedure is <code>systemctl disable --now wazuh-agent</code> in <code>kali-tor</code> for the duration, noted in the case log.</p></div>
+
+<h3>Enrollment — declarative, not imperative</h3>
+<p>The build uses Wazuh's documented password-authentication flow rather than <code>agent-auth</code>, because a golden image wants configuration that re-applies cleanly rather than a registration action that fires once.</p>
+<div class="filehead">agent side · every qube, scripted in phase 11</div>
+<pre class="conf">printf '%s\n' "$AUTHD_PASSWORD" &gt; /var/ossec/etc/authd.pass
+chmod 640 /var/ossec/etc/authd.pass
+chown root:wazuh /var/ossec/etc/authd.pass
+sed -i 's|&lt;address&gt;.*&lt;/address&gt;|&lt;address&gt;10.137.0.50&lt;/address&gt;|' /var/ossec/etc/ossec.conf
+systemctl enable --now wazuh-agent          <span class="cm"># self-enrolls on start</span>
+</pre>
+
+<figure>
+<pre class="mermaid">
+flowchart LR
+  classDef g fill:#EAF4EC,stroke:#2A7742,color:#1D5730
+  classDef o fill:#FBF2E1,stroke:#BE640B,color:#7A4208
+  classDef p fill:#F1EAF8,stroke:#663A99,color:#4A2A70
+  classDef b fill:#E9F1F8,stroke:#20629F,color:#154B79
+  A[clearnet qubes]:::g -->|tcp 1514| W[(wazuh-srv<br>10.137.0.50)]:::b
+  S[chain middleboxes<br>squid · eve.json · zeek]:::o -->|tcp 1514| W
+  T[purple branch<br>sys-whonix · kali-tor · anon-whonix]:::p -.->|qrexec ConnectTCP<br>no network path| W
+  W -->|dashboard 443<br>qrexec only| K[work]:::g
+</pre>
+<figcaption>Fig. 2 — Telemetry map. Solid arrows are network flows permitted by the segmentation matrix; the dotted arrow is the dom0-mediated qrexec pipe that keeps the purple zone off the clearnet.</figcaption>
+</figure>
+
+<h2 id="packet"><span class="num">10</span>Life of a packet</h2>
+<figure>
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant K as kali-clear
+  participant P as sys-proxy
+  participant I as sys-ids
+  participant D as sys-dpi
+  participant F as sys-firewall
+  participant N as sys-net
+  participant X as Internet
+  K->>P: TLS to target:443
+  Note over P: custom-dnat-squid redirects 443→3129<br>custom-input accepts; log qube-IP + SNI; splice
+  P->>I: encrypted stream
+  Note over I: NFQUEUE verdict — drop if a rule hits<br>fail-closed if Suricata is down
+  I->>D: allowed traffic
+  Note over D: conn / ssl / file-hash records written
+  D->>F: forward
+  Note over F: dnat-dns redirects :53 to local unbound<br>DoT to 9.9.9.9
+  F->>N: NAT out
+  N->>X: egress, unit-attributed IP
+  X-->>K: response, reverse path
+</pre>
+<figcaption>Fig. 3 — Every clearnet flow crosses all four checkpoints in this order. Tor flows skip P, I and D entirely and enter at F via sys-whonix.</figcaption>
+</figure>
+
+<h2 id="backup"><span class="num">11</span>Weekly backup</h2>
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> <code>qvm-backup</code> has no <code>--yes</code> flag</div>
+<p>The previous revision's timer would have hung waiting for confirmation, every Sunday at 03:00, forever — the kind of failure nobody notices until they need a restore. <strong>Profile mode is the documented non-interactive path</strong>, and <code>--profile</code> is mutually exclusive with all other options.</p></div>
+
+<div class="filehead">dom0 · /etc/qubes/backup/golden-image.conf  (mode 0600 — holds the passphrase path)</div>
+<pre class="conf">destination_vm: sys-usb
+destination_path: /mnt/backup
+compression: true
+passphrase_file: /root/.backup-pass
+include:
+ - dom0
+ - vault
+ - personal
+ - work
+ - kali-clear
+ - wazuh-srv
+ - tpl-kali
+ - tpl-personal
+ - tpl-ids
+ - tpl-proxy
+ - tpl-sys
+ - tpl-wazuh
+</pre>
+<p class="sub">The wrapper regenerates this file before each run so current <code>case-*</code> qubes are picked up, then calls <code>qvm-backup --profile golden-image</code>. A systemd timer fires it weekly.</p>
+
+<h3>Scope and discipline</h3>
+<ul class="plain">
+  <li><strong>Included:</strong> everything carrying state or effort — vault, work qubes, case qubes, <code>kali-clear</code> (tool configs and Maltego graphs live in <code>/home</code>), <code>wazuh-srv</code> (standalone, so full root), all custom templates, and dom0.</li>
+  <li><strong>Excluded:</strong> stock templates (re-downloadable), <code>untrusted</code>, and <strong>the entire Tor branch</strong> — it intentionally holds nothing, and backing it up would copy anonymous-context artifacts into attributed storage.</li>
+  <li><strong>Retention:</strong> the last four weekly sets.</li>
+  <li><strong>Monthly:</strong> restore verification, calendared, owned by a named person. An unverified backup is a hope, not a control.</li>
+  <li><strong>Escrow the passphrase</strong> before shredding <code>credentials.json</code>. No passphrase, no restore.</li>
+</ul>
+
+<h2 id="supply"><span class="num">12</span>Supply chain</h2>
+<p class="section-note">Three templates pull packages from outside Debian. Each repository was verified against the vendor's own documentation on 2026-09-01, and the build checks the Kali fingerprint before installing a single Kali package — a mismatch aborts rather than warning and continuing.</p>
+<div class="tw"><table>
+  <tr><th>Component</th><th>Repository</th><th>Key</th><th>Verified against</th></tr>
+  <tr><td class="qn zc-yellow">Kali</td><td class="mono" style="font-size:11.5px">http.kali.org/kali kali-rolling</td><td class="mono" style="font-size:11.5px">archive.kali.org/archive-keyring.gpg</td><td>kali.org signing-key announcement, cross-checked on the Ubuntu keyserver</td></tr>
+  <tr><td class="qn zc-orange">Zeek 8.0 LTS</td><td class="mono" style="font-size:11.5px">OBS security:/zeek/Debian_13</td><td class="mono" style="font-size:11.5px">…/Debian_13/Release.key</td><td>docs.zeek.org; Debian 13 repo confirmed reachable</td></tr>
+  <tr><td class="qn zc-blue">Wazuh 4.14.7</td><td class="mono" style="font-size:11.5px">packages.wazuh.com/4.x/apt stable main</td><td class="mono" style="font-size:11.5px">packages.wazuh.com/key/GPG-KEY-WAZUH</td><td>documentation.wazuh.com installation guide</td></tr>
+</table></div>
+
+<h3>Kali — the fingerprint is the check that matters</h3>
+<div class="cal note"><div class="ct"><span class="tag">verified</span> 827C…E4C5 is the <em>current</em> key, not a retired one</div>
+<p>This is worth stating plainly because it is easy to misread. <code>827C8569F2518CC677FECA1AED65462EC8D5E4C5</code> is the <strong>current</strong> 2025 key: rsa4096, created 2025-04-17, expires 2028-04-17, short id <code>ED65462EC8D5E4C5</code>. The <strong>retired</strong> key is <code>44C6513A…ED444FF07D8D0BF6</code> (expires 2027-02-04), still shipped in the keyring so older releases verify. The April 2025 breakage happened because the archive stopped being signed by the old key and systems lacked the new one — not because the new key was withdrawn.</p></div>
+<pre class="conf">827C8569F2518CC677FECA1AED65462EC8D5E4C5   <span class="cm"># CURRENT — Kali Archive Automatic Signing Key (2025)</span>
+44C6513A8E4FB3D30875F758ED444FF07D8D0BF6   <span class="cm"># retired, still shipped · expires 2027-02-04</span>
+603374c107a90a69d983dbcb4d31e0d6eedfc325   <span class="cm"># SHA1 of the keyring file, published 2025-04-28</span>
+
+deb [<span class="hl">signed-by=/usr/share/keyrings/kali-archive-keyring.gpg</span>] \
+    http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware
+</pre>
+<p class="sub">The build treats the <strong>fingerprint as authoritative and the checksum as advisory</strong>. A fingerprint identifies the key and only changes when Kali rolls one — a mismatch stops the build. A checksum identifies the <em>file</em> and changes whenever the keyring is regenerated for any reason — a mismatch warns and asks you to re-verify. Getting this the wrong way round produces either false alarms or false confidence. The repository line now pins trust with <code>signed-by=</code> rather than relying on the global trust store.</p>
+
+<h3>Zeek — you are trusting the build service</h3>
+<p>Zeek is not in Debian main; upstream ships binaries through the openSUSE Build Service, and Zeek state plainly that OBS signs these packages outside the Zeek project's control. Their documentation also warns that on Debian you must re-add the key manually when it expires. That belongs on the monthly checklist: an expired key silently stops Zeek updates, and a DPI recorder that quietly goes stale is worse than one that fails loudly.</p>
+
+<h2 id="deploy"><span class="num">13</span>Deployment</h2>
+<p class="section-note">Two Python 3 scripts, standard library only — which matters because dom0 has no network by design. Both embed their configuration and write it as JSON on first run, never overwriting your edits.</p>
+<div class="tw"><table>
+  <tr><th>Script</th><th>Runs on</th><th>Purpose</th></tr>
+  <tr><td class="qn zc-green">golden_image.py</td><td><strong>dom0</strong>, each laptop</td><td>Twelve phases: templates, chain, SIEM, segmentation, backups, acceptance tests. Resumable.</td></tr>
+  <tr><td class="qn zc-gray">build_iso.py</td><td>a build host, never dom0</td><td>Custom templates and <code>InQubestigationOS.iso</code></td></tr>
+</table></div>
+
+<h3>On each system</h3>
+<pre class="conf">sudo ./golden_image.py --write-config   <span class="cm"># emit config, review, edit</span>
+sudo ./golden_image.py --dry-run        <span class="cm"># print every action, change nothing</span>
+sudo ./golden_image.py                  <span class="cm"># build (resumable)</span>
+sudo ./golden_image.py --from-phase 7   <span class="cm"># resume after a failure</span>
+sudo ./golden_image.py --verify         <span class="cm"># acceptance tests only</span>
+</pre>
+
+<h3>Two ISO tiers</h3>
+<div class="tw"><table>
+  <tr><th></th><th>Tier 1 — default</th><th>Tier 2 — offline</th></tr>
+  <tr><td><strong>In the ISO</strong></td><td>Stock templates + provisioning payload</td><td>Investigator templates baked in as RPMs</td></tr>
+  <tr><td><strong>First boot</strong></td><td>Builds templates from network, 1–3 hours</td><td>Wires topology only, minutes</td></tr>
+  <tr><td><strong>Network needed</strong></td><td>Yes, at install</td><td class="ok">No</td></tr>
+  <tr><td><strong>ISO size</strong></td><td>Close to stock</td><td>Tens of GB</td></tr>
+  <tr><td><strong>Maintenance</strong></td><td>One ageing surface (dom0)</td><td>Two (dom0 + templates)</td></tr>
+</table></div>
+<p class="sub">Tier 2 is the right answer for air-gapped deployment or colleagues without reliable connectivity at install time. Otherwise Tier 1 gives a far smaller image and one maintenance track instead of two. <strong>Provisioning still runs on Tier 2</strong> — the ISO ships templates, not topology.</p>
+
+<div class="cal warn"><div class="ct"><span class="tag">decision</span> Three things before you distribute an ISO</div>
+<p><strong>A self-built ISO is not signed by the Qubes team.</strong> Colleagues cannot verify it against the Qubes release key, because it is not a Qubes release. You become the signing authority: sign with the unit key and distribute that fingerprint through a channel independent of the ISO. An unsigned image on USB sticks is exactly the supply-chain problem this design exists to prevent.</p>
+<p><strong>The ISO goes stale and becomes a liability.</strong> It freezes dom0, Xen and the kernel at build time. An image built today and installed in six months installs six months of known-vulnerable dom0 before its first update. Rebuild on every security bulletin affecting dom0 or Xen; treat a stale investigator ISO as unusable.</p>
+<p><strong>No credentials are baked in.</strong> They are generated per machine at provisioning. A shared secret inside a widely-copied image across a whole unit would be the worst possible outcome.</p></div>
+
+<h3>Credentials</h3>
+<p>Four secrets — dashboard, API, agent enrollment, backup passphrase — generated uniquely per machine into <code>~/golden-image/credentials.json</code>, mode 600, dom0 only, with rotation procedures beside it. Log in, change them, escrow the new values, then <code>shred -u</code> the file. A <code>use_fixed_defaults</code> option reproduces shared-password behaviour for an isolated lab; it warns, stamps the file, and the acceptance tests flag it.</p>
+
+<h2 id="corrections"><span class="num">14</span>Corrections log</h2>
+<p class="section-note">Six defects found during verification against primary sources. Three would have failed silently in production. Recorded rather than quietly patched, so nobody reintroduces them.</p>
+<div class="tw"><table>
+  <tr><th>#</th><th>Defect</th><th>Would have caused</th><th>Fix</th></tr>
+  <tr><td class="mono">1</td><td><code>custom-prerouting</code> chain does not exist</td><td class="no">Proxy redirect never installed</td><td>Created <code>custom-dnat-squid</code>, the documented pattern</td></tr>
+  <tr><td class="mono">2</td><td>Missing <code>custom-input</code> accept</td><td class="no">Squid received nothing; config looked correct</td><td>Accept 3128/3129 and 53 from <code>vif*</code></td></tr>
+  <tr><td class="mono">3</td><td>DNS written into Qubes-managed <code>dnat-dns</code></td><td class="no">Rules wiped at every network start</td><td>Replace the chain from <code>qubes-firewall.d/</code></td></tr>
+  <tr><td class="mono">4</td><td><code>qvm-backup --yes</code> does not exist</td><td class="no">Weekly backup hangs forever</td><td>Profile mode</td></tr>
+  <tr><td class="mono">5</td><td><code>qvm-firewall reset</code> not in the manpage</td><td>Possible hard failure on some releases</td><td>Capability check, documented fallback</td></tr>
+  <tr><td class="mono">6</td><td><code>/rw/bind-dirs/var/ossec</code> never seeded</td><td class="no">Agents re-enroll as new hosts each reboot</td><td>Pre-create before the bind takes effect</td></tr>
+</table></div>
+<p class="sub">Two further bugs were found <em>by testing</em> rather than by reading: dry-run aborted at phase 8 because it did not track qubes it would have created, and a backslash inside a comment silently swallowed the following line. Both fixed.</p>
+
+<h3>What was tested</h3>
+<div class="tw"><table>
+  <tr><th>Test</th><th>Result</th></tr>
+  <tr><td>Both scripts compile</td><td class="ok">pass</td></tr>
+  <tr><td>Dry run, all twelve phases</td><td class="ok">180 actions planned, no aborts</td></tr>
+  <tr><td>Real run against a fake-dom0 harness</td><td class="ok">exit 0, 11/12 phases marked</td></tr>
+  <tr><td>Phase 12 refuses to mark complete when tests fail</td><td class="ok">pass</td></tr>
+  <tr><td>Generated config files captured and validated</td><td class="ok">58 / 58 checks</td></tr>
+  <tr><td>systemd unit structural validation</td><td class="ok">pass</td></tr>
+  <tr><td>Credentials mode 600, four unique secrets</td><td class="ok">pass</td></tr>
+</table></div>
+<p class="sub">The 58 checks cover nftables brace balance, chain types and hooks against the valid sets, <code>redirect</code> used only in a nat prerouting context, absence of the non-existent <code>custom-prerouting</code>, nft set spacing, the add-then-delete idiom and <code>dstnat</code> priority in the DNS script, Squid peek-then-splice with no decryption plus <code>%&gt;a</code> attribution, unbound DoT syntax and non-open-resolver posture, Suricata <code>queue num</code> and genuine fail-closed with no <code>bypass</code> in any executable line, and no unsubstituted placeholders anywhere.</p>
+
+<h2 id="verify"><span class="num">15</span>Open verification</h2>
+<p class="section-note">What cannot be checked without a live Qubes 4.3.1 install and the issued hardware. Each prints as <code>[VERIFY]</code> at the moment it matters and is collected at the end of every run. None is architectural.</p>
+<ul class="checks">
+  <li><strong>DNS survives a reboot.</strong> <code>nft list chain ip qubes dnat-dns</code> should show the golden-image rule, not the default nameservers. This is the highest-value check in the list — it is the one that used to fail silently.</li>
+  <li><strong>Proxy counters increment under load.</strong> <code>nft list chain ip qubes custom-dnat-squid</code></li>
+  <li><strong>Backup profile schema.</strong> One manual <code>sudo qvm-backup --profile golden-image</code>. If the keys are rejected, generate a reference with <code>--save-profile</code> and copy its key names.</li>
+  <li><strong>Wi-Fi in a Debian <code>sys-net</code></strong> on the issued NIC — drivers come from the dom0 kernel, firmware from the template.</li>
+  <li><code>qvm-prefs &lt;vm&gt; ip</code> accepted on your build (used to pin the SIEM address).</li>
+  <li><code>qubes.ConnectTCP</code> policy grammar and <code>qvm-connect-tcp</code> port ordering.</li>
+  <li>Squid peek/splice directive names against the shipped Squid 6.13 configuration.</li>
+  <li>Zeek install prefix — the configs assume <code>/opt/zeek</code>.</li>
+  <li>pykickstart merging two <code>%packages</code> sections (standard Anaconda behaviour, not confirmed against a Qubes-specific source).</li>
+  <li>The signature on the qubes-builderv2 checkout itself — the builder verifies what it fetches; nothing verifies the builder for you.</li>
+</ul>
+
+<hr class="rule">
+<p class="sub" style="color:var(--ink-3)">Fig. 1 is self-contained SVG and always renders. Figs. 2–3 render via Mermaid from a CDN; offline they display as readable source that can be pasted into the team wiki. Facts marked <em>verified</em> were checked against primary sources on 2026-09-01 — re-verify before each image version bump and record the date in VERIFICATION.md.</p>
+
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+if (window.mermaid) {
+  mermaid.initialize({
+    startOnLoad: true, theme: 'base',
+    themeVariables: {
+      fontFamily: '"IBM Plex Sans", sans-serif', fontSize: '13px',
+      primaryColor: '#FFFFFF', primaryBorderColor: '#57616C',
+      primaryTextColor: '#131D18', lineColor: '#57616C',
+      actorBkg: '#FFFFFF', actorBorder: '#57616C',
+      noteBkgColor: '#FBF2E1', noteBorderColor: '#BE640B'
+    }
+  });
+}
+</script>
+</body>
+</html>
