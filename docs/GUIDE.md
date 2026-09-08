@@ -386,13 +386,19 @@ and that last row is the one place the Debian switch could bite.
 
 ## 11. Hand over to the investigator
 
-Three commands, in this order:
+Three commands, in this order — or `sudo golden-image-provision --handover`,
+which runs all three behind a single confirmation and stops the chain if any of
+them fails:
 
 ```bash
 sudo golden-image-provision --rotate-credentials
 sudo golden-image-provision --escrow-credentials
 sudo golden-image-provision --shred-credentials
 ```
+
+Run them separately if your policy requires the values to reach the unit's
+password process before the dom0 copy is destroyed — that is the gap between
+steps 2 and 3.
 
 **`--rotate-credentials`** generates four new secrets and applies them: the
 manager's enrollment password and every enrolled agent's copy of it, the
@@ -480,14 +486,32 @@ sudo golden-image-provision --upgrade-wazuh
 ```
 
 It upgrades `wazuh-srv`, reads back the version it actually reached, refuses to
-touch a single agent if it cannot, then upgrades and re-pins every template.
+touch a single agent if it cannot, then upgrades and re-pins every template — and
+writes that version into `golden-image.json`, so the next provisioning run
+installs the same thing rather than re-pinning to the old one. Commit that
+change: the golden image is the git tag, not any one laptop.
+
+**Signing keys expire, and Zeek's documentation says you must re-add theirs by
+hand when it does.** The expiry watch tells you when; this is what it tells you
+to run:
+
+```bash
+sudo golden-image-provision --refresh-repo-keys
+```
+
+It re-fetches the Zeek, Kali and Wazuh keys into the templates that use them and
+re-verifies each against its pinned fingerprint, keeping the old key in place if
+the new one does not match — a failed refresh must not leave a template unable to
+update at all.
 
 **Kali key rolls happen.** April 2025 broke `apt update` for every Kali system
-worldwide. `check-upstream` catches the next one the Monday after it happens.
-Confirm the new fingerprint at kali.org, then:
+worldwide. `check-upstream` catches the next one the Monday after it happens, and
+cross-checks the key against an independent keyserver rather than trusting the
+announcement alone. Confirm the new fingerprint at kali.org, then:
 
 ```bash
 ./build_iso.py --set kali.key_fpr=<new fingerprint>
+sudo golden-image-provision --refresh-repo-keys
 ```
 
 **The verification stamp maintains itself.** `supply-chain.lock.json` records

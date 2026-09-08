@@ -124,7 +124,17 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
   rule refresh, signing-key expiry, and a staleness banner.
 - The backup disk mounts itself by filesystem label; the SIEM dashboard is a
   launcher in `work`.
-- `--upgrade-wazuh` performs the manager-then-agents order.
+- `--upgrade-wazuh` performs the manager-then-agents order and writes the
+  version it reached into `golden-image.json`, so the config and the machine
+  cannot drift apart.
+- `--handover` runs rotate, escrow and shred in the only safe order.
+- `--refresh-repo-keys` re-fetches and re-verifies the pinned Zeek, Kali and
+  Wazuh keys, rolling back if a fetched key does not match its fingerprint.
+- `check-upstream` performs the independent keyserver cross-check
+  docs/VERIFICATION.md asks for, on every run rather than "on first build".
+- `CREDENTIALS-README.txt` described a four-part manual rotation that
+  `--rotate-credentials` had replaced, and told the operator to hand-write the
+  files the tooling now writes.
 - `tests/` is the fake-dom0 harness and the static checks the previous release
   described but did not ship; CI runs them on every push and `check-upstream`
   every Monday.

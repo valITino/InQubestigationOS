@@ -138,7 +138,9 @@ Most of those steps are now commands or timers.
 | `dd` to a device you hope is the right one | `./build_iso.py write-usb` — verifies the signature, refuses fixed disks, reads the stick back |
 | Three verification commands emailed to colleagues | `verify-iso.sh` and `FINGERPRINT.txt`, generated beside the image |
 | "Confirm by hand the four things the tests cannot check" | acceptance-test group 13 |
-| Read credentials.json, rotate four secrets in a web UI, escrow, `shred -u` | `--rotate-credentials`, `--escrow-credentials`, `--shred-credentials` |
+| Read credentials.json, rotate four secrets in a web UI, escrow, `shred -u` | `--rotate-credentials`, `--escrow-credentials`, `--shred-credentials` — or `--handover` for all three |
+| Re-add an expired repository key by hand in the template | `--refresh-repo-keys`, re-verified against the pinned fingerprint, rolled back if it does not match |
+| "Do this cross-check on first build rather than trusting the blog post alone" | `check-upstream` asks an independent keyserver about the Kali key, every run |
 | `qvm-connect-tcp 8443:wazuh-srv:443` from memory | a "SIEM dashboard" launcher in `work` |
 | Weekly template updates, weekly `suricata-update`, monthly key-expiry check, monthly restore test | seven timers, installed by phase 10, that raise a login banner when they fail |
 | Upgrade Wazuh in the right order and remember which order that is | `--upgrade-wazuh` |

@@ -759,43 +759,72 @@ class Provisioner:
         self._mark(2)
 
     def _cred_readme(self) -> str:
+        me = Path(sys.argv[0]).name
         w, q = self.c["wazuh"], self.q
         return f"""\
 credentials.json — {self.c['image_name']} v{self.c['image_version']}
 Host: {os.uname().nodename}   Built: {datetime.now():%Y-%m-%d %H:%M:%S}
 {self.creds.get('_stamp','')}
 
-THIS IS THE ONLY COPY. Mode 600, dom0 only.
-  1. Use these to log in for the first time.
-  2. Change every one of them (below).
-  3. Store the new values in your vault qube / unit password process.
-  4. Shred:  shred -u {self.cred_file}
-Never commit this file to the provisioning repo.
+THIS IS THE ONLY COPY until you escrow it. Mode 600, dom0 only.
+Never commit it to the provisioning repository.
 
-HOW TO CHANGE EACH ONE
-----------------------
-Dashboard / indexer admin password
-  In {q['wazuh']}, use the Wazuh indexer security admin tooling to set a new
-  hash for 'admin', then restart the indexer and dashboard.
-  [VERIFY] exact tool path and arguments for Wazuh {w['version']}.
+HANDOVER — three commands, in this order
+----------------------------------------
+    sudo {me} --rotate-credentials
+        Generates four new secrets and applies every one of them: the manager's
+        enrollment password and each enrolled qube's copy, the dashboard admin
+        password and the wazuh-wui API password through the Wazuh passwords
+        tool, and the backup passphrase. If it cannot set the dashboard
+        password it stops before writing anything, so the old values stay
+        valid rather than this file and the machine disagreeing.
 
-API password
-  Change via the Wazuh API users endpoint or the dashboard security settings,
-  then update the dashboard's stored API credentials.
+        The PREVIOUS backup passphrase is kept in this file afterwards, under
+        _previous_backup_passphrase: existing backup sets still need it, for
+        {self.c['backup']['keep_sets']} weeks.
 
-Agent enrollment password
-  In {q['wazuh']}:
-      echo "NEWSECRET" > /var/ossec/etc/authd.pass
-      chmod 640 /var/ossec/etc/authd.pass
-      chown root:wazuh /var/ossec/etc/authd.pass
-      systemctl restart wazuh-manager
-  Already-enrolled agents keep working; this only gates NEW registrations.
-  Rotate whenever someone leaves the team.
+    sudo {me} --escrow-credentials
+        Copies this file into 'vault' — verifying the copy by SHA-256, and
+        refusing outright if the target qube has a netvm — and records where
+        it went. Copy the values into your unit's password process too: a
+        vault qube is offline, but it is on the same disk as everything else.
 
-Backup passphrase
-  Write the new value to dom0:/root/.backup-pass (mode 600).
-  Old backup sets still need the OLD passphrase — keep it escrowed until
-  those sets age out ({self.c['backup']['keep_sets']} weeks).
+    sudo {me} --shred-credentials
+        Destroys the dom0 copy. It refuses without an escrow record, and
+        re-verifies the escrowed copy before it touches anything. It shreds
+        the build log as well, because that log records every command run
+        against every qube.
+
+Or all three at once, with one confirmation:  sudo {me} --handover
+
+WHAT EACH SECRET IS
+-------------------
+dashboard   admin login for the Wazuh dashboard and indexer.
+api         the wazuh-wui API user the dashboard authenticates with.
+authd       agent enrollment password. Rotating it does not disturb agents
+            that are already enrolled; it gates NEW registrations. Rotate
+            whenever somebody leaves the team.
+backup      passphrase for the weekly encrypted backup. NO PASSPHRASE, NO
+            RESTORE — escrow it before anything else.
+
+IF YOU HAVE TO DO IT BY HAND
+----------------------------
+You should not need to; --rotate-credentials exists so that the procedure is
+the same on every machine. If you are recovering a machine where it failed:
+
+  Dashboard / API   in {q['wazuh']}:
+                        /opt/wazuh-passwords-tool.sh -u admin     -p 'NEW'
+                        /opt/wazuh-passwords-tool.sh -u wazuh-wui -p 'NEW'
+                    [VERIFY] the tool path for Wazuh {w['version']}.
+  Enrollment        in {q['wazuh']}: write NEW to /var/ossec/etc/authd.pass,
+                    mode 640, owner root:wazuh, then restart wazuh-manager.
+                    Write the same value to every enrolled qube's copy.
+  Backup            write NEW to dom0:/root/.backup-pass (mode 600). The
+                    weekly wrapper reads it into the profile at run time.
+
+Afterwards, put the new values in this file so the machine and the record
+agree, and escrow it again — --shred-credentials refuses to proceed against
+an escrow record that no longer matches.
 """
 
     # =======================================================================
@@ -3062,6 +3091,43 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
               f"--escrow-credentials\n")
         return 0
 
+    def handover_sequence(self, target: str) -> int:
+        """rotate, then escrow, then shred — with one confirmation.
+
+        The order is the whole point: shredding before escrowing destroys the
+        only copy, and escrowing before rotating escrows values that are about
+        to stop being true. Each step already refuses to run out of order; this
+        just removes the opportunity to get it wrong.
+        """
+        o = self.out
+        print(f"\n{Out.B}{Out.C}══ Handover{Out.RST}")
+        print(f"""
+  This will, in order:
+    1. generate four new secrets and apply them to the SIEM, every enrolled
+       qube and the backup passphrase
+    2. copy the result into '{target}' and verify it by SHA-256
+    3. destroy the dom0 copy and the build log
+
+  Step 3 is not reversible. Step 2 puts the values in an offline qube on this
+  same disk — that is not off-site storage. Copy them into your unit's password
+  process between steps 2 and 3 if that is your policy, by running the three
+  commands separately instead.
+""")
+        if not self.args.dry_run and not self.args.force:
+            if not sys.stdin.isatty():
+                raise Fatal("--handover needs a terminal, or --force.")
+            if input("  Type HANDOVER to continue: ").strip() != "HANDOVER":
+                raise Fatal("aborted")
+        for step in (lambda: self.rotate_credentials(),
+                     lambda: self.escrow_credentials(target),
+                     lambda: self.shred_credentials()):
+            rc = step()
+            if rc:
+                raise Fatal("handover stopped — the remaining steps were not run, "
+                            "and nothing has been shredded.")
+        o.ok("handover complete")
+        return 0
+
     def _enrolled_qubes(self) -> list[str]:
         q = self.q
         return ["personal", "work", q["kali_clear"], q["kali_tor"], q["whonix"],
@@ -3210,9 +3276,92 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                             "sed -i 's|^deb |#deb |' "
                             "/etc/apt/sources.list.d/wazuh.list", check=False)
             o.ok(f"{tpl}: agent at {target}, re-pinned")
+        # Persist it. Telling the operator to make the same edit by hand was an
+        # invitation for the config and the machine to disagree, and the next
+        # provisioning run would then re-pin the agents to the old version.
+        if CONF_PATH.exists():
+            try:
+                stored = json.loads(CONF_PATH.read_text())
+            except json.JSONDecodeError:
+                stored = {}
+        else:
+            stored = {}
+        stored.setdefault("wazuh", {})["version"] = target
+        old_umask = os.umask(0o077)
+        try:
+            CONF_PATH.write_text(json.dumps(stored, indent=2) + "\n")
+        finally:
+            os.umask(old_umask)
+        CONF_PATH.chmod(0o600)
         o.say("")
-        o.info(f"update wazuh.version to {target} in golden-image.json so the next "
-               f"provisioning run installs the same thing")
+        o.ok(f"wazuh.version set to {target} in {CONF_PATH.name}")
+        o.info("commit that change to the provisioning repository — the golden "
+               "image is the git tag, not any one laptop")
+        return 0
+
+    def refresh_repo_keys(self) -> int:
+        """Re-fetch and re-verify the third-party repository keys.
+
+        Zeek's own documentation says that on Debian you must re-add the OBS key
+        by hand when it expires, and an expired key silently stops DPI updates.
+        The expiry watch tells you when; this is what it tells you to run.
+        """
+        o, r = self.out, self.r
+        print(f"\n{Out.B}{Out.C}══ Repository signing keys{Out.RST}")
+        jobs = [
+            (self.t["ids"], self.c["zeek"]["key_url"],
+             self.c["zeek"]["keyring_path"], self.c["zeek"].get("key_fpr", ""),
+             "Zeek OBS", "dearmor"),
+            (self.t["kali"], self.c["kali"]["keyring_url"],
+             self.c["kali"]["keyring_path"], self.c["kali"]["key_fpr"],
+             "Kali", "raw"),
+        ]
+        for tpl in (self.t["proxy"], self.t["ids"], self.t["kali"],
+                    self.t["personal"], self.t["wazuh"]):
+            jobs.append((tpl, self.c["wazuh"]["key_url"],
+                         self.c["wazuh"]["keyring_path"],
+                         self.c["wazuh"].get("key_fpr", ""), "Wazuh", "import"))
+
+        failures = 0
+        for tpl, url, path, fpr, label, how in jobs:
+            if not r.vm_exists(tpl):
+                continue
+            if self.args.dry_run:
+                o.info(f"[dry-run] refresh the {label} key in {tpl}")
+                continue
+            r.ensure_running(tpl)
+            if how == "dearmor":
+                cmd = (f"curl -fsSL {shlex.quote(url)} | gpg --dearmor "
+                       f"> {shlex.quote(path)} && chmod 644 {shlex.quote(path)}")
+            elif how == "raw":
+                cmd = (f"curl -fsSL {shlex.quote(url)} -o {shlex.quote(path)} && "
+                       f"chmod 644 {shlex.quote(path)}")
+            else:
+                cmd = (f"rm -f {shlex.quote(path)} && curl -fsSL {shlex.quote(url)} "
+                       f"| gpg --no-default-keyring "
+                       f"--keyring gnupg-ring:{shlex.quote(path)} --import && "
+                       f"chmod 644 {shlex.quote(path)}")
+            # Keep the old key until the new one has been verified: a failed
+            # refresh must not leave the template unable to update at all.
+            r.qrun(tpl, f"cp -a {shlex.quote(path)} {shlex.quote(path)}.prev "
+                        f"2>/dev/null || true", check=False)
+            try:
+                r.qrun(tpl, cmd)
+                self._verify_keyring(tpl, path, fpr, label)
+            except Fatal as e:
+                r.qrun(tpl, f"mv -f {shlex.quote(path)}.prev {shlex.quote(path)} "
+                            f"2>/dev/null || true", check=False)
+                o.warn(f"{tpl}: {label} refresh failed and was rolled back — {e}")
+                failures += 1
+                continue
+            r.qrun(tpl, f"rm -f {shlex.quote(path)}.prev", check=False)
+            r.qrun(tpl, "apt-get update", check=False)
+        if failures:
+            o.warn(f"{failures} key(s) could not be refreshed. If a fingerprint "
+                   f"changed, confirm the new one at the vendor's own site and "
+                   f"update the config first.")
+            return 1
+        o.ok("every pinned repository key re-fetched and re-verified")
         return 0
 
     # =======================================================================
@@ -3365,9 +3514,15 @@ def main() -> int:
                            "(default: vault) and record that it is there")
     life.add_argument("--shred-credentials", action="store_true",
                       help="destroy the dom0 copy — refuses without an escrow record")
+    life.add_argument("--handover", nargs="?", const="vault", metavar="QUBE",
+                      help="rotate, escrow and shred in that order, with one "
+                           "confirmation")
     life.add_argument("--upgrade-wazuh", action="store_true",
                       help="upgrade the SIEM in the supported order: manager, "
                            "then agents")
+    life.add_argument("--refresh-repo-keys", action="store_true",
+                      help="re-fetch and re-verify the pinned repository signing "
+                           "keys (what the expiry watch tells you to run)")
     args = p.parse_args()
 
     if args.list_phases:
@@ -3381,6 +3536,10 @@ def main() -> int:
         cfg = load_config(write_only=args.write_config, dry_run=args.dry_run)
         prov = Provisioner(cfg, args)
 
+        if args.handover:
+            return prov.handover_sequence(args.handover)
+        if args.refresh_repo_keys:
+            return prov.refresh_repo_keys()
         if args.rotate_credentials:
             return prov.rotate_credentials()
         if args.escrow_credentials:

@@ -121,6 +121,9 @@ DEFAULT_CONFIG: dict = {
         # ED65462EC8D5E4C5. 44C6513A...0BF6 is the retired one, still shipped.
         "key_fpr": "827C8569F2518CC677FECA1AED65462EC8D5E4C5",
         "key_fpr_legacy": "44C6513A8E4FB3D30875F758ED444FF07D8D0BF6",
+        # An independent second source for the same key. docs/VERIFICATION.md
+        # asks for this cross-check; check-upstream performs it.
+        "keyserver_url": "https://keyserver.ubuntu.com/pks/lookup?search=827C8569F2518CC677FECA1AED65462EC8D5E4C5&fingerprint=on&op=index",
         "metapackage": "kali-linux-default",
     },
     "zeek": {
@@ -1514,7 +1517,12 @@ def doctor(x: Ctx) -> int:
 
     for tool in ("git", "curl", "gpg", "rsync"):
         c.append(Check(f"{tool} installed", OK if shutil.which(tool) else FAIL,
-                       fix=f"./build_iso.py setup-host"))
+                       fix="./build_iso.py setup-host"))
+    # Without it the build cannot confirm the investigator templates actually
+    # made it into the finished image, which is the whole Tier 2 promise.
+    c.append(Check("bsdtar installed (checks the ISO's contents after the build)",
+                   OK if shutil.which("bsdtar") else FAIL,
+                   fix="./build_iso.py setup-host"))
 
     if not shutil.which(ce):
         c.append(Check(f"{ce} installed", FAIL, fix="./build_iso.py setup-host"))
@@ -2096,6 +2104,21 @@ def check_upstream(x: Ctx) -> int:
         extra = [f for f in fprs if f not in (k["key_fpr"], k["key_fpr_legacy"])]
         c.append(Check("Kali: keyring holds no unexpected key",
                        OK if not extra else WARN, ", ".join(extra)))
+        # docs/VERIFICATION.md says: "Do this cross-check on first build rather
+        # than trusting the blog post alone. Two independent sources agreeing is
+        # the standard you want before a police workstation trusts a package
+        # repository." So do it, every time, rather than asking.
+        try:
+            page = _fetch(k["keyserver_url"]).decode("utf-8", "replace")
+            c.append(Check("Kali: an independent keyserver knows this key",
+                           OK if k["key_fpr"].upper() in page.upper().replace(" ", "")
+                           else WARN,
+                           "keyserver.ubuntu.com",
+                           "two independent sources agreeing is the standard "
+                           "before a police workstation trusts a repository"))
+        except Exception as e:                               # noqa: BLE001
+            c.append(Check("Kali: independent keyserver reachable", WARN,
+                           f"{type(e).__name__}: {e}"))
     except Exception as e:                                   # noqa: BLE001
         c.append(Check("Kali: keyring reachable", WARN, f"{type(e).__name__}: {e}",
                        "network check skipped — re-run where the build host has "
