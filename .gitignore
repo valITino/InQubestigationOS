@@ -1,0 +1,39 @@
+# Machine-specific configuration. Both scripts write these on first run and
+# never overwrite your edits — they belong to the machine, not the repository.
+golden-image.json
+iso-build.json
+
+# Secrets. Nothing in this list may ever reach git.
+credentials.json
+CREDENTIALS-README.txt
+*.asc
+*.gpg
+*.pem
+*.key
+!docs/**/*.asc
+.backup-pass
+authd.pass
+
+# Build products and state.
+golden-image/
+investigator-iso/
+output/
+artifacts/
+*.iso
+*.iso.sha256
+BUILD-RECORD.txt
+build.log
+.build-state
+
+# Supply-chain drift record is committed; its scratch copies are not.
+supply-chain.lock.json.new
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editors
+*.swp
+*~
+.DS_Store

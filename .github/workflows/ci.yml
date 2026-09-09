@@ -1,0 +1,58 @@
+name: checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Monday 06:00 UTC. docs/GUIDE.md used to ask a human to check the Zeek OBS
+    # key and the Wazuh release every month; this does it instead.
+    - cron: "0 6 * * 1"
+
+jobs:
+  harness:
+    name: fake-dom0 harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile both scripts
+        run: python3 -m py_compile golden_image.py build_iso.py
+      - name: Run the harness
+        run: ./tests/run_tests.py
+      # Also run standalone so a failure names itself in the job summary.
+      - name: Configuration agrees with the code
+        if: always()
+        run: ./tests/config_checks.py
+      - name: Documentation agrees with the code
+        if: always()
+        run: ./tests/doc_checks.py
+
+  supply-chain:
+    name: supply chain drift
+    runs-on: ubuntu-latest
+    # Network-dependent: informational on a normal push, blocking on schedule.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compare pinned keys and versions against upstream
+        # --update on the scheduled run so the baseline moves forward with the
+        # world; the exit code still reflects the findings, so a rotated key or
+        # a dom0 security bulletin fails the job either way.
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ./build_iso.py check-upstream --update
+          else
+            ./build_iso.py check-upstream
+          fi
+      - name: Upload the refreshed baseline
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-lock
+          path: supply-chain.lock.json

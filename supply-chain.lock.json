@@ -1,0 +1,44 @@
+{
+  "checked": "2026-09-08",
+  "kali": {
+    "expiries": {
+      "44C6513A8E4FB3D30875F758ED444FF07D8D0BF6": 148,
+      "827C8569F2518CC677FECA1AED65462EC8D5E4C5": 586
+    },
+    "fingerprints": [
+      "827C8569F2518CC677FECA1AED65462EC8D5E4C5",
+      "44C6513A8E4FB3D30875F758ED444FF07D8D0BF6"
+    ],
+    "key_fpr": "827C8569F2518CC677FECA1AED65462EC8D5E4C5",
+    "keyring_sha1": "603374c107a90a69d983dbcb4d31e0d6eedfc325"
+  },
+  "qsb": {
+    "count": 118,
+    "latest": "qsb-118-2026.txt"
+  },
+  "wazuh": {
+    "latest": "4.14.7",
+    "pinned": "4.14.7"
+  },
+  "wazuh_key": {
+    "expiries": {
+      "0DCFCA5547B19D2A6099506096B3EE5F29111145": 249
+    },
+    "fingerprints": [
+      "0DCFCA5547B19D2A6099506096B3EE5F29111145"
+    ],
+    "pinned": "0DCFCA5547B19D2A6099506096B3EE5F29111145"
+  },
+  "wazuh_tools": {
+    "wazuh-certs-tool.sh": "8c93ed36d7b956a6e97a906aed6b6bc636d7cb55a15a41fd6e9c2aa825164216",
+    "wazuh-passwords-tool.sh": "29ce567ce1bcb4629a34f3ccfcaec7463a5418bcdd0ee96db5e25dbc0340f8eb"
+  },
+  "zeek": {
+    "expiries": {
+      "F9FA0223B56B116C363737EF5DA57BDD6DD785CA": 84
+    },
+    "fingerprints": [
+      "F9FA0223B56B116C363737EF5DA57BDD6DD785CA"
+    ]
+  }
+}
