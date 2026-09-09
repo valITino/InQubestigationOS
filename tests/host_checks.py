@@ -621,6 +621,13 @@ def check_ci_covers_both_families() -> None:
           and "runs-on: ubuntu-latest" in ubuntu_job
           and "run: ./tests/host_checks.py" in ubuntu_job,
           "the normal Ubuntu host check is missing")
+    if ubuntu_job:
+        apt_update = ubuntu_job.find("sudo apt-get update")
+        harness = ubuntu_job.find("run: ./tests/run_tests.py")
+        check("CI refreshes APT metadata before either live package probe",
+              0 <= apt_update < harness,
+              "stale hosted-runner indexes make host_checks fail both inside "
+              "run_tests.py and in its standalone CI step")
     fedora_job = job_body("fedora-host")
     check("CI has a dedicated Fedora host-check job", fedora_job is not None,
           "add a fedora-host job so DNF package availability is tested live")
