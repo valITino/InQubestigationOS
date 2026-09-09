@@ -119,7 +119,7 @@ backup-media:  ## (on the laptop) partition, format and label the backup disk
 	sudo ./golden_image.py --prepare-backup-media
 
 .PHONY: ci
-ci:  ## exactly what .github/workflows/ci.yml runs, locally
+ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
 	python3 -m py_compile golden_image.py build_iso.py
 	ruff check .
 	python3 -m bandit -q -lll -r build_iso.py golden_image.py tests
