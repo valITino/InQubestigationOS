@@ -83,7 +83,9 @@ InQubestigationOS/
 ├── tests/
 │   ├── run_tests.py           fake-dom0 harness: runs all 12 phases off Qubes
 │   ├── static_checks.py       assertions over every generated config file
+│   ├── host_checks.py         the build-host support must hold up per distro
 │   ├── doc_checks.py          the docs must not drift from the code
+│   ├── config_checks.py       the code and its configuration must agree
 │   └── qubes_stub.py          one stand-in for every dom0 command
 ├── .github/workflows/ci.yml   harness on every push, supply chain every Monday
 └── .gitignore                 keeps credentials and build artifacts out of git

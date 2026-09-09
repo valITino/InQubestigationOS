@@ -38,10 +38,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 FAILED: list[str] = []
 PASSED: list[str] = []
+# Coverage this run could not exercise. Kept and reported rather than left
+# implicit: a probe that quietly does not run makes "N/N pass" mean less than
+# it did the run before, with nothing in the output saying so.
+SKIPPED: list[str] = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     (PASSED if ok else FAILED).append(name if ok else f"{name}\n          {detail}")
+
+
+def skip(what: str, why: str) -> None:
+    SKIPPED.append(f"{what} — {why}")
 
 
 def load_build_iso():
@@ -156,14 +164,14 @@ def check_live_availability(bi) -> None:
         # A skipped probe is not a passing check — counting it as one would
         # make a host that cannot be probed look better tested than one that
         # can.
-        print("  SKIP  live package probe: no apt-get or dnf on this host")
+        skip("live package availability", "no apt-get or dnf on this host")
         return
     plan = bi.host_package_plan(fam, "docker")
     every = sorted({n for _, cands in plan for n in cands})
     avail = bi.packages_available(fam, every)
     if avail is None:
-        print(f"  SKIP  live package probe on {d.described()}: "
-              "the package manager could not be queried (no cache?)")
+        skip("live package availability",
+             f"the package manager on {d.described()} could not be queried")
         return
     for purpose, cands in plan:
         pick = next((c for c in cands if c in avail), "")
@@ -260,35 +268,57 @@ def check_doctor_fix(bi) -> None:
 
 
 def check_mock_is_conditional() -> None:
-    """The mock configuration must never be passed unconditionally."""
+    """The mock configuration must never be passed unconditionally.
+
+    Asserted through the AST rather than by matching source text: a regex over
+    the call site fails a correct reformatting and passes some incorrect
+    rewrites. What matters is the shape — the argv list handed to
+    generate-container-image.sh must not contain mock_config, and the only
+    place mock_config joins it must be inside a branch testing for mock.
+    """
     src = (ROOT / "build_iso.py").read_text()
-    check("the container image build no longer forces the mock code path",
-          not re.search(r'"tools/generate-container-image\.sh",\s*'
-                        r'x\.c\["container_engine"\],\s*\n?\s*x\.c\["mock_config"\]',
-                        src),
-          "generate-container-image.sh is called with the mock config as a "
-          "positional argument again — that runs `sudo mock --scrub=all`, and "
-          "mock is in no Debian or Kali suite, so the build aborts under set -e")
-    check("the mock config is guarded by a check that mock exists",
-          'shutil.which("mock")' in src,
-          "nothing tests for mock before selecting upstream's mock code path")
-    # The guard has to be the thing that decides the argument, not merely
-    # present somewhere else in the file.
-    # The guard has to be what decides the argument, not merely present
-    # somewhere else in the file: find the argv construction and the run, and
-    # require the append to sit inside a which("mock") branch between them.
-    m = re.search(r'gci\s*=\s*\[[^\]]*generate-container-image[^\]]*\]'
-                  r'(.*?)x\.run\(\*gci', src, re.S)
-    body = m.group(1) if m else ""
-    code = "\n".join(l for l in body.splitlines()
-                     if not l.lstrip().startswith("#"))
-    check("the mock argument is appended only inside that guard",
-          bool(m) and 'shutil.which("mock")' in code
-          and re.search(r'if shutil\.which\("mock"\):\s*\n\s*'
-                        r'gci\.append\(x\.c\["mock_config"\]\)', code)
-          is not None,
-          "could not find `if shutil.which(\"mock\"): gci.append(...)` between "
-          "building the argv and running it")
+    tree = ast.parse(src)
+
+    def seg(n) -> str:
+        return ast.get_source_segment(src, n) or ""
+
+    # Every list literal naming the upstream script.
+    argv_lists = [n for n in ast.walk(tree) if isinstance(n, ast.List)
+                  and any(isinstance(e, ast.Constant)
+                          and isinstance(e.value, str)
+                          and "generate-container-image.sh" in e.value
+                          for e in n.elts)]
+    check("the container image build's argv is built as a list", bool(argv_lists),
+          "could not find the call to tools/generate-container-image.sh")
+    for lst in argv_lists:
+        check("the mock config is not a fixed argument of the image build",
+              not any("mock_config" in seg(e) for e in lst.elts),
+              seg(lst) + " — passing it positionally runs `sudo mock "
+              "--scrub=all`, and mock is in no Debian or Kali suite, so the "
+              "build aborts under set -e")
+
+    # Every statement that appends mock_config to that argv must sit inside a
+    # test for mock being present.
+    appends = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+               and getattr(n.func, "attr", "") == "append"
+               and "mock_config" in seg(n)]
+    check("the mock config is appended somewhere", bool(appends),
+          "nothing ever adds it, so a host WITH mock silently loses the "
+          "chroot path upstream prefers")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if not any(a in ast.walk(node) for a in appends):
+            continue
+        check("the mock config is appended only under a test for mock",
+              'which("mock")' in seg(node.test),
+              f"guarded by `{seg(node.test)}` instead of a check that mock "
+              "is actually installed")
+    guarded = [a for a in appends
+               if any(a in ast.walk(n) for n in ast.walk(tree)
+                      if isinstance(n, ast.If) and 'which("mock")' in seg(n.test))]
+    check("every append of the mock config is guarded", len(guarded) == len(appends),
+          f"{len(appends) - len(guarded)} unguarded")
 
 
 def check_pypi_install_is_consented() -> None:
@@ -315,7 +345,6 @@ def check_pypi_install_is_consented() -> None:
                    and getattr(n.func, "id", "") == "ensure_pykickstart")
 
     total = calls_in(setup)
-    # Branches of the plan-execution loop that handle the __pykickstart__ step.
     guarded = 0
     for node in ast.walk(setup):
         if not isinstance(node, ast.If):
@@ -367,26 +396,22 @@ def check_install_gate(bi) -> None:
               not any(g in ("python3-yaml", "python3-pyyaml") for g in gaps),
               f"{gaps} — this message is printed on both families")
 
-        # The virtualenv the kickstart validator needs on Debian and Kali is
-        # only usable if ensurepip is there — Debian splits it into
-        # python3-venv, and `import venv` succeeds either way, so probing venv
-        # would miss it. Without this the package step never installs
-        # python3-venv unless something ELSE happened to be missing too.
-        bi._have_module = lambda n: n != "ensurepip"
-        check("a missing ensurepip triggers the install when a venv is needed",
+
+        # A host with everything EXCEPT a kickstart validator must still
+        # trigger the package install. Probing only Debian's half of this —
+        # ensurepip, from python3-venv — left the worse case unfixed: a Fedora
+        # host, where the validator IS packaged, skipped the install step and
+        # went to PyPI for a module dnf already had.
+        bi._have_module = lambda n: True
+        check("a missing kickstart validator alone triggers the package install",
               bi.host_gaps("docker", True) != [],
-              "setup-host would list the virtualenv step and then find it has "
-              "no way to build one")
-        check("a missing ensurepip is not a gap when no venv is needed",
-              bi.host_gaps("docker", False) == [],
-              "a Fedora host, which has a pykickstart package, would be told "
-              "to install packages it does not need")
+              "setup-host would install nothing and go straight to a PyPI "
+              "download, even on a distribution that packages the validator")
 
         # A genuinely complete host must still report nothing to do.
-        bi._have_module = lambda n: True
         check("a host with everything reports no gaps",
-              bi.host_gaps("docker", True) == [],
-              str(bi.host_gaps("docker", True)))
+              bi.host_gaps("docker", False) == [],
+              str(bi.host_gaps("docker", False)))
     finally:
         bi.shutil.which, bi._have_module = real_which, real_mod
 
@@ -400,14 +425,14 @@ def check_probe_itself(bi) -> None:
     """
     d = bi.host_distro()
     if d.family == "unknown":
-        print("  SKIP  probe control: no apt-get or dnf on this host")
+        skip("probe controls", "no apt-get or dnf on this host")
         return
     # A name no distribution has, and one every one of them does.
     certainly_absent = "zzzz-not-a-real-package-name-9f3c"
     certainly_present = "python3"
     got = bi.packages_available(d.family, [certainly_present, certainly_absent])
     if got is None:
-        print("  SKIP  probe control: the package manager could not be queried")
+        skip("probe controls", "the package manager could not be queried")
         return
     check("the probe finds a package that certainly exists",
           certainly_present in got,
@@ -534,6 +559,50 @@ def check_os_release_reading(bi) -> None:
           f"{'present' if bi.shutil.which('apt-get') else 'absent'}")
 
 
+def check_family_neutral_messages() -> None:
+    """Operator-facing text must not name one family's package to the other."""
+    src = (ROOT / "build_iso.py").read_text()
+    tree = ast.parse(src)
+    docstrings = set()
+    for node in ast.walk(tree):
+        b = getattr(node, "body", None)
+        if isinstance(b, list) and b and isinstance(b[0], ast.Expr) \
+                and isinstance(b[0].value, ast.Constant) \
+                and isinstance(b[0].value.value, str):
+            docstrings.add(id(b[0].value))
+    bare = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Constant) and isinstance(n.value, str)):
+            continue
+        if id(n) in docstrings or "python3-yaml" not in n.value:
+            continue
+        # Naming it alongside the other family's package is correct, and so is
+        # the bare name inside the package plan, where it IS the Debian answer.
+        if "python3-pyyaml" in n.value or n.value.strip() == "python3-yaml":
+            continue
+        bare.append(n.lineno)
+    check("no operator message names python3-yaml without its Fedora counterpart",
+          not bare,
+          "lines " + ", ".join(map(str, bare))
+          + " tell a Fedora operator to install a Debian package")
+
+
+def note_unprobed_family(bi) -> None:
+    """Say which family's package names were only checked against the ledger.
+
+    CI runs on one distribution, so the other family's names are verified
+    against KNOWN_ABSENT and nothing else. That is a real limit on what a
+    green run means, and it belongs in the output rather than in a reviewer's
+    head.
+    """
+    fam = bi.host_distro().family
+    other = {"debian": "fedora", "fedora": "debian"}.get(fam)
+    if other:
+        skip(f"live {other} package names",
+             f"this host is {fam}-family; {other} names are checked only "
+             "against the dated KNOWN_ABSENT ledger")
+
+
 def check_no_hardcoded_lists() -> None:
     """The two flat cross-distro lists must not come back."""
     src = (ROOT / "build_iso.py").read_text()
@@ -592,13 +661,18 @@ def main() -> int:
     check_mock_is_conditional()
     check_pypi_install_is_consented()
     check_install_gate(bi)
+    check_family_neutral_messages()
+    note_unprobed_family(bi)
     check_no_hardcoded_lists()
     check_pykickstart_advice()
 
     for f in FAILED:
         print(f"  FAIL  {f}")
+    for sk in SKIPPED:
+        print(f"  SKIP  {sk}")
     total = len(PASSED) + len(FAILED)
-    print(f"\n  {len(PASSED)}/{total} build-host checks pass")
+    tail = f", {len(SKIPPED)} skipped" if SKIPPED else ""
+    print(f"\n  {len(PASSED)}/{total} build-host checks pass{tail}")
     return 1 if FAILED else 0
 
 

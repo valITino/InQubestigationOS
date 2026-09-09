@@ -262,23 +262,41 @@ def main() -> int:
           "a work tree was created by a run that says it changes nothing")
 
     print("\nbuild host")
-    ph = subprocess.run([sys.executable, str(TESTS / "host_checks.py")],
+    # -B: these run from inside the checkout, and a __pycache__ left behind
+    # shows up as untracked files in the tree the harness is testing.
+    ph = subprocess.run([sys.executable, "-B", str(TESTS / "host_checks.py")],
                         capture_output=True, text=True, cwd=ROOT)
     print(ph.stdout.rstrip())
+    # A traceback goes to stderr. Swallowing it turned a crashed check script
+    # into a bare "see output above" with no output above.
+    if ph.stderr.strip():
+        print(ph.stderr.rstrip())
     stage("build_iso.py supports the hosts it claims to", ph.returncode == 0,
           "see output above")
 
     print("\nconfiguration")
-    pc = subprocess.run([sys.executable, str(TESTS / "config_checks.py")],
+    # -B: these run from inside the checkout, and a __pycache__ left behind
+    # shows up as untracked files in the tree the harness is testing.
+    pc = subprocess.run([sys.executable, "-B", str(TESTS / "config_checks.py")],
                         capture_output=True, text=True, cwd=ROOT)
     print(pc.stdout.rstrip())
+    # A traceback goes to stderr. Swallowing it turned a crashed check script
+    # into a bare "see output above" with no output above.
+    if pc.stderr.strip():
+        print(pc.stderr.rstrip())
     stage("the code and its configuration agree", pc.returncode == 0,
           "see output above")
 
     print("\ndocumentation")
-    p7 = subprocess.run([sys.executable, str(TESTS / "doc_checks.py")],
+    # -B: these run from inside the checkout, and a __pycache__ left behind
+    # shows up as untracked files in the tree the harness is testing.
+    p7 = subprocess.run([sys.executable, "-B", str(TESTS / "doc_checks.py")],
                         capture_output=True, text=True, cwd=ROOT)
     print(p7.stdout.rstrip())
+    # A traceback goes to stderr. Swallowing it turned a crashed check script
+    # into a bare "see output above" with no output above.
+    if p7.stderr.strip():
+        print(p7.stderr.rstrip())
     stage("documentation matches the code", p7.returncode == 0, "see output above")
 
     ok = sum(1 for _, o, _ in RESULTS if o)

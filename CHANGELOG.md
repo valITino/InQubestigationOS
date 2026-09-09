@@ -306,11 +306,14 @@ packages.debian.org, pkg.kali.org and mdapi.fedoraproject.org.
   rather than repeating a fix that cannot work.
 - `resolve_auto_values` raised `Fatal` for an underivable `mock_config` even on
   hosts where the value is then discarded unused.
-- New `tests/host_checks.py` (135 checks), wired into the harness, the Makefile
-  and CI. It pins each of the above against a dated ledger of packages verified
-  absent from each distribution, probes this host's real package manager, and
-  checks that `doctor --fix` invokes a script path that exists. Every fix was
-  mutation-tested: re-introducing each bug fails the suite.
+- New `tests/host_checks.py`, wired into the harness, the Makefile and CI. It
+  pins each of the above against a dated ledger of packages verified absent
+  from each distribution, probes this host's real package manager (with a
+  control at both ends, so a broken probe cannot pass silently), and checks
+  that `doctor --fix` invokes a script path that exists. It reports what it
+  could not exercise — the other family's package names, on a one-distribution
+  CI runner — rather than letting a green run imply more than it covered.
+  Every fix was mutation-tested: re-introducing each bug fails the suite.
 
 - `doctor` now checks the build host is x86-64. The docs called that the one
   real hardware requirement and nothing tested it, so an ARM VM would have got

@@ -1266,7 +1266,8 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
         import yaml
     except ImportError:
         raise Fatal(
-            "python3-yaml is needed to edit builder.yml safely.\n"
+            "PyYAML is needed to edit builder.yml safely "
+            "(python3-yaml on Debian and Kali, python3-pyyaml on Fedora).\n"
             "     Appending raw text would create duplicate top-level keys, and\n"
             "     YAML keeps only the last one — that silently drops the upstream\n"
             "     component list and the rpm/deb signing keys.\n"
@@ -2291,11 +2292,12 @@ def doctor(x: Ctx) -> int:
 
     try:
         import yaml                                          # noqa: F401
-        c.append(Check("python3-yaml present (builder.yml is merged, not appended)",
+        c.append(Check("PyYAML present (builder.yml is merged, not appended)",
                        OK))
     except ImportError:
-        c.append(Check("python3-yaml present (builder.yml is merged, not appended)",
-                       FAIL, "missing", "./build_iso.py setup-host"))
+        c.append(Check("PyYAML present (builder.yml is merged, not appended)",
+                       FAIL, "missing — python3-yaml on Debian and Kali, "
+                       "python3-pyyaml on Fedora", "./build_iso.py setup-host"))
 
     payload = Path(__file__).resolve().parent / "golden_image.py"
     c.append(Check("provisioning payload beside this script",
@@ -2649,7 +2651,7 @@ def _have_module(name: str) -> bool:
         return False
 
 
-def host_gaps(ce: str, need_venv: bool = False) -> list[str]:
+def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
     """Everything the build host is missing that a package can supply.
 
     This used to probe five binaries and nothing else, so on a host that
@@ -2667,13 +2669,15 @@ def host_gaps(ce: str, need_venv: bool = False) -> list[str]:
         gaps.append("PyYAML")
     if not iso_reader():
         gaps.append("an ISO reader (bsdtar/7z/isoinfo/xorriso)")
-    # Debian-family distributions split ensurepip out of python3 and into
-    # python3-venv, and without it `python3 -m venv` produces an environment
-    # with no pip. `venv` itself imports fine either way, so it is not the
-    # thing to probe. Only a gap when a virtualenv is actually going to be
-    # built — which is only where the distribution has no pykickstart package.
-    if need_venv and not _have_module("ensurepip"):
-        gaps.append("ensurepip, for the kickstart validator's virtualenv")
+    # A missing kickstart validator is a gap on BOTH families, and probing
+    # only Debian's half of it — ensurepip, which python3-venv supplies — left
+    # the worse case unfixed: a Fedora host that already had everything else
+    # skipped the package step entirely and went to PyPI for a module dnf
+    # packages as python3-kickstart. Whatever the distribution has for this,
+    # the install step is what fetches it.
+    if need_ks:
+        gaps.append("a kickstart validator (a package where one exists, or "
+                    "the venv support to install one where none does)")
     return gaps
 
 
@@ -2737,10 +2741,12 @@ def setup_host(x: Ctx) -> int:
     ce = x.c["container_engine"]
     plan: list[list[str]] = []
 
-    # Resolved once: it decides both whether the package step needs to supply
-    # ensurepip and whether the virtualenv step is listed at all.
-    need_venv = not kickstart_python(x)[0]
-    gaps = host_gaps(ce, need_venv)
+    # Resolved once: it decides both whether the package step has something to
+    # fetch for the kickstart validator and whether the virtualenv step is
+    # listed at all. The virtualenv step re-checks and does nothing if the
+    # package install satisfied it, so a Fedora host uses its own package.
+    need_ks = not kickstart_python(x)[0]
+    gaps = host_gaps(ce, need_ks)
     if gaps:
         x.info("missing on this host: " + ", ".join(gaps))
         if fam == "debian":
@@ -2761,10 +2767,14 @@ def setup_host(x: Ctx) -> int:
     # the package install above may still provide it — ensure_pykickstart
     # re-checks and does nothing if it did.
     # Before the virtualenv that goes inside it, so the plan reads in the
-    # order it runs.
-    plan.append(["__mkdir__", str(x.work)])
+    # order it runs. Only when it is actually absent: appending it
+    # unconditionally made the "nothing to do — the host is already set up"
+    # branch below unreachable, so a fully prepared host was still asked to
+    # approve a plan.
+    if not x.work.is_dir():
+        plan.append(["__mkdir__", str(x.work)])
 
-    if need_venv:
+    if need_ks:
         plan.append(["__pykickstart__"])
 
     if in_qube():
