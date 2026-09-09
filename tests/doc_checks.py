@@ -354,6 +354,56 @@ def check_docs_do_not_contradict() -> None:
               "the chain does not exist in Qubes")
 
 
+def check_stdlib_claim() -> None:
+    """A script the docs call "standard library only" must actually be one.
+
+    README.md and docs/DESIGN.html said BOTH scripts were standard-library
+    Python with no `pip install`, giving dom0's lack of a network as the
+    reason. That reason only ever applied to golden_image.py: build_iso.py
+    imports PyYAML to edit builder.yml, and pykickstart to check the generated
+    kickstart. The claim is now scoped to the script it is true of, and this
+    keeps it that way.
+    """
+    # Modules that ship with this interpreter, plus the repository's own.
+    local = {p.stem for p in ROOT.glob("*.py")} | {"tests"}
+
+    def third_party(script: str) -> set[str]:
+        found = set()
+        for node in ast.walk(ast.parse((ROOT / script).read_text())):
+            if isinstance(node, ast.Import):
+                found |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])
+        return {m for m in found
+                if m not in sys.stdlib_module_names and m not in local}
+
+    gi = third_party("golden_image.py")
+    check("golden_image.py really is standard-library only", not gi,
+          "the docs say it is, and dom0 has no network to install from: "
+          + ", ".join(sorted(gi)))
+
+    # build_iso.py runs on a networked build host, so a third-party import is
+    # allowed — but each one has to be accounted for, because setup-host must
+    # install it and the docs must not claim it does not exist.
+    known = {"yaml"}
+    bi = third_party("build_iso.py")
+    check("build_iso.py imports no unaccounted third-party module",
+          bi <= known,
+          "new third-party imports: " + ", ".join(sorted(bi - known))
+          + " — setup-host has to install them and README.md/DESIGN.html "
+            "describe what they are")
+
+    for doc, text in [(d.name, d.read_text()) for d in DOCS] + \
+                     [(h.name, html_text(h)) for h in HTML_DOCS]:
+        flat = " ".join(text.split())
+        for claim in ("Both are standard-library", "Both are standard library",
+                      "Two Python 3 scripts, standard library only"):
+            check(f"{doc}: does not claim both scripts are standard-library only",
+                  claim not in flat,
+                  "build_iso.py imports " + ", ".join(sorted(known))
+                  + "; scope the claim to golden_image.py")
+
+
 def check_no_secrets() -> None:
     """Nothing that looks like key material may be committed."""
     bad = []
@@ -387,6 +437,7 @@ def main() -> int:
     check_product_name()
     check_supply_chain()
     check_docs_do_not_contradict()
+    check_stdlib_claim()
     check_no_secrets()
 
     for f in FAILED:

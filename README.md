@@ -99,10 +99,16 @@ the installer kickstart.
 | `build_iso.py` | Build host (Debian 13, Kali or Fedora; Docker; ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
 | `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests |
 
-Both are standard-library Python 3 — no `pip install`, which matters because
-dom0 has no network by design. Both embed their configuration, write it as JSON
-on first run, and never overwrite your edits. Both are resumable: completed
-phases are recorded and skipped.
+`golden_image.py` is standard-library Python 3 — no `pip install`, which
+matters because dom0 has no network by design. `build_iso.py` runs on a
+networked build host, and needs PyYAML to edit `builder.yml` safely;
+`setup-host` installs your distribution's package for it. It also uses
+pykickstart to check the generated kickstart before the build, and on Debian
+and Kali — which have not packaged pykickstart since 2019 — `setup-host` puts
+that one, alone, in a virtualenv under `work_dir` rather than installing into
+the system interpreter. Both scripts embed their configuration, write it as
+JSON on first run, and never overwrite your edits. Both are resumable:
+completed phases are recorded and skipped.
 
 ## Before you ship this to anyone
 
