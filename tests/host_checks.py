@@ -622,8 +622,13 @@ def check_ci_covers_both_families() -> None:
           and "run: ./tests/host_checks.py" in ubuntu_job,
           "the normal Ubuntu host check is missing")
     if ubuntu_job:
+        universe = ubuntu_job.find("add-apt-repository --yes universe")
         apt_update = ubuntu_job.find("sudo apt-get update")
         harness = ubuntu_job.find("run: ./tests/run_tests.py")
+        check("CI enables Ubuntu universe before probing build-host packages",
+              0 <= universe < apt_update,
+              "docker.io and libarchive-tools are in universe; apt-get update "
+              "cannot expose a repository that is disabled")
         check("CI refreshes APT metadata before either live package probe",
               0 <= apt_update < harness,
               "stale hosted-runner indexes make host_checks fail both inside "

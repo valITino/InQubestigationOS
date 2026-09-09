@@ -24,8 +24,10 @@ jobs:
       # host_checks asks apt-cache about every package in the build-host plan.
       # Hosted-runner indexes can be stale or absent; without an update the
       # same probe fails once in run_tests.py and again in the standalone step.
-      - name: Refresh live APT package metadata
-        run: sudo apt-get update
+      - name: Enable the Ubuntu package set used by setup-host
+        run: |
+          sudo add-apt-repository --yes universe
+          sudo apt-get update
       - name: Compile both scripts
         run: python3 -m py_compile golden_image.py build_iso.py
       - name: Lint Python
