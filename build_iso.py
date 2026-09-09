@@ -1963,7 +1963,13 @@ def host_os_release() -> dict[str, str]:
 DEBIAN_IDS = {"debian", "ubuntu", "kali", "raspbian", "linuxmint", "pop",
               "elementary", "devuan", "parrot", "neon", "zorin", "trisquel"}
 FEDORA_IDS = {"fedora", "rhel", "centos", "rocky", "almalinux", "ol",
-              "scientific", "qubes"}
+              "scientific"}
+# "qubes" is deliberately in NEITHER table. dom0 is the only place that ID is
+# expected, and doctor refuses to build there anyway; leaving it out means an
+# ID this script does not know falls through to ID_LIKE, which is what
+# actually says how packages are installed. Claiming "qubes" for one family
+# would classify a Qubes app qube of the OTHER family wrongly, and an app qube
+# is a supported build host.
 
 
 class HostDistro:

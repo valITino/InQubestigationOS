@@ -194,6 +194,17 @@ def check_distro_detection(bi) -> None:
               f"described() said {d.described()!r}")
         check(f"{ident} says it came from os-release",
               d.how == "/etc/os-release", d.how)
+    # A Qubes app qube is a supported build host, and it can be of either
+    # family. An ID this script does not recognise must therefore defer to
+    # ID_LIKE rather than being claimed by one family's table.
+    for like, want in (("debian", "debian"), ("fedora", "fedora")):
+        d = bi.host_distro({"ID": "qubes", "ID_LIKE": like,
+                            "PRETTY_NAME": f"Qubes ({like})"})
+        check(f"an unrecognised ID with ID_LIKE={like} follows ID_LIKE",
+              d.family == want,
+              f"got {d.family}; claiming an unknown ID for one family "
+              "misclassifies app qubes of the other")
+
     # The whole point: two derivatives must not be indistinguishable.
     kali = bi.host_distro({"ID": "kali", "ID_LIKE": "debian",
                            "PRETTY_NAME": "Kali GNU/Linux Rolling"})
