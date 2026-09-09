@@ -590,10 +590,10 @@ def check_family_neutral_messages() -> None:
 def note_unprobed_family(bi) -> None:
     """Say which family's package names were only checked against the ledger.
 
-    CI runs on one distribution, so the other family's names are verified
-    against KNOWN_ABSENT and nothing else. That is a real limit on what a
-    green run means, and it belongs in the output rather than in a reviewer's
-    head.
+    One process runs on one distribution, so the other family's names are
+    verified against KNOWN_ABSENT in that process. CI runs this suite once on
+    each family, but a standalone run must still state its own coverage rather
+    than silently taking credit for a different job.
     """
     fam = bi.host_distro().family
     other = {"debian": "fedora", "fedora": "debian"}.get(fam)
@@ -606,23 +606,30 @@ def note_unprobed_family(bi) -> None:
 def check_ci_covers_both_families() -> None:
     """CI must live-query both supported package-manager families."""
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    def job_body(name: str) -> str | None:
+        match = re.search(
+            rf"(?ms)^  {re.escape(name)}:\n"
+            rf"(?P<body>.*?)(?=^  [A-Za-z_][A-Za-z0-9_-]*:\n|\Z)",
+            workflow,
+        )
+        return match.group("body") if match else None
+
+    ubuntu_job = job_body("harness")
     check("CI runs the Debian-family live package probe on Ubuntu",
-          "runs-on: ubuntu-latest" in workflow
-          and "run: ./tests/host_checks.py" in workflow,
+          ubuntu_job is not None
+          and "runs-on: ubuntu-latest" in ubuntu_job
+          and "run: ./tests/host_checks.py" in ubuntu_job,
           "the normal Ubuntu host check is missing")
-    fedora_job = re.search(
-        r"(?ms)^  fedora-host:\n(?P<body>.*?)(?=^  [a-z][a-z-]*:\n|\Z)",
-        workflow,
-    )
+    fedora_job = job_body("fedora-host")
     check("CI has a dedicated Fedora host-check job", fedora_job is not None,
           "add a fedora-host job so DNF package availability is tested live")
     if fedora_job:
-        body = fedora_job.group("body")
         check("the Fedora host-check job runs in a Fedora container",
-              re.search(r"(?m)^\s+image:\s*fedora:\d+\s*$", body) is not None,
+              re.search(r"(?m)^\s+image:\s*fedora:\d+\s*$", fedora_job) is not None,
               "the fedora-host job has no versioned Fedora container")
         check("the Fedora job runs the complete host-check suite",
-              "python3 ./tests/host_checks.py" in body,
+              "python3 ./tests/host_checks.py" in fedora_job,
               "Fedora starts, but host_checks.py is not executed there")
 
 
