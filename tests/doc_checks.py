@@ -216,6 +216,12 @@ def check_config_keys() -> None:
             key = m.group(1)
             if key.split(".")[0] not in roots:
                 continue
+            # `credentials.json` is a filename, not credentials.<key>.
+            if key.rsplit(".", 1)[-1] in {
+                    "json", "py", "md", "sh", "log", "asc", "gpg", "html", "txt",
+                    "conf", "yml", "yaml", "xml", "pem", "ks", "list", "rules",
+                    "service", "timer", "mount", "desktop", "cfg", "pass"}:
+                continue
             check(f"{doc.name}: config key `{key}` exists",
                   key in known, "not a key in either DEFAULT_CONFIG")
 

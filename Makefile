@@ -16,6 +16,10 @@ help:  ## show this help
 	     END{print ""}' $(MAKEFILE_LIST)
 
 # --- build host ------------------------------------------------------------
+.PHONY: bootstrap
+bootstrap:  ## host, key, key backup, checks, plan and build — in that order
+	./build_iso.py bootstrap $(if $(UID),--uid "$(UID)",)
+
 .PHONY: host
 host:  ## install and configure everything the build host needs
 	./build_iso.py setup-host
@@ -85,6 +89,14 @@ shred:  ## (on the laptop) destroy the dom0 copy — refuses without an escrow r
 .PHONY: verify
 verify:  ## (on the laptop) run the acceptance tests
 	sudo ./golden_image.py --verify
+
+.PHONY: status
+status:  ## (on the laptop) phases, credentials, timers, recent results
+	sudo ./golden_image.py --status
+
+.PHONY: issue
+issue:  ## (on the laptop) verify, then record the release (OPERATOR="Name")
+	sudo ./golden_image.py --issue --operator "$(OPERATOR)"
 
 .PHONY: handover
 handover:  ## (on the laptop) rotate, escrow and shred, in that order

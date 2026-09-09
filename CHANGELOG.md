@@ -213,6 +213,23 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
 - `gen-key` adopts the only key in the keyring rather than asking; it takes
   `--passphrase-file` for a scripted key-management process.
 
+- `bootstrap` runs the whole build side in order — setup-host, gen-key,
+  backup-key, doctor, check-upstream, plan, build — stopping at the first
+  failure and skipping what already succeeded.
+- `preflight` runs `doctor` for the build actions and refuses on a blocking
+  row, and re-checks the supply chain when the recorded baseline is older than
+  `check_upstream_max_age_days`. An empty `iso_sign_key` fails there rather
+  than four hours later beside the finished image.
+- `--issue --operator "<name>"` re-runs the acceptance tests, refuses if any
+  fail or if credentials.json is still on the machine, and writes the release
+  record. `--status` answers "where is this machine" in one command.
+- A `golden-key-refresh.timer` renews an expiring repository key by running
+  `--refresh-repo-keys`, which verifies against the pinned fingerprint and
+  rolls the old key back on mismatch. A genuinely *rotated* key therefore
+  fails and stays a decision for a person, which is the correct outcome.
+- The Wazuh passwords tool being absent is fatal rather than a warning: it
+  would leave the SIEM admin password at a value nobody has.
+
 **Deliberately still manual**, because automating them would be wrong: reading
 the fingerprint out over an independent channel, choosing the disk-encryption
 passphrase, accepting a rotated upstream signing key, applying dom0 updates that

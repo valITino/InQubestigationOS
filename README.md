@@ -50,15 +50,15 @@ templates, and Whonix.
 
 ```bash
 # On a Debian 13 or Fedora host with ~250 GB free — nothing pre-installed
-./build_iso.py setup-host                       # Docker, group, deps, bind-dirs
-./build_iso.py gen-key --uid "Your Unit <you@example.org>"
-./build_iso.py doctor                           # is this host ready? changes nothing
-./build_iso.py --dry-run all                    # read the whole plan
-./build_iso.py all                              # templates, then a signed ISO
-./build_iso.py write-usb --device /dev/sdX      # verified, then written, then read back
+git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
+./build_iso.py bootstrap          # host, key, key backup, checks, plan, build
+./build_iso.py write-usb --wait   # plug the stick in when it asks
 ```
 
-Or `make host key doctor plan all-build usb`.
+`bootstrap` runs `setup-host`, `gen-key`, `backup-key`, `doctor`,
+`check-upstream`, the dry-run plan and the build, stopping at the first failure.
+Every step is idempotent, so fixing a cause and re-running skips what already
+succeeded. Each is also available on its own — `make` lists them.
 
 Boot the USB and install. First boot provisions itself; there is nothing to do
 by hand, and the recurring maintenance installs itself as timers.
@@ -129,6 +129,7 @@ Most of those steps are now commands or timers.
 
 | Was | Now |
 |---|---|
+| Seven commands in the right order to get from a clone to a signed image | `./build_iso.py bootstrap` |
 | Install Docker, join its group, log out and back in | `./build_iso.py setup-host` |
 | `gpg --quick-generate-key`, copy the fingerprint into JSON | `./build_iso.py gen-key --uid "..."` |
 | `$EDITOR iso-build.json`, match `mock_config` to the release by hand | `./build_iso.py --set key=value`; the chroot derives itself |
@@ -151,6 +152,9 @@ Most of those steps are now commands or timers.
 | Notice `iso_sign_key` is empty before shipping an unsigned image | a real build refuses; `--allow-unsigned` is an explicit, testing-only choice |
 | "Disable the agent in kali-tor for the duration and note it in the case log" | `--case-mode anonymous --case <id>`, which masks the agent and writes the log entry |
 | `journalctl -f`, `systemctl list-timers`, and knowing which files to read | `--status` |
+| "All must pass before the laptop leaves your desk" | `--issue --operator "<name>"` re-runs the tests, refuses if the credentials are still on the machine, and writes the release record |
+| Re-add an expiring repository key when the watch tells you to | a timer runs `--refresh-repo-keys`, which renews against the pinned fingerprint and rolls back on mismatch — a genuinely *rotated* key still stops for a person |
+| Click through Anaconda | `install.unattended` — everything but the disk passphrase |
 | Give the template a netvm when apt fails through the update proxy, then clear it | done automatically for that one install, and the netvm is always restored |
 | Install the SIEM stack by hand on a Tier 1 build | phase 8 installs it from the already-configured, already-verified repository |
 | Decide whether this machine has the RAM for a local SIEM | `wazuh.mode: auto` |

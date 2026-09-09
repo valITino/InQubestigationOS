@@ -115,6 +115,9 @@ DEFAULT_CONFIG: dict = {
     "cache_templates": [],
 
     "auto_provision": True,
+    # How stale the recorded supply-chain baseline may be before a build
+    # re-checks it automatically. 0 disables the automatic check entirely.
+    "check_upstream_max_age_days": 7,
 
     # Anaconda answers. With "unattended": false (the default) the installer
     # behaves exactly as before and a person drives it.
@@ -296,6 +299,20 @@ class Ctx:
         """
         fp = (self.c.get("iso_sign_key") or "").strip()
         if not fp:
+            # Fail here, not four hours later next to the finished image.
+            if self.args.action in ("iso", "all") and not self.args.dry_run \
+                    and not getattr(self.args, "allow_unsigned", False):
+                raise Fatal(
+                    "iso_sign_key is empty, so this build would produce an "
+                    "UNSIGNED image.\n"
+                    "     An unsigned image passed around on USB sticks is "
+                    "exactly the supply-chain\n     problem this design exists "
+                    "to prevent.\n\n"
+                    '     ./build_iso.py gen-key --uid "Your Unit <you@example.org>"\n'
+                    "     ./build_iso.py gen-key --use-key auto      (adopt an "
+                    "existing key)\n\n"
+                    "     Or --allow-unsigned to build one deliberately for "
+                    "testing.")
             return
         if "BEGIN PGP" in fp or "PRIVATE KEY" in fp:
             raise Fatal(
@@ -459,6 +476,17 @@ def preflight(x: Ctx, tier2: bool):
                     "     golden_image.py must sit beside this script — it is what "
                     "gets embedded into the ISO.")
     x.ok(f"provisioning payload found: {payload.name}")
+
+    # doctor was a separate step somebody had to remember. It reports every
+    # blocking condition this build would hit, so run it as part of the build.
+    if x.args.action in ("templates", "iso", "all") and not x.args.dry_run \
+            and not getattr(x.args, "skip_doctor", False):
+        x.say("")
+        if doctor(x):
+            raise Fatal("this host is not ready — see the blocking rows above.\n"
+                        "     ./build_iso.py doctor --fix   fixes what this script "
+                        "owns.\n"
+                        "     --skip-doctor builds anyway.")
     return payload
 
 
@@ -548,6 +576,71 @@ def setup_builder(x: Ctx):
         x.ok(f"qubes-release sources at {conf}")
     x.mark("builder")
 
+
+
+# ---------------------------------------------------------------------------
+#  bootstrap — the whole build side, in the right order
+#
+#  Getting from a freshly cloned repository to a written USB was seven separate
+#  invocations that had to happen in a particular order, and `all` covered only
+#  two of them. Each step here is the command the guide documents; running them
+#  in sequence is what nobody should have to remember.
+# ---------------------------------------------------------------------------
+def bootstrap(x: Ctx, args) -> int:
+    steps: list[tuple[str, str, list[str]]] = [
+        ("setup-host", "install and configure the build host", ["setup-host"]),
+        ("gen-key", "create or adopt the signing key", ["gen-key"]),
+        ("backup-key", "back up the signing key before anything can lose it",
+         ["backup-key"]),
+        ("doctor", "confirm the host is ready", ["doctor"]),
+        ("check-upstream", "confirm the pinned keys and versions are current",
+         ["check-upstream", "--update"]),
+        ("plan", "print the whole build plan", ["--dry-run", "all"]),
+        ("build", "build the templates and the ISO", ["all"]),
+    ]
+    if getattr(args, "uid", None):
+        steps[1] = ("gen-key", steps[1][1], ["gen-key", "--uid", args.uid])
+    if getattr(args, "to", None):
+        steps[2] = ("backup-key", steps[2][1], ["backup-key", "--to", args.to])
+
+    print(f"\n{B}{C}══ bootstrap{RST}")
+    print("\n  This runs, stopping at the first failure:\n")
+    for i, (name, why, argv) in enumerate(steps, start=1):
+        print(f"    {i}. {name:15s} {why}")
+    print(f"""
+  Each is resumable and each is idempotent, so if one fails you can fix the
+  cause and run bootstrap again — the completed ones are skipped.
+
+  Not included, because they need you: writing the USB (plug the stick in, then
+  ./build_iso.py write-usb --wait), and reading the fingerprint out over a
+  channel independent of the image.
+""")
+    if args.dry_run:
+        x.info("[dry-run] nothing executed")
+        return 0
+    if not confirmed(x, "Start?"):
+        raise Fatal("aborted")
+
+    me = [sys.executable, str(Path(__file__).resolve())]
+    passthrough = ["--yes"] if getattr(args, "assume_yes", False) else []
+    for i, (name, _why, argv) in enumerate(steps, start=1):
+        print(f"\n{B}{C}══ bootstrap {i}/{len(steps)}: {name}{RST}")
+        rc = subprocess.run(me + argv + passthrough).returncode
+        if rc != 0:
+            raise Fatal(f"bootstrap stopped at step {i} ({name}), exit {rc}.\n"
+                        f"     Fix the cause and run bootstrap again — completed "
+                        f"steps are skipped.")
+    print(f"""
+{B}{C}══ bootstrap complete{RST}
+
+  The image, its checksum, its signature, the public key, verify-iso.sh,
+  verify-iso.ps1 and FINGERPRINT.txt are in {x.out_dir}
+
+  Next:
+    plug the stick in, then  ./build_iso.py write-usb --wait
+    and give colleagues the fingerprint through a channel that is NOT the stick.
+""")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2662,6 +2755,25 @@ def _days_left(epoch: str) -> int | None:
         return None
 
 
+def upstream_check_is_stale(x: Ctx) -> bool:
+    """Has the supply chain been checked recently enough to skip it now?"""
+    days = int(x.c["check_upstream_max_age_days"])
+    if days <= 0:
+        return False
+    if not LOCK_PATH.exists():
+        return True
+    try:
+        when = json.loads(LOCK_PATH.read_text()).get("checked", "")
+        age = (datetime.now() - datetime.strptime(when, "%Y-%m-%d")).days
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True
+    if age < days:
+        x.info(f"supply chain last checked {age} day(s) ago — skipping "
+               f"(check_upstream_max_age_days = {days})")
+        return False
+    return True
+
+
 def check_upstream(x: Ctx) -> int:
     x.phase("check-upstream", "are the pinned keys and versions still current?")
     update = getattr(x.args, "update", False)
@@ -3395,6 +3507,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 lifecycle
+  bootstrap        all of the below, in order, stopping at the first failure
   setup-host       install and configure everything the build host needs
   gen-key          create (or adopt) the ISO signing key and record it
   doctor           check the host is ready; change nothing
@@ -3413,7 +3526,7 @@ lifecycle
                    choices=["iso", "templates", "all", "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
                             "write-usb", "config", "sign",
-                            "backup-key", "restore-key"],
+                            "backup-key", "restore-key", "bootstrap"],
                    help="what to do (default: iso)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true", help="skip the warning prompt")
@@ -3453,6 +3566,8 @@ lifecycle
     p.add_argument("--iso", metavar="PATH",
                    help="sign: the image to sign (default: the built one)")
     c = p.add_argument_group("check-upstream")
+    p.add_argument("--skip-doctor", action="store_true",
+                   help="do not run the readiness checks before building")
     p.add_argument("--skip-upstream", action="store_true",
                    help="do not check the supply chain before building")
     c.add_argument("--update", action="store_true",
@@ -3479,6 +3594,9 @@ lifecycle
             print(f"{Y}DRY RUN — nothing will be changed{RST}")
         x.say(f"work dir: {x.work}")
         x.say(f"log:      {x.log}")
+
+        if args.action == "bootstrap":
+            return bootstrap(x, args)
 
         if args.action == "config":
             rc = 0
@@ -3527,10 +3645,12 @@ lifecycle
         resolve_auto_values(x)
         payload = preflight(x, tier2)
         if args.action in ("templates", "iso", "all") and not args.dry_run \
-                and not args.skip_upstream:
+                and not args.skip_upstream and upstream_check_is_stale(x):
             # "Remember to run check-upstream before a first build" is not a
             # thing to remember. A rotated key or a dom0 bulletin found here
-            # costs a minute; found afterwards it costs the build.
+            # costs a minute; found afterwards it costs the build. Gated on the
+            # age of the recorded baseline so a same-day rebuild is not slowed
+            # down, and skipped entirely when the host has no network.
             if check_upstream(x):
                 raise Fatal(
                     "the supply-chain check above found something blocking.\n"

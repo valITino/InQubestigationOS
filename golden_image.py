@@ -1661,6 +1661,11 @@ for kr in {shlex.quote(self.c['zeek']['keyring_path'])} \\
         }}' | while read -r line; do
         logger -t golden-image "$line"
         echo "$line" >> /var/log/golden-image-key-expiry.log
+        # Refreshing is safe to do unattended precisely because
+        # --refresh-repo-keys re-verifies the fetched key against its PINNED
+        # fingerprint and rolls the old one back on any mismatch. It renews a
+        # key; it never accepts a new one.
+        touch /var/run/golden-image-key-refresh-wanted 2>/dev/null || true
     done
 done
 """)
@@ -2099,9 +2104,14 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
                        "keeps whatever the installer generated. Reset it before "
                        "issuing the laptop.")
         else:
-            o.warn("wazuh-passwords-tool.sh not available — the admin password is")
-            o.warn("  whatever the indexer generated. Retrieve it from")
-            o.warn("  /etc/wazuh-indexer/ or reset it before issuing the laptop.")
+            raise Fatal(
+                "wazuh-passwords-tool.sh is not present, so the dashboard admin "
+                "password would stay\n     whatever the installer generated — a "
+                "value nobody has, on the machine that\n     watches the whole "
+                "workstation. It is checksum-pinned and fetched automatically "
+                "when\n     the qube has a route; if it does not, bake it into "
+                "the template or give the qube\n     a route and re-run "
+                "'--phase 8'.")
 
         o.info("group 13 asserts wazuh-manager, -indexer and -dashboard are active")
         o.info("group 13 asserts the certificate layout the three services "
@@ -2551,6 +2561,37 @@ else
     mkdir -p /etc/motd.d
     echo "  *** BACKUP RESTORE VERIFICATION FAILED — see $LOG ***" \
         > /etc/motd.d/golden-image-restore
+fi
+""")
+
+        self._dom0_unit(
+            "golden-key-refresh",
+            "Renew a repository signing key that is close to expiry",
+            "Tue 05:30",
+            f"""#!/bin/bash
+# Golden image — renew, never accept.
+# The expiry watch in sys-dpi flags a key inside its warning window. Renewing it
+# is safe unattended because --refresh-repo-keys verifies whatever it fetches
+# against the PINNED fingerprint and rolls the old key back if it does not
+# match. A key that has genuinely been ROTATED therefore fails here and stays a
+# decision for a person, which is correct.
+set -u
+LOG=/var/log/golden-image-key-refresh.log
+if {shlex.quote(str(me))} --refresh-repo-keys --force >> "$LOG" 2>&1; then
+    logger -t golden-image "repository keys refreshed"
+    rm -f /etc/motd.d/golden-image-keys
+else
+    logger -t golden-image "key refresh FAILED — a key may have been rotated"
+    mkdir -p /etc/motd.d
+    {{
+      echo
+      echo "  A repository signing key could not be renewed."
+      echo "  It may have been ROTATED, which is a decision for a person:"
+      echo "  confirm the new fingerprint at the vendor's own site, then"
+      echo "      ./build_iso.py --set <name>.key_fpr=<new>   (on the build host)"
+      echo "  See $LOG"
+      echo
+    }} > /etc/motd.d/golden-image-keys
 fi
 """)
 
@@ -3147,7 +3188,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         #     self-checks, and pass.
         for unit in ("golden-backup.timer", "golden-template-update.timer",
                      "golden-selfcheck.timer", "golden-restore-test.timer",
-                     "golden-staleness.timer"):
+                     "golden-key-refresh.timer", "golden-staleness.timer"):
             on = r.quiet("systemctl", "is-enabled", unit)
             self._t("pass" if on else "fail",
                     f"{unit} is enabled" if on else
@@ -3593,6 +3634,51 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
              f"by label, whenever it is attached")
         return 0
 
+    ISSUE_RECORD = "/var/lib/golden-image/issuance"
+
+    def issue(self, operator: str) -> int:
+        """Record that this machine passed its gate, and who says so.
+
+        "All must pass before the laptop leaves your desk" was a sentence in a
+        guide. This runs the tests, refuses on any failure, and writes down what
+        passed, when, and on whose authority — so the claim survives the
+        conversation in which it was made.
+        """
+        o = self.out
+        if not operator:
+            raise Fatal("--issue needs a name: --issue --operator 'A. Name'")
+        print(f"\n{Out.B}{Out.C}══ Issue check{Out.RST}")
+        self.args.verify = True
+        failures = self.run()
+        if failures:
+            raise Fatal(
+                f"{failures} acceptance test(s) failed. This machine is NOT fit "
+                f"to issue, and nothing has been recorded.")
+        if self.cred_file.exists():
+            raise Fatal(
+                f"{self.cred_file} is still on this machine. Complete the "
+                f"handover first:\n     sudo {Path(sys.argv[0]).name} --handover")
+        if self.args.dry_run:
+            return 0
+        rec = dom0(self.ISSUE_RECORD)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text(json.dumps({
+            "image": self.c["image_name"], "version": self.c["image_version"],
+            "host": os.uname().nodename,
+            "at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "operator": operator,
+            "tests": dict(self.tests),
+        }, indent=2) + "\n")
+        o.ok(f"recorded in {rec}")
+        print(f"""
+  {self.c['image_name']} v{self.c['image_version']} on {os.uname().nodename}
+  All {self.tests['pass']} acceptance checks passed, {self.tests['warn']} warnings.
+  Released by {operator} at {datetime.now():%Y-%m-%d %H:%M}.
+
+  This record is on the machine. Copy it into your issue log.
+""")
+        return 0
+
     def status(self) -> int:
         """Where this machine actually is: phases, credentials, timers, tests.
 
@@ -3635,7 +3721,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         print(f"\n{Out.B}  Maintenance{Out.RST}")
         for unit in ("golden-backup.timer", "golden-template-update.timer",
                      "golden-selfcheck.timer", "golden-restore-test.timer",
-                     "golden-staleness.timer"):
+                     "golden-key-refresh.timer", "golden-staleness.timer"):
             on = r.quiet("systemctl", "is-enabled", unit)
             when = r.run("systemctl", "show", unit, "-p", "NextElapseUSecRealtime",
                          "--value", check=False, capture=True).strip()
@@ -3854,6 +3940,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
 
   Running from here on, without anyone remembering to:
     golden-template-update.timer   weekly template updates      (dom0)
+    golden-key-refresh.timer       renew expiring repo keys     (dom0)
     golden-selfcheck.timer         weekly acceptance tests      (dom0)
     golden-restore-test.timer      monthly restore verification (dom0)
     golden-staleness.timer         daily "is this image too old" (dom0)
@@ -3963,6 +4050,11 @@ def main() -> int:
     p.add_argument("--write-config", action="store_true",
                    help="emit golden-image.json and exit")
     p.add_argument("--list-phases", action="store_true")
+    p.add_argument("--issue", action="store_true",
+                   help="run the acceptance tests and, only if they all pass and "
+                        "the handover is done, record that this machine was issued")
+    p.add_argument("--operator", metavar="NAME",
+                   help="who is releasing the machine (required by --issue)")
     p.add_argument("--status", action="store_true",
                    help="what this machine's state actually is: phases, "
                         "credentials, timers, recent results")
@@ -4015,6 +4107,8 @@ def main() -> int:
 
         if args.handover:
             return prov.handover_sequence(args.handover)
+        if args.issue:
+            return prov.issue(args.operator or "")
         if args.status:
             return prov.status()
         if args.initial_setup:

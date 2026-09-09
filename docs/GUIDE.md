@@ -104,6 +104,26 @@ intend to issue.
 
 ## 2. Prepare the build host
 
+**The short version.** Sections 2 to 6 are one command:
+
+```bash
+git clone <your-internal-url>/InQubestigationOS.git
+cd InQubestigationOS
+./build_iso.py bootstrap
+```
+
+It runs `setup-host`, `gen-key`, `backup-key`, `doctor`, `check-upstream`, the
+dry-run plan and then the build, in that order, stopping at the first failure —
+and every step is idempotent, so after fixing a cause you run `bootstrap` again
+and the completed steps are skipped. It does not write the USB (you have to plug
+it in) and it does not distribute the fingerprint (that has to travel
+separately). Add `--yes` for an unattended run.
+
+The rest of this section, and sections 3 to 6, explain what each of those steps
+does and how to run them individually.
+
+---
+
 Clone the repository, then let it prepare the host:
 
 ```bash
@@ -355,31 +375,40 @@ gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
 
 ## 8. Install on a laptop
 
-1. Boot the USB.
-2. Install Qubes normally. Accept the defaults. **Enable full-disk encryption**
-   with your unit's passphrase policy.
-3. Reboot and complete Qubes initial setup — the step that creates `sys-net`,
-   `sys-firewall`, `personal`, `work` and so on. The provisioner rewires these,
-   so it waits for them to exist.
-
-**Or let the image do steps 2 and 3 for you.** Set `install.unattended` and the
-generated kickstart carries the language, keyboard, timezone and partitioning
-answers, so Anaconda stops asking them:
+**Build the ISO so there is nothing to click.** Set this before section 6 and
+the generated kickstart carries the language, keyboard, timezone and
+partitioning answers, so Anaconda stops asking them:
 
 ```bash
 ./build_iso.py --set install.unattended=true --set install.disk=/dev/nvme0n1
 ```
 
-The one thing it deliberately does **not** answer is the disk encryption
-passphrase. `autopart --encrypted` makes Anaconda *require* one, so the decision
-that must stay human cannot be clicked past by someone in a hurry. Set
-`install.encrypt_disk=false` only if your unit's policy genuinely differs.
+It is **off by default** on purpose: it names a disk and erases it, which is not
+a thing to turn on by accident. Turn it on once you have decided which disk, and
+every laptop after that installs the same way.
 
-And `install.auto_initial_setup` (on by default) means the first-boot runner
-completes Qubes' own initial setup non-interactively if nobody has, rather than
-waiting thirty minutes and giving up. It retries every thirty minutes until the
-machine is provisioned, so a laptop left at the wizard overnight still finishes
-by itself.
+The one answer it deliberately does **not** supply is the disk encryption
+passphrase. `autopart --encrypted` makes Anaconda *require* one, so the decision
+that has to stay human cannot be clicked past by someone in a hurry.
+
+Then the install is:
+
+1. Boot the USB.
+2. Answer the passphrase prompt. That is the only prompt.
+3. Reboot. `install.auto_initial_setup` (on by default) means the first-boot
+   runner completes Qubes' own initial setup non-interactively, and retries
+   every thirty minutes until the machine is provisioned — so a laptop left
+   alone overnight finishes by itself.
+
+**Without `install.unattended`** it is the ordinary Qubes install:
+
+1. Boot the USB.
+2. Install Qubes normally. Accept the defaults. **Enable full-disk encryption**
+   with your unit's passphrase policy.
+3. Reboot and complete Qubes initial setup — the step that creates `sys-net`,
+   `sys-firewall`, `personal`, `work` and so on. The provisioner rewires these,
+   so it waits for them to exist. (`sudo golden-image-provision --initial-setup`
+   does the same thing without the wizard.)
 
 ---
 
@@ -505,6 +534,18 @@ the automount rule keys off.
 A udev rule and a mount unit in `sys-usb` mount it at `/mnt/backup` whenever it
 appears — by label, never by device node, because `/dev/sdb` is whatever was
 plugged in last and a backup written to the wrong disk is worse than none.
+
+When every check passes and the handover is done, record the release:
+
+```bash
+sudo golden-image-provision --issue --operator "Your Name"
+```
+
+It re-runs the acceptance tests, refuses if any fail *or* if `credentials.json`
+is still on the machine, and only then writes `/var/lib/golden-image/issuance`
+with the image version, the host, the counts and who released it. "All must pass
+before the laptop leaves your desk" then survives the conversation it was said
+in.
 
 **Brief the investigator on three rules:**
 
