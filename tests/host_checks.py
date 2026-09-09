@@ -282,6 +282,54 @@ def check_mock_is_conditional() -> None:
           "building the argv and running it")
 
 
+def check_pypi_install_is_consented() -> None:
+    """A download from PyPI must be in the plan the operator approves.
+
+    setup-host prints "This will run:", asks "Proceed?", and then executes the
+    plan. Installing pykickstart from PyPI anywhere other than from inside
+    that plan — an unconditional call at the end of the function, say — puts a
+    network install of third-party code outside the thing the operator agreed
+    to. Being merely "after the prompt" is not enough: it has to be a step
+    that was DISPLAYED.
+    """
+    src = (ROOT / "build_iso.py").read_text()
+    tree = ast.parse(src)
+    setup = next((n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "setup_host"), None)
+    check("setup_host exists to check", setup is not None)
+    if setup is None:
+        return
+
+    def calls_in(node) -> int:
+        return sum(1 for n in ast.walk(node)
+                   if isinstance(n, ast.Call)
+                   and getattr(n.func, "id", "") == "ensure_pykickstart")
+
+    total = calls_in(setup)
+    # Branches of the plan-execution loop that handle the __pykickstart__ step.
+    guarded = 0
+    for node in ast.walk(setup):
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.get_source_segment(src, node.test) or ""
+        if "__pykickstart__" in test and "cmd" in test:
+            guarded += calls_in(node)
+
+    check("pykickstart is installed only from inside the approved plan",
+          total > 0 and total == guarded,
+          f"{total} call(s) to ensure_pykickstart in setup_host, {guarded} of "
+          "them inside the plan step — a call outside the plan runs a PyPI "
+          "download the operator never saw listed")
+
+    body = ast.get_source_segment(src, setup) or ""
+    check("the plan lists the pykickstart step so it can be seen before approving",
+          '"__pykickstart__"' in body,
+          "the plan has no entry for it, so the operator approves a plan that "
+          "omits a PyPI download")
+    check("the displayed plan names PyPI explicitly", "PyPI" in src,
+          "the operator should be told where the code is downloaded from")
+
+
 def check_install_gate(bi) -> None:
     """The gate must trip on more than five binaries."""
     real_which, real_mod = shutil.which, bi._have_module
@@ -304,8 +352,11 @@ def check_install_gate(bi) -> None:
               "host_gaps() saw nothing to do — this is the deadlock: doctor "
               "blocks on python3-yaml with the fix ./build_iso.py setup-host, "
               "and setup-host decides there is nothing to install")
-        check("the python3-yaml gap says what is missing",
-              any("yaml" in g for g in gaps), str(gaps))
+        check("the PyYAML gap says what is missing",
+              any("yaml" in g.lower() for g in gaps), str(gaps))
+        check("the PyYAML gap is not named by one distribution's package name",
+              not any(g in ("python3-yaml", "python3-pyyaml") for g in gaps),
+              f"{gaps} — this message is printed on both families")
 
         # A genuinely complete host must still report nothing to do.
         bi._have_module = lambda n: True
@@ -367,6 +418,7 @@ def main() -> int:
     check_distro_detection(bi)
     check_doctor_fix(bi)
     check_mock_is_conditional()
+    check_pypi_install_is_consented()
     check_install_gate(bi)
     check_no_hardcoded_lists()
     check_pykickstart_advice()

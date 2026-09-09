@@ -542,14 +542,17 @@ def setup_builder(x: Ctx):
                         "builderv2 supports Fedora and Debian families")
         deps = (x.builder / deps_file).read_text().split()
         # Same reasoning as setup-host: one name the host does not have fails
-        # the whole apt-get batch, and upstream's list targets Debian proper.
+        # the whole apt-get batch, and upstream's list targets Debian proper —
+        # Kali and older Ubuntu do not carry all of it. Report what looks
+        # missing, but do NOT drop it: a Debian virtual package with a single
+        # provider installs by name while reporting Candidate: (none), and
+        # dropping those would lose dependencies the unfiltered install used
+        # to get. Anything genuinely absent costs only its own retry.
         avail = packages_available(fam, deps)
         if avail is not None and set(deps) - avail:
-            x.warn("not in this host's package sources, skipping: "
-                   + " ".join(sorted(set(deps) - avail)))
-            deps = [d for d in deps if d in avail]
-        mgr = ["apt-get", "install", "-y"] if fam == "debian" else ["dnf", "install", "-y"]
-        x.run(*_sudo([*mgr, *deps]), live=True, check=False)
+            x.warn("upstream lists these but this host's package sources do "
+                   "not appear to have them: " + " ".join(sorted(set(deps) - avail)))
+        install_packages(x, fam, deps)
         x.info("builder dependencies installed (failures above are not fatal — the "
                "container image build below is the real test)")
 
@@ -2398,8 +2401,11 @@ def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
         # bsdtar is its own Fedora binary package, built from the libarchive
         # source package but not shipped by the libarchive binary one.
         ("a reader for the finished ISO", ["bsdtar", "p7zip", "xorriso"]),
-        # python3-kickstart is the importable module; the package named
-        # "pykickstart" is the command-line tool, which depends on it.
+        # python3-kickstart is the importable module, which is all this needs
+        # — nothing here runs ksvalidator or ksflatten. The package named
+        # "pykickstart" is the command-line tool; it depends on the module, so
+        # it works too, and is kept as a fallback for a Fedora that has only
+        # that name.
         ("kickstart validation", ["python3-kickstart", "pykickstart"]),
     ]
     if ce == "docker":
@@ -2483,21 +2489,25 @@ def packages_available(fam: str, names: list[str]) -> set[str] | None:
     return None
 
 
-def resolve_host_packages(x: Ctx, fam: str, ce: str) -> tuple[list[str], list[str]]:
-    """Pick one real package per capability. Returns (install, unavailable).
+def resolve_host_packages(x: Ctx, fam: str,
+                          ce: str) -> tuple[list[str], list[str], bool]:
+    """Pick one real package per capability.
 
-    `unavailable` names the capabilities this distribution has no package for
-    at all, so setup-host can say which ones it is skipping and why instead of
-    failing the whole batch on them.
+    Returns (install, unavailable, probed). `unavailable` names the
+    capabilities this distribution has no package for at all, so setup-host
+    can say which ones it is skipping and why instead of failing the whole
+    batch on them. `probed` is False when the package manager could not be
+    asked, which tells the caller not to bother with a batch install — a name
+    in the list is then expected to be wrong.
     """
     plan = host_package_plan(fam, ce)
     every = sorted({n for _, cands in plan for n in cands})
     avail = packages_available(fam, every)
     if avail is None:
         x.info("could not ask the package manager what it has (no cache yet?) "
-               "— trying the preferred name for each and installing one at a "
-               "time so a single unknown name cannot fail the rest")
-        return [cands[0] for _, cands in plan], []
+               "— trying the preferred name for each, one at a time so a "
+               "single unknown name cannot fail the rest")
+        return [cands[0] for _, cands in plan], [], False
     install, missing = [], []
     for purpose, cands in plan:
         pick = next((c for c in cands if c in avail), "")
@@ -2505,7 +2515,7 @@ def resolve_host_packages(x: Ctx, fam: str, ce: str) -> tuple[list[str], list[st
             install.append(pick)
         else:
             missing.append(f"{purpose} (no package named {' or '.join(cands)})")
-    return install, missing
+    return install, missing, True
 
 
 # ---------------------------------------------------------------------------
@@ -2632,37 +2642,38 @@ def host_gaps(ce: str) -> list[str]:
     """
     gaps = [t for t in ("git", "curl", "gpg", "rsync", ce) if not shutil.which(t)]
     if not _have_module("yaml"):
-        gaps.append("python3-yaml")
+        # Named by what it is, not by one distribution's package name: this
+        # message is printed on Fedora hosts too, where it is python3-pyyaml.
+        gaps.append("PyYAML")
     if not iso_reader():
         gaps.append("an ISO reader (bsdtar/7z/isoinfo/xorriso)")
     return gaps
 
 
-def install_host_packages(x: Ctx, fam: str, ce: str) -> None:
-    """Install one real package per capability, and say what it could not.
+def install_packages(x: Ctx, fam: str, pkgs: list[str], batch: bool = True) -> None:
+    """Install pkgs so that one bad name cannot cost you the rest.
 
-    The batch is attempted first because it is much faster; if it fails —
-    which on a Debian-family host means apt-get exited 100 because ONE name in
-    the batch was unknown — every package is retried on its own, so a single
-    bad name costs that one capability instead of all of them.
+    `apt-get install -y` exits 100 on a single unknown name and installs
+    nothing at all — which is how one package removed from Debian in 2019
+    stopped setup-host from installing the other eight. The batch is tried
+    first because it is much faster; on failure every package is retried on
+    its own. Pass batch=False when the availability probe did not work, since
+    then a name in the list is expected to be wrong.
     """
-    install, unavailable = resolve_host_packages(x, fam, ce)
-    for gap in unavailable:
-        x.warn(f"no package on this host for {gap} — skipping it rather than "
-               "failing the whole install")
-    if not install:
+    if not pkgs:
         x.warn("nothing left to install")
         return
     base = ["apt-get", "install", "-y"] if fam == "debian" else ["dnf", "install", "-y"]
-    try:
-        x.run(*_sudo([*base, *install]), live=True)
-        x.ok(f"installed: {' '.join(install)}")
-        return
-    except Fatal:
-        x.warn("the batch install failed — retrying one package at a time so "
-               "one unavailable package cannot block the rest")
+    if batch:
+        try:
+            x.run(*_sudo([*base, *pkgs]), live=True)
+            x.ok(f"installed: {' '.join(pkgs)}")
+            return
+        except Fatal:
+            x.warn("the batch install failed — retrying one package at a time "
+                   "so one unavailable package cannot block the rest")
     done, failed = [], []
-    for pkg in install:
+    for pkg in pkgs:
         try:
             x.run(*_sudo([*base, pkg]), live=True)
             done.append(pkg)
@@ -2673,6 +2684,15 @@ def install_host_packages(x: Ctx, fam: str, ce: str) -> None:
     if failed:
         x.warn(f"could not install: {' '.join(failed)} — "
                "./build_iso.py doctor says whether that actually blocks a build")
+
+
+def install_host_packages(x: Ctx, fam: str, ce: str) -> None:
+    """Install one real package per capability, and say what it could not."""
+    install, unavailable, probed = resolve_host_packages(x, fam, ce)
+    for gap in unavailable:
+        x.warn(f"no package on this host for {gap} — skipping it rather than "
+               "failing the whole install")
+    install_packages(x, fam, install, batch=probed)
 
 
 def setup_host(x: Ctx) -> int:
@@ -2704,10 +2724,21 @@ def setup_host(x: Ctx) -> int:
         if user and "docker" not in groups:
             plan.append(_sudo(["usermod", "-aG", "docker", user]))
 
+    # pykickstart is not packaged on every distribution, and where it is not
+    # the only way to have it is a virtualenv and a download from PyPI. That
+    # is a network install of third-party code: it belongs in the plan the
+    # operator approves, not quietly after it. Listed conditionally because
+    # the package install above may still provide it — ensure_pykickstart
+    # re-checks and does nothing if it did.
+    # Before the virtualenv that goes inside it, so the plan reads in the
+    # order it runs.
+    plan.append(["__mkdir__", str(x.work)])
+
+    if not kickstart_python(x)[0]:
+        plan.append(["__pykickstart__"])
+
     if in_qube():
         plan.append(["__bind_dirs__"])
-
-    plan.append(["__mkdir__", str(x.work)])
 
     if not plan:
         x.ok("nothing to do — the host is already set up")
@@ -2725,6 +2756,15 @@ def setup_host(x: Ctx) -> int:
                 print(f"          {purpose}: {' or '.join(cands)}")
             print("        whichever of each line this host actually has; "
                   "anything it has none of is reported and skipped")
+        elif cmd[0] == "__pykickstart__":
+            print("      IF no package on this host provides pykickstart:")
+            print(f"          python3 -m venv {kickstart_venv(x)}")
+            print("          then, inside it:  pip install pykickstart   "
+                  "(downloaded from PyPI)")
+            print("        it validates the generated kickstart BEFORE the "
+                  "build. Decline and the")
+            print("        build still runs — the same thing is confirmed "
+                  "afterwards from the ISO.")
         elif cmd[0] == "__mkdir__":
             print(f"      mkdir -p {cmd[1]}")
         else:
@@ -2744,14 +2784,11 @@ def setup_host(x: Ctx) -> int:
             setup_qube_bind_dirs(x)
         elif cmd[0] == "__packages__":
             install_host_packages(x, cmd[1], cmd[2])
+        elif cmd[0] == "__pykickstart__":
+            ensure_pykickstart(x)
         else:
             x.run(*cmd, live=True)
             x.ok(" ".join(cmd[:3]))
-
-    # Debian and Kali have no pykickstart package at all, so the capability
-    # loop above cannot have installed one. Put it in a virtualenv instead of
-    # leaving doctor to recommend a command that cannot help.
-    ensure_pykickstart(x)
 
     # Group membership does not apply to an already-running shell. Rather than
     # telling the operator to log out and back in, verify through 'sg' so the
@@ -3234,21 +3271,24 @@ def resolve_auto_values(x: Ctx) -> None:
         # rather than guessing; fall back to the release's known host.
         derived = mock_config_from_builder(x) or {"4.3": "fedora-41-x86_64",
                                                   "4.2": "fedora-37-x86_64"}.get(rel)
-        if not derived and not shutil.which("mock"):
+        if derived:
+            x.c["mock_config"] = derived
+            x.info(f"mock_config derived as {derived}")
+        elif not shutil.which("mock"):
             # Only the mock branch of tools/generate-container-image.sh reads
             # this value, and that branch is taken only when mock is on the
             # host. Failing the whole run over a value about to be discarded
             # made a release this script has no fallback for unbuildable on
             # exactly the hosts — Debian, Kali — where mock does not exist.
+            # mock_config is left as "auto" rather than blanked: nothing reads
+            # it on this path, and a later run on a host that HAS mock derives
+            # it properly.
             x.info(f"no mock_config for Qubes {rel}, but mock is not installed "
                    "here, so the container image is built from the pinned "
                    "Fedora image and does not need one")
-            return
-        if not derived:
+        else:
             raise Fatal(f"cannot derive mock_config for Qubes {rel}. "
                         f'Set it explicitly:  ./build_iso.py --set mock_config=fedora-NN-x86_64')
-        x.c["mock_config"] = derived
-        x.info(f"mock_config derived as {derived}")
 
 
 def mock_config_from_builder(x: Ctx) -> str | None:
