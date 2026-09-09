@@ -63,7 +63,7 @@ ALIASES = {
         "res": "resources", "cc": "credentials",
     },
     "build_iso.py": {
-        "k": "kali", "z": "zeek", "w": "wazuh",
+        "k": "kali", "z": "zeek", "w": "wazuh", "inst": "install",
     },
 }
 

@@ -47,7 +47,55 @@ whatever is missing. Every later step in this guide is also available as a
 workable), 512 GB SSD minimum. Check it against the Qubes Hardware
 Compatibility List before committing.
 
-**A GPG key** for signing. Section 3 covers creating one.
+### If your workstation is Windows
+
+**The build host must be Linux.** This is not a limitation of these scripts —
+`qubes-builderv2` builds every package inside a Linux container using Mock
+chroots, and its dependency lists are Debian and Fedora packages. There is no
+Windows-native path, and the two scripts here are POSIX throughout.
+
+You have two options on a Windows machine, and they are not equally proven:
+
+| | |
+|---|---|
+| **A Linux VM** — Hyper-V, VirtualBox or VMware, Debian 13, ~250 GB virtual disk, 8 GB RAM | **The path to use.** Inside the VM it is an ordinary Linux build host, so everything in this guide applies unchanged. |
+| **WSL2** — Debian from the Microsoft Store, `systemd=true` in `/etc/wsl.conf`, Docker | **Not verified.** WSL2 is a real Linux kernel and the scripts run, but nobody — upstream or here — has confirmed that the Mock chroots and loop-device work that the ISO build depends on behave under it. `./build_iso.py doctor` detects WSL and checks the parts it can (kernel type, `/dev/loop-control`, systemd as PID 1). If it fails, use a VM rather than fighting it. |
+
+Either way, remember that a WSL distro or a discarded VM takes your **signing
+key** with it. Back it up the moment you create it:
+
+```bash
+./build_iso.py backup-key --to /mnt/c/Users/you/keys/investigator
+```
+
+**Writing the USB from Windows.** You can build in the VM, copy the ISO out to
+Windows, and flash it with Rufus onto your 128 GB stick — but:
+
+> **Rufus must be set to "Write in DD Image mode".** Select the ISO, press
+> START, and choose DD Image mode when Rufus asks. This is the Qubes project's
+> own instruction; ISO mode rewrites the boot structure and the installer will
+> not work. One consequence they also note: a Rufus-written stick does not offer
+> "Test this media and install Qubes OS" — choose "Install Qubes OS".
+
+Rufus does not verify the image, so verify it on Windows first. The build writes
+a PowerShell script beside the ISO for exactly this:
+
+```powershell
+.erify-iso.ps1 <the fingerprint you were given out of band>
+```
+
+It checks the SHA-256 with Windows' own tooling and the GPG signature via
+Gpg4win, and exits non-zero on any mismatch. Without a fingerprint argument it
+prints the signer for you to compare by eye. If Gpg4win is not installed it says
+so and exits 2 rather than implying the image is trustworthy.
+
+`./build_iso.py write-usb` remains the better option when you can reach the
+stick from Linux: it is the only path that also reads the stick back and
+compares it byte for byte.
+
+**A GPG key** for signing. Section 3 covers creating one — and backing it up,
+which matters more than it sounds: lose the build host and every image you ever
+signed becomes unverifiable.
 
 **A spare machine to test on.** Do not let the first install be on hardware you
 intend to issue.
@@ -314,6 +362,25 @@ gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
    `sys-firewall`, `personal`, `work` and so on. The provisioner rewires these,
    so it waits for them to exist.
 
+**Or let the image do steps 2 and 3 for you.** Set `install.unattended` and the
+generated kickstart carries the language, keyboard, timezone and partitioning
+answers, so Anaconda stops asking them:
+
+```bash
+./build_iso.py --set install.unattended=true --set install.disk=/dev/nvme0n1
+```
+
+The one thing it deliberately does **not** answer is the disk encryption
+passphrase. `autopart --encrypted` makes Anaconda *require* one, so the decision
+that must stay human cannot be clicked past by someone in a hurry. Set
+`install.encrypt_disk=false` only if your unit's policy genuinely differs.
+
+And `install.auto_initial_setup` (on by default) means the first-boot runner
+completes Qubes' own initial setup non-interactively if nobody has, rather than
+waiting thirty minutes and giving up. It retries every thirty minutes until the
+machine is provisioned, so a laptop left at the wizard overnight still finishes
+by itself.
+
 ---
 
 ## 9. First boot
@@ -424,11 +491,16 @@ backup passphrase especially:** no passphrase, no restore.
 Then the dashboard. There is no `qvm-connect-tcp` line to remember: `work` has a
 **SIEM dashboard** launcher that opens the qrexec tunnel and the browser.
 
-Finally, label the backup disk once and plug it in:
+Finally, prepare the backup disk. Attach it to `sys-usb`, then:
 
 ```bash
-sudo mkfs.ext4 -L GOLDEN-BACKUP /dev/sdX1
+sudo golden-image-provision --prepare-backup-media
 ```
+
+It lists what is attached, refuses anything that is not removable, makes you
+type `ERASE`, then partitions, formats and labels it — and confirms
+`/dev/disk/by-label/GOLDEN-BACKUP` actually appeared, because that is the path
+the automount rule keys off.
 
 A udev rule and a mount unit in `sys-usb` mount it at `/mnt/backup` whenever it
 appears — by label, never by device node, because `/dev/sdb` is whatever was

@@ -221,6 +221,13 @@ In that configuration `tpl-sys` is cloned from Fedora, phase 5 installed an agen
 into neither the apt list nor the dnf path for it, and phase 12 then failed
 "`tpl-sys` carries the agent" every time.
 
+**25. Making a dead setting live exposed that its value was wrong.**
+`builder_branch` was never read, so nobody noticed it said `release4.3`. Passing
+it to `git clone --branch` — the fix for the dead key — would have made the clone
+fail on every build host. qubes-builderv2 has exactly one branch, `main`
+(`git ls-remote --heads`). Reviving a dead setting means checking its value, not
+just its plumbing.
+
 ### Settings that did nothing
 
 Each of these was a documented knob the code never read — worse than an error,
@@ -349,13 +356,29 @@ long on a fast machine and too short on a slow one. It now polls until qrexec
 answers, which is the condition that actually matters, and gives up after
 `timeouts.short` with a warning rather than continuing silently.
 
+## The `[VERIFY]` list, closed
+
+Release 2.1 printed nine `[VERIFY]` notes; earlier in this pass that was down to
+four. It is now zero unconditional ones. The last four went like this:
+
+| Was | Now |
+|---|---|
+| "The signature on the qubes-builderv2 checkout — nothing verifies the builder for you" | Qubes publishes a trust chain: developer keys in qubes-secpack are certified by the Master Signing Key, and every builder commit carries a signed `mm_<sha>` tag. One fingerprint is pinned; the rest is derived. Verified end to end against the live repository. |
+| "pykickstart merges two `%packages` sections — standard Anaconda behaviour, not confirmed" | The generated kickstart is parsed with pykickstart and its package list read back. Belt and braces: the finished ISO is opened and the template RPMs confirmed present, which answers the same question about the artefact rather than the input. |
+| "The first-boot service fires after Qubes initial setup on your hardware" | The runner records what it did in `/var/lib/golden-image/firstboot-status`, group 13 reads it, and a timer retries every 30 minutes rather than giving up once. |
+| "Certificate paths against the Wazuh single-node guide — layout changes between series" | Group 13 asserts the six files the three services actually read, with their owners and modes. A layout change is now a failing test. |
+
+Two conditional notes remain, and only fire when something is absent: no
+pykickstart on the build host, or a qubes-secpack whose key layout has moved.
+
 ## Still not verified — requires real hardware
 
 Everything that could become an automated check has: see acceptance-test group 13
 and the table in [VERIFICATION.md](VERIFICATION.md). What is left needs a live
 Qubes 4.3.1 install and a decision:
 
-- an end-to-end run on real hardware — neither script has had one
+- an end-to-end run on real hardware — neither script has had one. This is the
+  one thing on this page that no amount of tooling closes.
 - whether the Kali apt pin priorities suit your unit's tool set in practice
 - whether `pykickstart` merges two `%packages` sections as expected (standard
   Anaconda behaviour, not confirmed against a Qubes-specific source; the build

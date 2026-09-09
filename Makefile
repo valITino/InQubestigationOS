@@ -24,6 +24,14 @@ host:  ## install and configure everything the build host needs
 key:  ## create the ISO signing key and record its fingerprint (UID=...)
 	./build_iso.py gen-key --uid "$(UID)"
 
+.PHONY: backup-key
+backup-key:  ## back up the signing key (TO=/path/on/removable/media)
+	./build_iso.py backup-key $(if $(TO),--to $(TO),)
+
+.PHONY: restore-key
+restore-key:  ## restore a signing-key backup (FROM=/path)
+	./build_iso.py restore-key $(if $(FROM),--from $(FROM),)
+
 .PHONY: doctor
 doctor:  ## check the build host is ready, change nothing
 	./build_iso.py doctor
@@ -77,6 +85,22 @@ shred:  ## (on the laptop) destroy the dom0 copy — refuses without an escrow r
 .PHONY: verify
 verify:  ## (on the laptop) run the acceptance tests
 	sudo ./golden_image.py --verify
+
+.PHONY: handover
+handover:  ## (on the laptop) rotate, escrow and shred, in that order
+	sudo ./golden_image.py --handover
+
+.PHONY: backup-media
+backup-media:  ## (on the laptop) partition, format and label the backup disk
+	sudo ./golden_image.py --prepare-backup-media
+
+.PHONY: ci
+ci:  ## exactly what .github/workflows/ci.yml runs, locally
+	python3 -m py_compile golden_image.py build_iso.py
+	./tests/run_tests.py
+	./tests/config_checks.py
+	./tests/doc_checks.py
+	./build_iso.py check-upstream
 
 .PHONY: clean
 clean:  ## remove local build state and caches

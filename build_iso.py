@@ -48,6 +48,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -58,7 +59,17 @@ DEFAULT_CONFIG: dict = {
     "iso_flavor": "InQubestigationOS",
     "iso_version": "",
     "qubes_release": "r4.3",
-    "builder_branch": "release4.3",
+    # qubes-builderv2 has ONE branch: main. There is no release4.3 branch —
+    # `git ls-remote --heads` returns refs/heads/main and nothing else. Passing
+    # a branch that does not exist makes the clone fail outright.
+    "builder_branch": "main",
+    # Verify the builder before building a police workstation with it. Only the
+    # Qubes Master Signing Key is pinned here; the core developer keys are
+    # trusted because that key has signed them, which is the trust model Qubes
+    # publishes. Confirmed against keys.qubes-os.org on 2026-09-09.
+    "verify_builder": True,
+    "qubes_master_key": "427F11FD0FAA4B080123F01CDDFA1A3E36879494",
+    "secpack_url": "https://github.com/QubesOS/qubes-secpack.git",
 
     # TIER 2 IS THE DEFAULT AND THE INTENDED PATH.
     #   2 = investigator templates baked into the ISO as RPMs. Installs with no
@@ -105,6 +116,29 @@ DEFAULT_CONFIG: dict = {
 
     "auto_provision": True,
 
+    # Anaconda answers. With "unattended": false (the default) the installer
+    # behaves exactly as before and a person drives it.
+    #
+    # Turning it on emits standard kickstart directives so the install stops
+    # being a sequence of clicks. Disk encryption is deliberately NOT made
+    # passwordless: `autopart --encrypted` makes Anaconda REQUIRE a passphrase,
+    # so the one decision that must stay human stays human, and cannot be
+    # clicked past by someone in a hurry.
+    "install": {
+        "unattended": False,
+        "lang": "en_US.UTF-8",
+        "keyboard": "ch",
+        "timezone": "Europe/Zurich",
+        "encrypt_disk": True,
+        # luks2 is what Anaconda defaults to on current releases; set it
+        # explicitly so a future default change does not alter your images.
+        "luks_version": "luks2",
+        # Wipe and use the whole disk. Blank leaves partitioning to the operator.
+        "disk": "",
+        # Complete Qubes' own initial setup non-interactively at first boot.
+        "auto_initial_setup": True,
+    },
+
     # GPG fingerprint (40 hex chars) of the unit key that signs the ISO.
     # THIS IS A FINGERPRINT, NOT A KEY. The private key stays in the build
     # host's GPG keyring and must never appear in this file or in the repo.
@@ -113,6 +147,13 @@ DEFAULT_CONFIG: dict = {
     "iso_sign_key": "",
 
     # --- Tier 2 template build -------------------------------------------
+    # The generated template component. Left local, it is fetched with
+    # signature checking OFF — acceptable only because you generated it on your
+    # own build host, and the build says so every time. Set component_remote to
+    # your unit's git server and component_sign_key to a signing fingerprint and
+    # the build pushes a signed tag there and turns verification back on.
+    "component_remote": "",
+    "component_sign_key": "",
     "dist_codename": "trixie",
     "template_root_size": "30G",
     # Top-level build timeout in seconds. The Kali template is the slow one.
@@ -207,7 +248,7 @@ class Ctx:
         self._log(f"PHASE {n} {name}")
 
     # --- exec ----------------------------------------------------------
-    def run(self, *argv, cwd=None, check=True, capture=False, live=False):
+    def run(self, *argv, cwd=None, check=True, capture=False, live=False, env=None):
         cmd = [str(a) for a in argv]
         if self.args.dry_run:
             print(f"  {D}[dry-run]{RST} {' '.join(shlex.quote(a) for a in cmd)}")
@@ -215,7 +256,7 @@ class Ctx:
         self._log("EXEC  " + " ".join(cmd))
         if live:
             p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True)
+                                 stderr=subprocess.STDOUT, text=True, env=env)
             assert p.stdout
             lf = self.log.open("a") if self.logging else None
             try:
@@ -231,11 +272,11 @@ class Ctx:
                 raise Fatal(f"failed: {' '.join(cmd)} — see {self.log}")
             return ""
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, env=env)
         self._log(f"      rc={p.returncode}\n{p.stdout[-4000:]}{p.stderr[-4000:]}")
         if check and p.returncode != 0:
             raise Fatal(f"failed: {' '.join(cmd)} — see {self.log}")
-        return p.stdout if capture else ""
+        return (p.stdout + p.stderr) if capture else ""
 
     def quiet(self, *argv) -> bool:
         try:
@@ -453,11 +494,7 @@ def setup_builder(x: Ctx):
         x.ok(f"qubes-builderv2 on {branch}")
     x.run("git", "submodule", "update", "--init", cwd=x.builder)
 
-    x.warn("VERIFY THE BUILDER ITSELF before building a police workstation with it.")
-    x.warn("  Check the signature on the checked-out tag against a Qubes developer key")
-    x.warn("  you obtained independently. The builder verifies what it fetches;")
-    x.warn("  nothing verifies the builder for you.")
-    x.verify("signature on the qubes-builderv2 checkout")
+    verify_builder(x)
 
     if not x.args.dry_run:
         if shutil.which("dnf"):
@@ -510,6 +547,116 @@ def setup_builder(x: Ctx):
                         f"     keeps failing, check {x.log}.")
         x.ok(f"qubes-release sources at {conf}")
     x.mark("builder")
+
+
+
+# ---------------------------------------------------------------------------
+#  Verify the builder itself
+#
+#  "The builder verifies what it fetches; nothing verifies the builder for you"
+#  was a [VERIFY] note. It does not have to be. Qubes publishes a trust chain:
+#  every core developer's key is signed by the Qubes Master Signing Key, and
+#  every commit in qubes-builderv2 carries a signed tag named mm_<short-sha>.
+#  So exactly ONE fingerprint needs pinning here — the master key — and the
+#  developer keys are trusted because it says so.
+# ---------------------------------------------------------------------------
+def verify_builder(x: Ctx) -> None:
+    if not x.c["verify_builder"]:
+        x.warn("verify_builder is off. Nothing is checking the tool that builds "
+               "the image you hand to colleagues.")
+        return
+    if x.args.dry_run:
+        x.info("[dry-run] verify the builder's signed tag against the Qubes "
+               "master signing key")
+        return
+
+    secpack = x.work / ".qubes-secpack"
+    if (secpack / ".git").is_dir():
+        if not x.quiet("git", "-C", str(secpack), "fetch", "-q", "--depth", "1",
+                       "origin", "HEAD"):
+            shutil.rmtree(secpack, ignore_errors=True)
+        else:
+            x.run("git", "-C", str(secpack), "reset", "-q", "--hard",
+                  "FETCH_HEAD", check=False)
+    if not (secpack / ".git").is_dir():
+        x.run("git", "clone", "-q", "--depth", "1", x.c["secpack_url"],
+              str(secpack), live=True)
+
+    master_dir, devs_dir = secpack / "keys" / "master-key", secpack / "keys" / "core-devs"
+    if not master_dir.is_dir() or not devs_dir.is_dir():
+        x.verify(f"qubes-secpack does not have the expected keys/master-key and "
+                 f"keys/core-devs layout at {secpack}. Verify the builder "
+                 f"checkout by hand before trusting this build.")
+        return
+
+    keyring = x.work / ".builder-keyring"
+    shutil.rmtree(keyring, ignore_errors=True)
+    keyring.mkdir(parents=True)
+    keyring.chmod(0o700)
+    env = dict(os.environ, GNUPGHOME=str(keyring))
+
+    pinned = x.c["qubes_master_key"].replace(" ", "").upper()
+    x.run("gpg", "--batch", "--quiet", "--import",
+          *[str(f) for f in sorted(master_dir.glob("*.asc"))], env=env)
+    have = {ln.split(":")[9] for ln in
+            x.run("gpg", "--with-colons", "--fingerprint", capture=True,
+                  check=False, env=env).splitlines()
+            if ln.startswith("fpr:")}
+    if pinned not in have:
+        raise Fatal(f"the Qubes Master Signing Key in {secpack} is not {pinned}.\n"
+                    f"     Found: {', '.join(sorted(have)) or 'nothing'}\n"
+                    "     Confirm the fingerprint at https://keys.qubes-os.org and "
+                    "at\n     https://www.qubes-os.org/security/verifying-signatures/ "
+                    "before going further.")
+    x.ok(f"Qubes Master Signing Key verified: {pinned}")
+
+    x.run("gpg", "--batch", "--quiet", "--import",
+          *[str(f) for f in sorted(devs_dir.glob("*.asc"))], env=env)
+    master_longid = pinned[-16:]
+    dev_fprs, current, certified = set(), None, set()
+    for ln in x.run("gpg", "--with-colons", "--check-signatures", capture=True,
+                    check=False, env=env).splitlines():
+        f = ln.split(":")
+        if f[0] == "pub":
+            current = None
+        elif f[0] == "fpr" and current is None:
+            current = f[9]
+            if current != pinned:
+                dev_fprs.add(current)
+        elif f[0] == "sig" and current and len(f) > 4 and f[4] == master_longid:
+            certified.add(current)
+    uncertified = dev_fprs - certified
+    if not dev_fprs:
+        raise Fatal(f"no developer keys found in {devs_dir}")
+    if uncertified:
+        x.warn(f"not signed by the master key, so not trusted here: "
+               f"{', '.join(sorted(uncertified))}")
+    trusted = dev_fprs & certified
+    if not trusted:
+        raise Fatal("no Qubes developer key is certified by the master key. "
+                    "Something is wrong with the secpack checkout.")
+    x.ok(f"{len(trusted)} developer key(s) certified by the master key")
+
+    tags = x.run("git", "-C", str(x.builder), "tag", "--points-at", "HEAD",
+                 check=False, capture=True).split()
+    if not tags:
+        raise Fatal(
+            "the builder checkout has no tag on HEAD, so there is nothing to "
+            "verify.\n     Every qubes-builderv2 commit normally carries a "
+            "signed mm_<sha> tag.\n     Run 'git -C "
+            f"{x.builder} fetch --tags', or set verify_builder=false and accept "
+            "an unverified builder.")
+    raw = x.run("git", "-C", str(x.builder), "verify-tag", "--raw", tags[0],
+                check=False, capture=True, env=env)
+    signer = next((ln.split()[2] for ln in raw.splitlines()
+                   if ln.startswith("[GNUPG:] VALIDSIG")), "")
+    good = any(ln.startswith("[GNUPG:] GOODSIG") for ln in raw.splitlines())
+    if not good or signer.upper() not in trusted:
+        raise Fatal(
+            f"the builder tag {tags[0]} does not verify against a Qubes "
+            f"developer key.\n     Signer: {signer or 'none'}\n"
+            "     Do not build a police workstation with an unverified builder.")
+    x.ok(f"builder tag {tags[0]} signed by {signer}")
 
 
 # ===========================================================================
@@ -864,10 +1011,52 @@ uninstallQubesRepo
     x.run("git", "commit", "-q", "-m", f"investigator templates {datetime.now():%F %T}",
           cwd=comp, check=False)
     x.ok("local component repo ready")
-    x.warn("This component is fetched from a local path with signature checking OFF.")
-    x.warn("  Acceptable only because you generated it on your own build host. Before")
-    x.warn("  production, move it to your unit's git server, sign the tags, and switch")
-    x.warn("  verification-mode back on.")
+    publish_component(x, comp)
+
+
+def component_source(x: Ctx) -> tuple[str, str]:
+    """(url, verification-mode) for the template component in builder.yml."""
+    if x.c["component_remote"] and x.c["component_sign_key"]:
+        return x.c["component_remote"], "signed-tag"
+    return f"file://{x.component}", "insecure-skip-checking"
+
+
+def publish_component(x: Ctx, comp: Path) -> None:
+    """Tag the generated component and push it, when a remote is configured.
+
+    Until then the component is fetched from a local path with signature
+    checking off. That is defensible on your own build host and indefensible in
+    production, which is why the build says so every single time.
+    """
+    remote, mode = x.c["component_remote"], x.c["component_sign_key"]
+    if not remote or not mode:
+        x.warn("This component is fetched from a local path with signature "
+               "checking OFF.")
+        x.warn("  Acceptable only because you generated it on your own build "
+               "host. For production:")
+        x.warn("    ./build_iso.py --set component_remote=<git url> \\")
+        x.warn("                   --set component_sign_key=<fingerprint>")
+        x.warn("  The build then pushes a signed tag there and verifies it.")
+        return
+    fpr = mode.replace(" ", "").upper()
+    if not re.fullmatch(r"[0-9A-F]{40}", fpr):
+        raise Fatal(f"component_sign_key '{mode}' is not a 40-hex fingerprint")
+    tag = f"investigator-{datetime.now():%Y%m%d%H%M%S}"
+    if x.args.dry_run:
+        x.info(f"[dry-run] tag {tag} signed by {fpr}, push to {remote}")
+        return
+    if not x.quiet("gpg", "--list-secret-keys", fpr):
+        raise Fatal(f"no SECRET key for {fpr} — cannot sign the component tag")
+    x.run("git", "-C", str(comp), "-c", f"user.signingkey={fpr}",
+          "tag", "-s", "-m", f"investigator templates {datetime.now():%F %T}", tag)
+    x.run("git", "-C", str(comp), "remote", "remove", "origin", check=False)
+    x.run("git", "-C", str(comp), "remote", "add", "origin", remote)
+    x.run("git", "-C", str(comp), "push", "--force", "origin", "HEAD:main",
+          live=True)
+    x.run("git", "-C", str(comp), "push", "origin", tag, live=True)
+    x.ok(f"component pushed to {remote} as signed tag {tag}")
+    x.info("builder.yml will fetch it from there with verification-mode: "
+           "signed-tag")
 
 
 
@@ -982,11 +1171,9 @@ def build_templates(x: Ctx):
         "template-root-size": x.c["template_root_size"],
         "timeout": x.c["build_timeout"],
         "templates": [{n: {"dist": dist, "flavor": n}} for n in names],
-        "components": [{"template-investigator": {
-            "packages": False,
-            "url": f"file://{x.component}",
-            "verification-mode": "insecure-skip-checking",
-        }}],
+        "components": [{"template-investigator": dict(zip(
+            ("packages", "url", "verification-mode"),
+            (False, *component_source(x))))}],
     }, "investigator templates")
 
     x.warn(f"the long one: {len(names)} templates, each a full debootstrap. "
@@ -1069,9 +1256,18 @@ def write_kickstart(x: Ctx, base_ks: str, payload: Path,
                 + "\n".join(f"qubes-template-{p}" for p in extra_packages)
                 + "\n%end\n")
 
+    auto_setup = "yes" if x.c["install"]["auto_initial_setup"] else "no"
+    autotimer = ("systemctl enable golden-image-firstboot.timer"
+                 if x.c["auto_provision"] else
+                 "# auto_provision is off — no retry timer")
     autoline = ("systemctl enable golden-image-firstboot.service"
                 if x.c["auto_provision"]
                 else "# auto_provision disabled — operator runs it manually")
+    auto_setup = "yes" if x.c["install"]["auto_initial_setup"] else "no"
+    autotimer = ("systemctl enable golden-image-firstboot.timer"
+                 if x.c["auto_provision"]
+                 else "# auto_provision disabled — no retry timer")
+    installer = build_installer_directives(x)
 
     ks.write_text(f"""\
 # =============================================================================
@@ -1081,7 +1277,7 @@ def write_kickstart(x: Ctx, base_ks: str, payload: Path,
 #  provisioning payload into dom0.
 # =============================================================================
 
-%include {base_ks}
+{installer}%include {base_ks}
 {pkgs}
 %post --log=/root/investigator-ks-post.log
 set -x
@@ -1119,6 +1315,21 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 SVC_EOF
 
+# Retry rather than latch. A machine left at the initial-setup wizard overnight
+# used to need someone to remember to run the provisioner by hand afterwards.
+cat > /etc/systemd/system/golden-image-firstboot.timer <<'TMR_EOF'
+[Unit]
+Description=Retry golden image provisioning until it succeeds
+ConditionPathExists=!/var/lib/golden-image/provisioned
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target
+TMR_EOF
+
 cat > /usr/local/sbin/golden-image-firstboot <<'FB_EOF'
 #!/bin/bash
 # Guarded first-boot runner. Waits until Qubes initial setup has produced the
@@ -1128,7 +1339,12 @@ MARKER=/var/lib/golden-image/provisioned
 mkdir -p /var/lib/golden-image
 [ -e "$MARKER" ] && exit 0
 
-for i in $(seq 1 60); do
+STATUS=/var/lib/golden-image/firstboot-status
+note() {{ echo "$(date '+%F %T') $*" >> "$STATUS"; logger -t golden-image "$*"; }}
+
+note "first-boot runner started"
+
+for i in $(seq 1 20); do
     if qvm-check --quiet sys-net 2>/dev/null && qvm-check --quiet sys-firewall 2>/dev/null; then
         break
     fi
@@ -1136,27 +1352,44 @@ for i in $(seq 1 60); do
 done
 
 if ! qvm-check --quiet sys-net 2>/dev/null; then
-    logger -t golden-image "initial setup incomplete after 30 min; not provisioning"
+    if [ "{auto_setup}" = "yes" ]; then
+        # Nobody is here to click through the wizard on an unattended install.
+        note "initial setup not done after 10 min; running it non-interactively"
+        if /usr/local/sbin/golden-image-provision --initial-setup \\
+                >> /var/log/golden-image-firstboot.log 2>&1; then
+            note "initial setup completed by the runner"
+        else
+            note "automatic initial setup FAILED"
+        fi
+    fi
+fi
+
+if ! qvm-check --quiet sys-net 2>/dev/null; then
+    note "initial setup incomplete; not provisioning"
     mkdir -p /etc/motd.d
     echo "Golden image provisioning deferred. Run: sudo golden-image-provision" \\
         > /etc/motd.d/golden-image
+    # Not a one-shot give-up: try again on the next boot, and on a timer, so a
+    # machine that was simply left at the wizard overnight still provisions.
     exit 0
 fi
 
-logger -t golden-image "starting provisioning"
+note "starting provisioning"
 /usr/local/sbin/golden-image-provision >> /var/log/golden-image-firstboot.log 2>&1
 rc=$?
 if [ $rc -eq 0 ]; then
     touch "$MARKER"
-    logger -t golden-image "provisioning finished"
+    note "provisioned"
+    rm -f /etc/motd.d/golden-image
 else
-    logger -t golden-image "provisioning failed rc=$rc; resume: sudo golden-image-provision"
+    note "provisioning ran and failed rc=$rc; resume: sudo golden-image-provision"
 fi
 exit 0
 FB_EOF
 chmod 755 /usr/local/sbin/golden-image-firstboot
 
 {autoline}
+{autotimer}
 
 mkdir -p /etc/motd.d
 cat > /etc/motd.d/golden-image <<'MOTD_EOF'
@@ -1179,16 +1412,93 @@ MOTD_EOF
     x.info(f"%include {base_ks}  (resolved from {conf})")
     if extra_packages:
         x.info(f"%packages adds: {', '.join('qubes-template-'+p for p in extra_packages)}")
-        x.verify("pykickstart merges multiple %packages sections rather than letting "
-                 "one override the other — standard Anaconda behaviour, not confirmed "
-                 "against a Qubes-specific source. The build checks the RPMs are in "
-                 "the image afterwards, which answers it in practice.")
+        validate_kickstart(x, ks, extra_packages)
     x.info(f"auto-provision on first boot: {x.c['auto_provision']}")
-    x.verify("the first-boot service fires after Qubes initial setup on your hardware "
-             "(the runner polls for sys-net rather than trusting unit order)")
+    x.info("the runner records what it did in /var/lib/golden-image/firstboot-status, "
+           "and acceptance group 13 reads it — no hardware check needed")
     x.warn("the ISO embeds the provisioning script. It contains NO secrets: credentials")
     x.warn("  are generated on the target machine, never baked into the image.")
     return rel
+
+
+def build_installer_directives(x: Ctx) -> str:
+    """Anaconda answers, when the operator asked for an unattended install.
+
+    Everything here is a standard kickstart directive. Encryption is the one
+    thing deliberately left interactive: `autopart --encrypted` makes Anaconda
+    demand a passphrase, so the decision that must stay human cannot be clicked
+    past — while the twenty that need not be, are not asked at all.
+    """
+    inst = x.c["install"]
+    if not inst["unattended"]:
+        return ""
+    lines = [
+        "# --- unattended install (iso-build.json: install.unattended) --------",
+        f"lang {inst['lang']}",
+        f"keyboard --vckeymap={inst['keyboard']} --xlayouts='{inst['keyboard']}'",
+        f"timezone {inst['timezone']} --utc",
+    ]
+    if inst["encrypt_disk"]:
+        disk = f" --drives={inst['disk']}" if inst["disk"] else ""
+        if inst["disk"]:
+            lines.append(f"ignoredisk --only-use={inst['disk']}")
+            lines.append(f"clearpart --all --initlabel{disk}")
+        else:
+            lines.append("clearpart --all --initlabel")
+        # No --passphrase= here, on purpose: Anaconda then prompts, and full-disk
+        # encryption on an investigator laptop is not a thing to bake a shared
+        # secret into.
+        lines.append(f"autopart --encrypted --luks-version={inst['luks_version']}")
+        lines.append("# Anaconda will PROMPT for the LUKS passphrase. That is")
+        lines.append("# deliberate — see iso-build.json: install.encrypt_disk.")
+    x.info(f"unattended install directives: {inst['lang']}, {inst['keyboard']}, "
+           f"{inst['timezone']}"
+           + (", full-disk encryption (passphrase prompted)"
+              if inst["encrypt_disk"] else ""))
+    if inst["encrypt_disk"]:
+        x.warn("the installer will still ask for the disk encryption passphrase. "
+               "That is the point: it cannot be skipped.")
+    return "\n".join(lines) + "\n\n"
+
+
+def validate_kickstart(x: Ctx, ks: Path, extra_packages: list[str]) -> None:
+    """Parse the generated kickstart with pykickstart, if it is available.
+
+    The open question was whether pykickstart merges two %packages sections or
+    lets one override the other. Rather than asking the operator to confirm
+    standard Anaconda behaviour, parse the file and read the package list back:
+    if every added template is in it, the merge happened.
+    """
+    if x.args.dry_run:
+        return
+    probe = """
+import sys
+from pykickstart.parser import KickstartParser
+from pykickstart.version import makeVersion
+p = KickstartParser(makeVersion())
+p.readKickstart(sys.argv[1])
+print("\\n".join(str(g) for g in p.handler.packages.packageList))
+"""
+    out = x.run(sys.executable, "-c", probe, str(ks), check=False, capture=True)
+    if "ModuleNotFoundError" in out or "ImportError" in out:
+        x.verify("pykickstart is not installed here, so the generated kickstart "
+                 "was not parsed. The build checks the template RPMs are in the "
+                 "finished ISO, which answers the same question after the fact.")
+        return
+    if "Traceback" in out:
+        raise Fatal(f"pykickstart cannot parse the generated kickstart:\n{out[-800:]}")
+    missing = [f"qubes-template-{n}" for n in extra_packages
+               if f"qubes-template-{n}" not in out]
+    if missing:
+        raise Fatal(
+            f"pykickstart parsed the kickstart but these packages are not in the "
+            f"package list: {', '.join(missing)}\n"
+            "     The second %packages section did not merge — it overrode, or was "
+            "overridden.\n     The ISO would install without the investigator "
+            "templates.")
+    if extra_packages:
+        x.ok(f"pykickstart merges both %packages sections "
+             f"({len(extra_packages)} templates present in the parsed list)")
 
 
 def build_iso(x: Ctx, payload: Path):
@@ -1343,25 +1653,29 @@ def build_iso(x: Ctx, payload: Path):
 
     # The %packages question, answered against the artefact rather than left as
     # a note: are the custom template RPMs actually inside the image?
-    if tier2 and shutil.which("bsdtar"):
-        listing = x.run("bsdtar", "-tf", str(target), check=False, capture=True)
+    if tier2:
+        listing = iso_listing(x, target)
+        if listing is None:
+            raise Fatal(
+                "could not read the ISO's contents with bsdtar, 7z, isoinfo or a "
+                "loop mount, so\n     there is no evidence the investigator "
+                "templates are actually in it — which is\n     the whole Tier 2 "
+                "promise. Install one of those tools "
+                "(./build_iso.py setup-host)\n     and re-run './build_iso.py "
+                "iso', or verify the image by hand before distributing.")
         absent = [n for n in x.c["tier2_templates"]
                   if f"qubes-template-{n}" not in listing]
-        if listing.strip() and not absent:
-            x.ok(f"all {len(x.c['tier2_templates'])} investigator templates are "
-                 f"present in the ISO")
-        elif listing.strip():
+        if absent:
             raise Fatal(f"these templates are NOT in the ISO: {', '.join(absent)}\n"
                         "     The %packages section did not take effect. Do not "
                         "distribute this image — it installs a broken workstation.")
-    elif tier2:
-        x.verify("bsdtar is not installed, so the ISO contents were not checked. "
-                 "Mount the image and confirm the investigator template RPMs are "
-                 "in it before distributing.")
+        x.ok(f"all {len(x.c['tier2_templates'])} investigator templates are "
+             f"present in the ISO")
 
     # Everything a colleague needs to check the image, in one command, beside
     # the image. GUIDE section 7 used to be three commands typed from memory.
     write_verify_script(x, digest)
+    write_verify_script_windows(x)
     if x.c["iso_sign_key"]:
         write_fingerprint_sheet(x, x.c["iso_sign_key"])
 
@@ -1465,6 +1779,17 @@ def in_qube() -> bool:
     return Path("/usr/share/qubes/marker-vm").exists()
 
 
+def in_wsl() -> str:
+    """'' if this is not WSL, otherwise 'wsl2' or 'wsl1'."""
+    try:
+        rel = Path("/proc/sys/kernel/osrelease").read_text().lower()
+    except OSError:
+        return ""
+    if "microsoft" not in rel:
+        return ""
+    return "wsl2" if "wsl2" in rel or os.environ.get("WSL_DISTRO_NAME") else "wsl1"
+
+
 def _sudo(argv: list[str]) -> list[str]:
     return argv if os.geteuid() == 0 else ["sudo", *argv]
 
@@ -1520,11 +1845,20 @@ def doctor(x: Ctx) -> int:
     for tool in ("git", "curl", "gpg", "rsync"):
         c.append(Check(f"{tool} installed", OK if shutil.which(tool) else FAIL,
                        fix="./build_iso.py setup-host"))
-    # Without it the build cannot confirm the investigator templates actually
-    # made it into the finished image, which is the whole Tier 2 promise.
-    c.append(Check("bsdtar installed (checks the ISO's contents after the build)",
-                   OK if shutil.which("bsdtar") else FAIL,
+    # Without one of these the build cannot confirm the investigator templates
+    # actually made it into the finished image, which is the whole Tier 2 promise.
+    reader = next((t for t in ("bsdtar", "7z", "7za", "isoinfo", "xorriso")
+                   if shutil.which(t)), "")
+    c.append(Check("a tool that can read an ISO's contents", OK if reader else FAIL,
+                   reader or "none of bsdtar, 7z, isoinfo, xorriso",
                    fix="./build_iso.py setup-host"))
+    try:
+        import pykickstart                                   # noqa: F401
+        c.append(Check("pykickstart present (validates the generated kickstart)", OK))
+    except ImportError:
+        c.append(Check("pykickstart present (validates the generated kickstart)",
+                       WARN, "missing — the kickstart is checked after the build "
+                       "instead of before it", "./build_iso.py setup-host"))
 
     if not shutil.which(ce):
         c.append(Check(f"{ce} installed", FAIL, fix="./build_iso.py setup-host"))
@@ -1601,6 +1935,33 @@ def doctor(x: Ctx) -> int:
                                OK if days > 90 else WARN, f"{days} days left",
                                "renew before the next build cycle"))
 
+    wsl = in_wsl()
+    if wsl:
+        # A real Linux kernel, so the scripts themselves run fine. What is NOT
+        # established is that qubes-builderv2's Mock chroots and loop-device
+        # work behave under WSL — upstream neither supports nor tests it.
+        c.append(Check("running under WSL", WARN, wsl,
+                       "qubes-builderv2 is not tested on WSL. A Debian 13 VM "
+                       "(Hyper-V/VirtualBox/VMware) is the path that is known to "
+                       "work. See docs/GUIDE.md section 2."))
+        if wsl == "wsl1":
+            c.append(Check("WSL version supports containers", FAIL,
+                           "WSL1 has no real kernel — Docker cannot run",
+                           "wsl --set-version <distro> 2"))
+        if not Path("/dev/loop-control").exists():
+            c.append(Check("loop devices available", FAIL, "no /dev/loop-control",
+                           "the ISO build needs them; use a VM instead"))
+        else:
+            c.append(Check("loop devices available", OK))
+        try:
+            sysd = Path("/proc/1/comm").read_text().strip()
+        except OSError:
+            sysd = "?"
+        c.append(Check("systemd is PID 1 (WSL needs it enabled)",
+                       OK if sysd == "systemd" else WARN, f"PID 1 is {sysd}",
+                       "put 'systemd=true' under [boot] in /etc/wsl.conf, then "
+                       "'wsl --shutdown' from Windows"))
+
     if in_qube():
         conf = Path("/rw/config/qubes-bind-dirs.d/50_docker.conf")
         c.append(Check("Docker storage persists across reboots (app qube)",
@@ -1659,9 +2020,9 @@ def key_expiry(fpr: str) -> int | None:
 # without it this script refuses to edit builder.yml at all. bsdtar lets the
 # build confirm the investigator templates are actually inside the finished ISO.
 DEB_PACKAGES = ["docker.io", "git", "curl", "gnupg", "rsync", "python3",
-                "python3-yaml", "libarchive-tools"]
+                "python3-yaml", "libarchive-tools", "python3-pykickstart"]
 RPM_PACKAGES = ["docker", "git", "curl", "gnupg2", "rsync", "python3",
-                "python3-pyyaml", "bsdtar"]
+                "python3-pyyaml", "bsdtar", "pykickstart"]
 
 
 def setup_host(x: Ctx) -> int:
@@ -1900,6 +2261,152 @@ To verify an image against this key:
 Or run the script shipped beside the ISO:  ./verify-iso.sh
 """)
     x.ok(f"fingerprint sheet written: {sheet}")
+
+
+# ---------------------------------------------------------------------------
+#  backup-key / restore-key
+#
+#  The signing key lives in the build host's GPG keyring, and nothing was
+#  keeping a copy of it. Lose the build host — a reinstalled machine, a deleted
+#  WSL distro, a discarded VM — and every image you ever signed becomes
+#  unverifiable and unrenewable, because the fingerprint your colleagues trust
+#  is gone. That is not a step to remember; it is a command.
+# ---------------------------------------------------------------------------
+def backup_key(x: Ctx) -> int:
+    x.phase("backup-key", "back up the signing key")
+    fpr = (getattr(x.args, "use_key", None) or x.c["iso_sign_key"] or "").replace(
+        " ", "").upper()
+    if not re.fullmatch(r"[0-9A-F]{40}", fpr or ""):
+        raise Fatal("no signing key to back up. ./build_iso.py gen-key first, or "
+                    "pass --use-key <fingerprint>.")
+    if not x.quiet("gpg", "--list-secret-keys", fpr):
+        raise Fatal(f"no SECRET key for {fpr} in this keyring")
+    dest = Path(getattr(x.args, "to", None) or (x.out_dir / "key-backup"))
+    if x.args.dry_run:
+        x.info(f"[dry-run] export {fpr} (secret key, revocation certificate, "
+               f"public key) to {dest}")
+        return 0
+    dest.mkdir(parents=True, exist_ok=True)
+    dest.chmod(0o700)
+    old_umask = os.umask(0o077)
+    try:
+        sec = dest / f"{fpr}-secret.asc"
+        if not getattr(x.args, "passphrase_file", None):
+            if not sys.stdin.isatty():
+                raise Fatal("backing up a key needs a terminal for the "
+                            "passphrase prompts, or --passphrase-file <path> "
+                            "to encrypt the backup non-interactively.")
+            x.info("gpg will ask for the key's passphrase, and then for a "
+                   "passphrase to encrypt the backup with. They may differ; both "
+                   "are needed to restore.")
+        # Encrypted at rest with a passphrase, not a bare export: this file is
+        # about to be carried somewhere.
+        rc = subprocess.run(
+            ["gpg", "--export-secret-keys", "--armor", "--output", str(sec), fpr]
+        ).returncode
+        if rc != 0 or not sec.exists():
+            raise Fatal(f"gpg could not export the secret key (exit {rc})")
+        sec.chmod(0o600)
+        enc = dest / f"{fpr}-secret.asc.gpg"
+        enc.unlink(missing_ok=True)
+        pf = getattr(x.args, "passphrase_file", None)
+        argv = ["gpg", "--symmetric", "--cipher-algo", "AES256",
+                "--output", str(enc)]
+        if pf:
+            # For a unit that scripts this into its own key-management process.
+            argv[1:1] = ["--batch", "--yes", "--pinentry-mode", "loopback",
+                         "--passphrase-file", str(pf)]
+        rc = subprocess.run(argv + [str(sec)]).returncode
+        if rc != 0 or not enc.exists():
+            sec.unlink(missing_ok=True)
+            raise Fatal("could not encrypt the exported key; the plaintext export "
+                        "has been removed.")
+        # Overwrite the plaintext export rather than merely unlinking it.
+        with sec.open("r+b") as fh:
+            n = fh.seek(0, 2)
+            fh.seek(0)
+            fh.write(b"\0" * n)
+            fh.flush()
+            os.fsync(fh.fileno())
+        sec.unlink()
+        enc.chmod(0o600)
+        x.ok(f"secret key -> {enc.name} (AES256, passphrase-protected)")
+
+        rev = dest / f"{fpr}-revocation.asc"
+        if not rev.exists():
+            # GNUPGHOME, not an assumed ~/.gnupg: a unit that keeps its keyring
+            # elsewhere would otherwise silently get a backup with no way to
+            # revoke the key it contains.
+            home = Path(os.environ.get("GNUPGHOME") or (Path.home() / ".gnupg"))
+            src = home / "openpgp-revocs.d" / f"{fpr}.rev"
+            if src.is_file():
+                shutil.copy2(src, rev)
+                rev.chmod(0o600)
+                x.ok(f"revocation certificate -> {rev.name}")
+            else:
+                x.warn("no pre-generated revocation certificate found; generate "
+                       "one with 'gpg --gen-revoke' and keep it with this backup")
+        pub = dest / f"{fpr}-public.asc"
+        x.quiet("gpg", "--batch", "--yes", "--armor", "--output", str(pub),
+                "--export", fpr)
+        (dest / "README.txt").write_text(f"""\
+Signing key backup — {x.c['iso_flavor']}
+Fingerprint: {fpr}
+Taken: {datetime.now():%Y-%m-%d %H:%M:%S} on {os.uname().nodename}
+
+  {fpr}-secret.asc.gpg   the private key, AES256, passphrase-protected
+  {fpr}-revocation.asc   use this if the key is ever compromised
+  {fpr}-public.asc       hand this to colleagues
+
+Restore on another machine:
+
+    ./build_iso.py restore-key --from <this directory>
+
+THIS IS THE KEY THAT SIGNS IMAGES YOUR UNIT INSTALLS. Whoever holds it and its
+passphrase can sign an image your colleagues will trust. Store it the way you
+store other private key material — not beside the ISOs it signs.
+""")
+        x.ok(f"backup written to {dest}")
+    finally:
+        os.umask(old_umask)
+    x.warn("carry this off the build host. A backup on the machine that would "
+           "lose the key protects you from nothing.")
+    return 0
+
+
+def restore_key(x: Ctx) -> int:
+    x.phase("restore-key", "restore the signing key")
+    src = Path(getattr(x.args, "from_dir", None) or (x.out_dir / "key-backup"))
+    if not src.is_dir():
+        raise Fatal(f"no backup directory at {src} — pass --from <directory>")
+    enc = sorted(src.glob("*-secret.asc.gpg"))
+    if not enc:
+        raise Fatal(f"no *-secret.asc.gpg in {src}")
+    fpr = enc[0].name.split("-secret")[0].upper()
+    if x.args.dry_run:
+        x.info(f"[dry-run] import {fpr} from {enc[0]}")
+        return 0
+    if x.quiet("gpg", "--list-secret-keys", fpr):
+        x.ok(f"{fpr} is already in this keyring")
+    else:
+        x.info("gpg will ask for the backup passphrase, then the key's own.")
+        pf = getattr(x.args, "passphrase_file", None)
+        argv = ["gpg", "--decrypt"]
+        if pf:
+            argv[1:1] = ["--batch", "--pinentry-mode", "loopback",
+                         "--passphrase-file", str(pf)]
+        dec = subprocess.run(argv + [str(enc[0])], capture_output=True)
+        if dec.returncode != 0 or not dec.stdout:
+            raise Fatal("could not decrypt the backup — wrong passphrase?")
+        imp = subprocess.run(["gpg", "--batch", "--import"], input=dec.stdout,
+                             capture_output=True)
+        if imp.returncode != 0:
+            raise Fatal(f"gpg could not import the key: "
+                        f"{imp.stderr.decode(errors='replace')[:300]}")
+        if not x.quiet("gpg", "--list-secret-keys", fpr):
+            raise Fatal(f"import reported success but {fpr} is not in the keyring")
+        x.ok(f"imported {fpr}")
+    return _adopt_key(x, fpr)
 
 
 # ---------------------------------------------------------------------------
@@ -2450,6 +2957,7 @@ def sign_iso(x: Ctx) -> int:
     # Everything that has to travel with, or beside, the signature.
     x.export_pubkey()
     write_verify_script(x, digest)
+    write_verify_script_windows(x)
     write_fingerprint_sheet(x, fpr)
     print(f"""
   Copy back to the build host, or hand out from here:
@@ -2459,6 +2967,117 @@ def sign_iso(x: Ctx) -> int:
     {iso.parent / 'FINGERPRINT.txt'}
 """)
     return 0
+
+
+def iso_listing(x: Ctx, iso: Path) -> str | None:
+    """Every file name in the ISO, by whichever tool this host has.
+
+    This answers the pykickstart question the build used to leave as a note:
+    if the templates are in the image, the %packages section took effect.
+    """
+    for argv in (["bsdtar", "-tf", str(iso)],
+                 ["7z", "l", "-ba", "-slt", str(iso)],
+                 ["7za", "l", "-ba", str(iso)],
+                 ["isoinfo", "-f", "-i", str(iso)],
+                 ["xorriso", "-indev", str(iso), "-find", "/"]):
+        if not shutil.which(argv[0]):
+            continue
+        out = x.run(*argv, check=False, capture=True)
+        if out.strip():
+            x.info(f"read the ISO's contents with {argv[0]}")
+            return out
+    # Last resort: mount it. Needs root, so it is tried last and never assumed.
+    mnt = x.work / ".isomount"
+    mnt.mkdir(parents=True, exist_ok=True)
+    if x.quiet(*_sudo(["mount", "-o", "loop,ro", str(iso), str(mnt)])):
+        try:
+            return "\n".join(str(q.relative_to(mnt)) for q in mnt.rglob("*"))
+        finally:
+            x.quiet(*_sudo(["umount", str(mnt)]))
+    return None
+
+
+def write_verify_script_windows(x: Ctx) -> None:
+    """The same check, for a colleague on Windows.
+
+    They cannot run verify-iso.sh, and telling them to install a POSIX shell to
+    check an ISO is how verification stops happening. Gpg4win provides gpg.exe;
+    the checksum needs nothing but Windows itself.
+    """
+    fp = x.c.get("iso_sign_key") or ""
+    ps = x.out_dir / "verify-iso.ps1"
+    ps.write_text(f"""\
+# Verify {x.c['iso_name']} on Windows.  PowerShell:  .\\verify-iso.ps1 [fingerprint]
+#
+# Checks the checksum with Windows' own tooling, then the GPG signature if
+# Gpg4win is installed (https://gpg4win.org). Pass the fingerprint you were
+# given through a channel INDEPENDENT of this media and the script compares it
+# for you; otherwise it prints the signer for you to compare by eye.
+param([string]$Expect = $env:EXPECT_FPR)
+$ErrorActionPreference = 'Stop'
+Set-Location -Path $PSScriptRoot
+
+$Iso = '{x.c["iso_name"]}'
+$Fpr = '{fp}'
+
+if (-not (Test-Path $Iso)) {{ Write-Host "  $Iso not found" -f Red; exit 1 }}
+
+Write-Host '  checksum ... ' -NoNewline
+$want = (Get-Content "$Iso.sha256" -Raw).Trim().Split()[0].ToLower()
+$got  = (Get-FileHash $Iso -Algorithm SHA256).Hash.ToLower()
+if ($want -ne $got) {{
+    Write-Host 'MISMATCH' -f Red
+    Write-Host "  expected $want"
+    Write-Host "  actual   $got"
+    Write-Host '  Do not install this image.' -f Red
+    exit 1
+}}
+Write-Host 'ok' -f Green
+
+$gpg = Get-Command gpg.exe -ErrorAction SilentlyContinue
+if (-not $gpg) {{
+    Write-Host ''
+    Write-Host '  gpg.exe not found. The checksum proves the file is intact,' -f Yellow
+    Write-Host '  NOT that it came from your unit. Install Gpg4win from' -f Yellow
+    Write-Host '  https://gpg4win.org and run this again.' -f Yellow
+    exit 2
+}}
+
+& gpg.exe --quiet --import unit-signing-key.asc 2>$null
+Write-Host '  signature ... ' -NoNewline
+$status = & gpg.exe --batch --status-fd 1 --verify "$Iso.asc" $Iso 2>$null
+if (-not ($status -match 'GOODSIG')) {{
+    Write-Host 'BAD' -f Red
+    Write-Host '  The signature does not verify. Do not install this image.' -f Red
+    exit 1
+}}
+Write-Host 'ok' -f Green
+
+$signer = ($status | Select-String 'VALIDSIG ([0-9A-F]{{40}})').Matches.Groups[1].Value
+Write-Host ''
+Write-Host "  Signed by:  $signer"
+if ($Fpr -and $signer -ne $Fpr) {{
+    Write-Host "  Expected:   $Fpr" -f Red
+    Write-Host '  The signer is NOT the key this image was built with. Stop.' -f Red
+    exit 1
+}}
+if ($Expect) {{
+    $e = ($Expect -replace '\s','').ToUpper()
+    if ($e -eq $signer) {{ Write-Host '  Matches the fingerprint you supplied.' -f Green }}
+    else {{
+        Write-Host "  Expected:   $e" -f Red
+        Write-Host '  MISMATCH. Do not install this image.' -f Red
+        exit 1
+    }}
+}} else {{
+    Write-Host ''
+    Write-Host '  COMPARE that fingerprint against the one you were given through'
+    Write-Host '  a channel INDEPENDENT of this media. Or let the script do it:'
+    Write-Host '      .\\verify-iso.ps1 <fingerprint>'
+}}
+Write-Host ''
+""")
+    x.ok(f"Windows verification script written: {ps.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -2546,6 +3165,26 @@ def write_usb(x: Ctx) -> int:
 
     # 2. Pick a device, and refuse anything that is not removable.
     devs = removable_devices()
+    if getattr(x.args, "wait", False) and not getattr(x.args, "device", None):
+        # Plugging the stick in cannot be automated. Waiting for it can.
+        before = {d["dev"] for d in devs}
+        x.info("waiting for a removable device to appear — plug the stick in "
+               "(Ctrl-C to give up)")
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            time.sleep(2)
+            devs = removable_devices()
+            fresh = [d for d in devs if d["dev"] not in before]
+            if len(fresh) == 1:
+                x.args.device = fresh[0]["dev"]
+                x.ok(f"{fresh[0]['dev']} appeared "
+                     f"({fresh[0]['size'] / 1e9:.1f} GB {fresh[0]['model']})")
+                break
+            if len(fresh) > 1:
+                raise Fatal("more than one device appeared at once — name the one "
+                            "you mean with --device")
+        else:
+            raise Fatal("no new removable device appeared within five minutes")
     dev_path = getattr(x.args, "device", None)
     if not dev_path:
         if not devs:
@@ -2711,13 +3350,16 @@ lifecycle
   iso              build, checksum and sign the ISO
   all              templates, then the ISO
   sign             sign an image on the machine that holds the key
+  backup-key       export the signing key, its revocation certificate and public key
+  restore-key      import a signing-key backup on another machine
   write-usb        verify the image and write it to removable media
   list-kickstarts  show what the fetched Qubes sources offer
 """)
     p.add_argument("action", nargs="?", default="iso",
                    choices=["iso", "templates", "all", "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
-                            "write-usb", "config", "sign"],
+                            "write-usb", "config", "sign",
+                            "backup-key", "restore-key"],
                    help="what to do (default: iso)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true", help="skip the warning prompt")
@@ -2741,6 +3383,15 @@ lifecycle
     u.add_argument("--device", metavar="/dev/sdX", help="target device")
     u.add_argument("--allow-fixed-disk", action="store_true",
                    help="permit a non-removable target (destroys it)")
+    u.add_argument("--wait", action="store_true",
+                   help="wait for a removable device to be plugged in")
+    b = p.add_argument_group("backup-key / restore-key")
+    b.add_argument("--to", metavar="DIR", help="where to write the key backup")
+    b.add_argument("--from", dest="from_dir", metavar="DIR",
+                   help="the key backup to restore from")
+    b.add_argument("--passphrase-file", metavar="PATH",
+                   help="encrypt/decrypt the backup with this passphrase instead "
+                        "of prompting (for a scripted key-management process)")
     p.add_argument("--iso", metavar="PATH",
                    help="sign: the image to sign (default: the built one)")
     c = p.add_argument_group("check-upstream")
@@ -2798,6 +3449,10 @@ lifecycle
             return check_upstream(x)
         if args.action == "sign":
             return sign_iso(x)
+        if args.action == "backup-key":
+            return backup_key(x)
+        if args.action == "restore-key":
+            return restore_key(x)
         if args.action == "write-usb":
             return write_usb(x)
 

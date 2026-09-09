@@ -153,7 +153,43 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
   described but did not ship; CI runs them on every push and `check-upstream`
   every Monday.
 
-**Verified 2026-09-08 against primary sources**
+**Fixed — a regression from this same pass**
+
+- Making the dead `builder_branch` key live exposed that its value was wrong:
+  qubes-builderv2 has exactly one branch, `main`. Passing `--branch release4.3`
+  would have made the clone fail outright. Confirmed with `git ls-remote`.
+
+**Automated — the last of it**
+
+- `verify_builder` checks the builder's signed `mm_<sha>` tag against the Qubes
+  trust chain: one pinned fingerprint (the Master Signing Key,
+  `427F11FD0FAA4B080123F01CDDFA1A3E36879494`), developer keys trusted because it
+  has signed them. This was the oldest `[VERIFY]` in the repository.
+- `backup-key` / `restore-key`: the signing key existed in exactly one place and
+  nothing kept a copy. Lose the build host and every image you ever signed
+  becomes unverifiable.
+- `--prepare-backup-media` partitions, formats and labels the backup disk, and
+  confirms the by-label path the automount rule depends on actually appeared.
+- `install.unattended` emits the Anaconda answers; `install.auto_initial_setup`
+  completes Qubes' own initial setup non-interactively, and the first-boot
+  service retries every 30 minutes instead of giving up after one attempt. The
+  disk-encryption passphrase stays interactive on purpose.
+- `component_remote` + `component_sign_key` push the generated template
+  component to your git server as a signed tag and switch `verification-mode`
+  off `insecure-skip-checking`.
+- The generated kickstart is parsed with pykickstart and its package list read
+  back; the finished ISO is opened (bsdtar, 7z, isoinfo, xorriso or a loop
+  mount) and the template RPMs confirmed present. Two more `[VERIFY]`s gone.
+- `write-usb --wait` waits for the stick; `verify-iso.ps1` gives colleagues on
+  Windows the same one-command check, with the same fingerprint comparison.
+- `doctor` detects WSL and checks what it can (kernel type, loop devices,
+  systemd as PID 1) rather than letting a build fail obscurely later.
+- Group 13 asserts the Wazuh certificate layout and reads the first-boot record.
+
+**No unconditional `[VERIFY]` notes remain.** The two that can still print are
+fallbacks for a missing tool or an upstream layout change.
+
+**Verified 2026-09-09 against primary sources**
 
 - Kali `827C…E4C5` current, expires 2028-04-17; legacy `44C6…0BF6` expires
   2027-02-04; published keyring SHA1 unchanged.

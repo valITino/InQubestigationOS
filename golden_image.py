@@ -221,6 +221,14 @@ DEFAULT_CONFIG: dict = {
         #     sudo mkfs.ext4 -L GOLDEN-BACKUP /dev/sdX1
         "media_label": "GOLDEN-BACKUP",
     },
+    # Qubes' own initial setup is a GUI step that creates the default qubes this
+    # provisioner then rewires. `--initial-setup` runs the same salt states
+    # non-interactively. Only states that exist on the machine are applied, and
+    # each one is confirmed by qvm-check afterwards rather than trusted.
+    "initial_setup_states": [
+        "qvm.sys-net", "qvm.sys-firewall", "qvm.sys-usb", "qvm.default-dispvm",
+        "qvm.personal", "qvm.work", "qvm.untrusted", "qvm.vault",
+    ],
     # Days after provisioning at which the login banner starts saying this image
     # is stale. An ISO freezes dom0, Xen and the kernel at build time.
     "staleness_warn_days": 120,
@@ -2001,9 +2009,9 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
             o.warn("  /etc/wazuh-indexer/ or reset it before issuing the laptop.")
 
         o.info("group 13 asserts wazuh-manager, -indexer and -dashboard are active")
-        o.verify(f"certificate paths against the Wazuh {w['version']} single-node "
-                 f"guide — the layout changes between series, and this is the one "
-                 f"thing group 13 cannot tell apart from a working install")
+        o.info("group 13 asserts the certificate layout the three services "
+               "actually read, so a layout change between Wazuh series shows up "
+               "as a failing test rather than an indexer that will not start")
         o.info("agents self-enroll on first start (phase 11) — no manual key exchange")
 
         self._mark(8)
@@ -2969,6 +2977,39 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                     "could not reach the dashboard over qrexec from 'work' — check "
                     "the policy in /etc/qubes/policy.d/30-golden-image.policy")
 
+        # 5b. The certificate layout. The paths differ between Wazuh series, and
+        #     a wrong one looks exactly like a working install until the indexer
+        #     refuses to start. Assert what each service actually reads.
+        if w["mode"] != "central" and r.vm_exists(q["wazuh"]):
+            for path, owner in (
+                    ("/etc/wazuh-indexer/certs/indexer.pem", "wazuh-indexer"),
+                    ("/etc/wazuh-indexer/certs/indexer-key.pem", "wazuh-indexer"),
+                    ("/etc/wazuh-indexer/certs/root-ca.pem", "wazuh-indexer"),
+                    ("/etc/wazuh-dashboard/certs/dashboard.pem", "wazuh-dashboard"),
+                    ("/etc/wazuh-dashboard/certs/dashboard-key.pem", "wazuh-dashboard"),
+                    ("/etc/wazuh-dashboard/certs/root-ca.pem", "wazuh-dashboard")):
+                ok = r.qtest(q["wazuh"],
+                             f"test -f {shlex.quote(path)} && "
+                             f"[ \"$(stat -c %U {shlex.quote(path)})\" = "
+                             f"{shlex.quote(owner)} ] && "
+                             f"[ \"$(stat -c %a {shlex.quote(path)})\" = 400 ]")
+                self._t("pass" if ok else "fail",
+                        f"{path} present, {owner}, mode 400" if ok else
+                        f"{path} missing, wrongly owned, or not mode 400 — check "
+                        f"the Wazuh {w['version']} single-node certificate layout")
+
+        # 5c. Did the first-boot service fire at all? That was a [VERIFY] note
+        #     in the ISO builder — "confirm on your hardware". The runner records
+        #     what it did; this reads the record.
+        fb = dom0("/var/lib/golden-image/firstboot-status")
+        if fb.exists():
+            txt = fb.read_text().strip()
+            self._t("pass" if "provisioned" in txt or "ran" in txt else "warn",
+                    f"first-boot service fired: {txt.splitlines()[0][:70]}")
+        else:
+            self._t("warn", "no first-boot record — this machine was provisioned "
+                            "by hand, or the ISO was built with auto_provision off")
+
         # 6. The backup profile schema is accepted.
         self._t_backup_profile()
 
@@ -3338,6 +3379,152 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                "image is the git tag, not any one laptop")
         return 0
 
+    def prepare_backup_media(self, device: str) -> int:
+        """Partition, format and label the backup disk.
+
+        The automount rule keys off the filesystem LABEL, and the one manual
+        step left was `mkfs.ext4 -L GOLDEN-BACKUP /dev/sdX1` typed against a
+        device node the operator identified by eye. This does the identifying
+        as well, and refuses anything that is not removable.
+        """
+        o, r, b = self.out, self.r, self.c["backup"]
+        dest, label = b["dest_qube"], b["media_label"]
+        print(f"\n{Out.B}{Out.C}══ Backup media{Out.RST}")
+        if not r.vm_exists(dest):
+            raise Fatal(f"{dest} does not exist — it is where the disk attaches")
+        r.ensure_running(dest)
+
+        listing = r.run("qvm-run", "--no-gui", "--pass-io", "-u", "root", dest,
+                        "lsblk -dnp -o NAME,SIZE,MODEL,RM,TYPE", check=False,
+                        capture=True)
+        disks = []
+        for line in listing.splitlines():
+            f = line.split()
+            if len(f) < 4 or f[-1] != "disk":
+                continue
+            disks.append({"dev": f[0], "size": f[1], "rm": f[-2] == "1",
+                          "model": " ".join(f[2:-2])})
+        if not disks:
+            raise Fatal(f"no block devices visible in {dest}. Attach the disk "
+                        f"first:  qvm-block attach {dest} <backend>:<device>")
+        o.say("")
+        for disk in disks:
+            o.say(f"      {disk['dev']:14s} {disk['size']:>8s}  "
+                  f"{'removable' if disk['rm'] else 'FIXED':10s} {disk['model']}")
+        o.say("")
+
+        if not device:
+            removable = [x for x in disks if x["rm"]]
+            if len(removable) != 1:
+                raise Fatal("name the disk with --device; "
+                            f"{len(removable)} removable disks are attached")
+            device = removable[0]["dev"]
+            o.info(f"selected the only removable disk: {device}")
+        chosen = next((x for x in disks if x["dev"] == device), None)
+        if chosen is None:
+            raise Fatal(f"{device} is not attached to {dest}")
+        if not chosen["rm"] and not self.args.force:
+            raise Fatal(f"{device} is not removable. This erases it completely. "
+                        f"Re-run with --force if you are certain.")
+
+        o.warn(f"EVERYTHING ON {device} IN {dest} WILL BE ERASED "
+               f"({chosen['size']} {chosen['model']}).")
+        if self.args.dry_run:
+            o.info(f"[dry-run] partition, mkfs.ext4 -L {label}, verify by-label")
+            return 0
+        if not self.args.force:
+            if not sys.stdin.isatty():
+                raise Fatal("no terminal to confirm on — re-run with --force")
+            if input(f"  Type ERASE to wipe {device}: ").strip() != "ERASE":
+                raise Fatal("aborted")
+
+        q = shlex.quote(device)
+        r.qrun(dest, f"set -e\n"
+                     f"umount {q}* 2>/dev/null || true\n"
+                     f"wipefs -a {q}\n"
+                     f"sgdisk --zap-all {q} 2>/dev/null || "
+                     f"  parted -s {q} mklabel gpt\n"
+                     f"parted -s {q} mklabel gpt mkpart primary ext4 1MiB 100%\n"
+                     f"udevadm settle 2>/dev/null || sleep 2\n")
+        part = r.run("qvm-run", "--no-gui", "--pass-io", "-u", "root", dest,
+                     f"lsblk -lnp -o NAME,TYPE {q} | awk '$2==\"part\"{{print $1; exit}}'",
+                     check=False, capture=True).strip()
+        if not part:
+            raise Fatal(f"no partition appeared on {device} after partitioning")
+        r.qrun(dest, f"mkfs.ext4 -q -F -L {shlex.quote(label)} {shlex.quote(part)}")
+        if not r.qtest(dest, f"test -e /dev/disk/by-label/{shlex.quote(label)}",
+                       dry_default=False):
+            raise Fatal(f"the filesystem was created but "
+                        f"/dev/disk/by-label/{label} did not appear. The "
+                        f"automount rule keys off that path.")
+        o.ok(f"{part} formatted ext4, labelled {label}")
+        r.qrun(dest, f"mkdir -p {shlex.quote(b['dest_dir'])} && "
+                     f"mount /dev/disk/by-label/{shlex.quote(label)} "
+                     f"{shlex.quote(b['dest_dir'])}", check=False)
+        o.ok(f"mounted at {b['dest_dir']} — and it will mount itself from now on, "
+             f"by label, whenever it is attached")
+        return 0
+
+    def initial_setup(self) -> int:
+        """Create the default qubes Qubes' GUI initial setup would create.
+
+        The provisioner rewires those qubes, so it has to wait for them. On an
+        unattended install nobody is there to click through the wizard, and the
+        first-boot runner used to give up after thirty minutes and write a note
+        to the MOTD. The same work is a set of salt states.
+        """
+        o, r = self.out, self.r
+        print(f"\n{Out.B}{Out.C}══ Qubes initial setup{Out.RST}")
+        if not r.quiet("which", "qubesctl") and not Path("/usr/bin/qubesctl").exists():
+            raise Fatal("qubesctl is not available — complete Qubes initial setup "
+                        "from the GUI, then re-run the provisioner.")
+        wanted = list(self.c["initial_setup_states"])
+        if self.args.dry_run:
+            for st in wanted:
+                o.info(f"[dry-run] qubesctl state.sls {st}")
+            return 0
+
+        # Which of them this release actually ships. Applying a state that does
+        # not exist fails in a way that reads like a broken machine.
+        available = []
+        for st in wanted:
+            if r.quiet("qubesctl", "top.enable", st, "--show-output"):
+                available.append(st)
+            elif r.quiet("qubesctl", "state.show_sls", st):
+                available.append(st)
+            else:
+                o.warn(f"salt state {st} not present on this release — skipping")
+        if not available:
+            raise Fatal("none of the configured initial-setup states exist on "
+                        "this machine. Complete initial setup from the GUI.")
+
+        failed = []
+        for st in available:
+            o.info(f"applying {st}")
+            if not r.quiet("qubesctl", "--show-output", "state.sls", st):
+                failed.append(st)
+                o.warn(f"{st} did not apply cleanly")
+        # Trust qvm-check, not salt's exit code.
+        expect = {"qvm.sys-net": self.q["net"], "qvm.sys-firewall": self.q["firewall"],
+                  "qvm.sys-usb": self.q["usb"], "qvm.personal": "personal",
+                  "qvm.work": "work", "qvm.untrusted": "untrusted",
+                  "qvm.vault": "vault", "qvm.default-dispvm": self.c["qube"]["dvm_offline"]}
+        for st in available:
+            vm = expect.get(st)
+            if vm and vm != self.c["qube"]["dvm_offline"]:
+                if r.vm_exists(vm):
+                    o.ok(f"{vm} exists")
+                else:
+                    o.warn(f"{st} applied but {vm} does not exist")
+                    failed.append(st)
+        if not r.vm_exists(self.q["net"]) or not r.vm_exists(self.q["firewall"]):
+            raise Fatal("initial setup did not produce sys-net and sys-firewall. "
+                        "Complete it from the GUI and re-run.")
+        if failed:
+            o.warn(f"states with problems: {', '.join(sorted(set(failed)))}")
+        o.ok("initial setup complete — the provisioner can run now")
+        return 0
+
     def refresh_repo_keys(self) -> int:
         """Re-fetch and re-verify the third-party repository keys.
 
@@ -3539,6 +3726,9 @@ def main() -> int:
     p.add_argument("--write-config", action="store_true",
                    help="emit golden-image.json and exit")
     p.add_argument("--list-phases", action="store_true")
+    p.add_argument("--initial-setup", action="store_true",
+                   help="create the default qubes non-interactively, instead of "
+                        "clicking through Qubes' initial-setup wizard")
     p.add_argument("--test-root", action="store_true",
                    help=argparse.SUPPRESS)          # tests/run_tests.py only
 
@@ -3559,6 +3749,9 @@ def main() -> int:
     life.add_argument("--upgrade-wazuh", action="store_true",
                       help="upgrade the SIEM in the supported order: manager, "
                            "then agents")
+    life.add_argument("--prepare-backup-media", nargs="?", const="", metavar="DEV",
+                      help="partition, format and label the backup disk in the "
+                           "USB qube (default: the only removable disk attached)")
     life.add_argument("--refresh-repo-keys", action="store_true",
                       help="re-fetch and re-verify the pinned repository signing "
                            "keys (what the expiry watch tells you to run)")
@@ -3577,6 +3770,10 @@ def main() -> int:
 
         if args.handover:
             return prov.handover_sequence(args.handover)
+        if args.initial_setup:
+            return prov.initial_setup()
+        if args.prepare_backup_media is not None:
+            return prov.prepare_backup_media(args.prepare_backup_media)
         if args.refresh_repo_keys:
             return prov.refresh_repo_keys()
         if args.rotate_credentials:

@@ -139,6 +139,13 @@ Most of those steps are now commands or timers.
 | "Build unsigned and sign afterwards on the machine that holds the key" | `./build_iso.py sign` — re-checksums, signs, and regenerates everything that travels with the signature |
 | Compare the printed fingerprint against the one you were given, by eye | `./verify-iso.sh <fingerprint>` compares them and exits non-zero |
 | Pick a `work_dir` "somewhere with 250 GB free" | `--set work_dir=auto` |
+| "Verify the builder itself — nothing verifies the builder for you" | `verify_builder` checks the signed tag against the Qubes master signing key's web of trust; one pinned fingerprint, developer keys derived from it |
+| Keep the signing key safe by remembering to | `backup-key` / `restore-key` — encrypted key, revocation certificate, public key |
+| `mkfs.ext4 -L GOLDEN-BACKUP /dev/sdX1` against a device you identified by eye | `--prepare-backup-media` |
+| Click through Anaconda, then through Qubes' initial-setup wizard | `install.unattended` + `install.auto_initial_setup` — everything except the disk passphrase, which stays human on purpose |
+| "Confirm on your hardware that the first-boot service fires" | the runner records what it did; group 13 reads the record, and a timer retries until the machine is provisioned |
+| "Confirm pykickstart merges two %packages sections" | the generated kickstart is parsed and its package list read back; the finished ISO is opened and the template RPMs confirmed present |
+| Move the component to your git server and sign its tags "before production" | `component_remote` + `component_sign_key` — the build pushes a signed tag and turns `verification-mode` back on |
 | Decide whether this machine has the RAM for a local SIEM | `wazuh.mode: auto` |
 | Three verification commands emailed to colleagues | `verify-iso.sh` and `FINGERPRINT.txt`, generated beside the image |
 | "Confirm by hand the four things the tests cannot check" | acceptance-test group 13 |
