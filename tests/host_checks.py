@@ -603,6 +603,29 @@ def note_unprobed_family(bi) -> None:
              "against the dated KNOWN_ABSENT ledger")
 
 
+def check_ci_covers_both_families() -> None:
+    """CI must live-query both supported package-manager families."""
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    check("CI runs the Debian-family live package probe on Ubuntu",
+          "runs-on: ubuntu-latest" in workflow
+          and "run: ./tests/host_checks.py" in workflow,
+          "the normal Ubuntu host check is missing")
+    fedora_job = re.search(
+        r"(?ms)^  fedora-host:\n(?P<body>.*?)(?=^  [a-z][a-z-]*:\n|\Z)",
+        workflow,
+    )
+    check("CI has a dedicated Fedora host-check job", fedora_job is not None,
+          "add a fedora-host job so DNF package availability is tested live")
+    if fedora_job:
+        body = fedora_job.group("body")
+        check("the Fedora host-check job runs in a Fedora container",
+              re.search(r"(?m)^\s+image:\s*fedora:\d+\s*$", body) is not None,
+              "the fedora-host job has no versioned Fedora container")
+        check("the Fedora job runs the complete host-check suite",
+              "python3 ./tests/host_checks.py" in body,
+              "Fedora starts, but host_checks.py is not executed there")
+
+
 def check_no_hardcoded_lists() -> None:
     """The two flat cross-distro lists must not come back."""
     src = (ROOT / "build_iso.py").read_text()
@@ -663,6 +686,7 @@ def main() -> int:
     check_install_gate(bi)
     check_family_neutral_messages()
     note_unprobed_family(bi)
+    check_ci_covers_both_families()
     check_no_hardcoded_lists()
     check_pykickstart_advice()
 

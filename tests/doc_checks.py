@@ -14,7 +14,6 @@ from __future__ import annotations
 import ast
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -294,7 +293,6 @@ def check_product_name() -> None:
     """One product name. A second one in the docs sends people looking for a
     file that the build never produces."""
     iso = default_config("build_iso.py")["iso_name"]
-    stem = iso.rsplit(".", 1)[0]
     for doc in DOCS:
         text = doc.read_text()
         stray = set(re.findall(r"\b(QubesOS-Cybercrime-Investigator[\w.-]*)", text))
@@ -341,8 +339,9 @@ def check_docs_do_not_contradict() -> None:
     ver = (ROOT / "docs" / "VERIFICATION.md").read_text()
     # Naming the chain to explain that it does not exist is fine; presenting it
     # as an open action item for somebody to go and verify is not.
-    open_items = [l for l in ver.splitlines()
-                  if l.lstrip().startswith("- [ ]") and "custom-prerouting" in l]
+    open_items = [line for line in ver.splitlines()
+                  if line.lstrip().startswith("- [ ]")
+                  and "custom-prerouting" in line]
     check("VERIFICATION.md does not still list custom-prerouting as a chain to check",
           not open_items,
           "docs/REVIEW.md defect 1 established that this chain does not exist: "

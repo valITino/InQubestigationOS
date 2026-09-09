@@ -44,8 +44,8 @@ VALID_TYPES = {"filter", "nat", "route"}
 
 
 def check_nft_text(label: str, text: str) -> None:
-    exec_lines = [l for l in text.splitlines()
-                  if l.strip() and not l.strip().startswith("#")]
+    exec_lines = [line for line in text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")]
     body = "\n".join(exec_lines)
 
     check(f"{label}: braces balance",
@@ -161,7 +161,8 @@ def check_unbound(label: str, ub: str) -> None:
     check(f"{label}: forwards over TLS", "forward-tls-upstream: yes" in ub)
     check(f"{label}: no cleartext fallback", "forward-first: no" in ub)
     check(f"{label}: upstreams are pinned to port 853 with a TLS name",
-          all("@853#" in l for l in ub.splitlines() if "forward-addr" in l))
+          all("@853#" in line for line in ub.splitlines()
+              if "forward-addr" in line))
     check(f"{label}: a CA bundle is configured for upstream validation",
           "tls-cert-bundle:" in ub)
     check(f"{label}: not an open resolver", "access-control: 0.0.0.0/0 refuse" in ub)
@@ -176,9 +177,9 @@ def checks_ids(cap: Path, qube: str, fail_closed: bool = True) -> None:
         check_nft_text(f"{qube}/user-script", us)
         check(f"{qube}: uses 'queue num' (nft syntax), not 'queue to'",
               "queue num" in us and "queue to" not in us)
-        exec_lines = [l for l in us.splitlines()
-                      if l.strip() and not l.strip().startswith("#")]
-        has_bypass = any("bypass" in l for l in exec_lines)
+        exec_lines = [line for line in us.splitlines()
+                      if line.strip() and not line.strip().startswith("#")]
+        has_bypass = any("bypass" in line for line in exec_lines)
         check(f"{qube}: fail-closed IPS has no 'bypass' in any executable line",
               has_bypass is not fail_closed,
               "bypass present in an executable line" if fail_closed else "bypass missing")
