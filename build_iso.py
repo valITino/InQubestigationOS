@@ -2103,6 +2103,8 @@ def fix_argv(fix_line: str) -> list[str]:
 # ---------------------------------------------------------------------------
 def doctor(x: Ctx) -> int:
     x.phase("doctor", "is this build host ready?")
+    # Before anything measures work_dir or reports where it will be.
+    resolve_work_dir(x, fatal=False)
     c: list[Check] = []
     ce = x.c["container_engine"]
     tier2 = int(x.c["tier"]) == 2
@@ -2406,6 +2408,11 @@ def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
     return plan
 
 
+# `dnf list` prints "name.arch"; strip only a real architecture suffix, so a
+# package whose name legitimately contains a dot is not truncated.
+_RPM_ARCHES = ("x86_64", "noarch", "i686", "aarch64", "src")
+
+
 def packages_available(fam: str, names: list[str]) -> set[str] | None:
     """Which of `names` this host's package manager can actually install.
 
@@ -2414,14 +2421,24 @@ def packages_available(fam: str, names: list[str]) -> set[str] | None:
     demand opposite responses: skip those packages, versus try them anyway.
     A completely empty result is treated as a broken probe too, since an apt
     cache that has never been updated answers "no" to everything.
+
+    Known limitation, and it fails safe: on Debian a purely virtual package
+    with exactly ONE provider is installable by name, but `apt-cache policy`
+    reports it as `Candidate: (none)`, so it is treated as unavailable here.
+    The caller names every package it skips, so the worst case is a visible
+    warning about something that would have installed — not a silent drop.
     """
     if not names:
         return set()
+    # apt and dnf translate their output. Parsing "Candidate:" against a
+    # localised host would find nothing, and this would report every package
+    # as missing on, say, a French install.
+    env = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C", "LANG": "C"}
     try:
         if fam == "debian":
             if not shutil.which("apt-cache"):
                 return None
-            p = subprocess.run(["apt-cache", "policy", *names],
+            p = subprocess.run(["apt-cache", "policy", *names], env=env,
                                capture_output=True, text=True, timeout=180)
             found, cur = set(), ""
             for line in p.stdout.splitlines():
@@ -2437,20 +2454,27 @@ def packages_available(fam: str, names: list[str]) -> set[str] | None:
             if not shutil.which("dnf"):
                 return None
             found = set()
-            for n in names:
-                p = subprocess.run(["dnf", "--quiet", "list", n],
-                                   capture_output=True, text=True, timeout=180)
-                if p.returncode == 0 and n.lower() in p.stdout.lower():
-                    found.add(n)
-                    continue
-                # `dnf list` matches package NAMES only, but `dnf install`
-                # also resolves virtual provides — "docker" installs
-                # moby-engine, which merely Provides it. Probing with list
-                # alone would report a name as unavailable that installs
-                # perfectly well, so ask what provides it before giving up.
+            # One call for the whole set rather than one per package: dnf
+            # lists every name it knows and complains about the rest.
+            p = subprocess.run(["dnf", "--quiet", "list", *names], env=env,
+                               capture_output=True, text=True, timeout=300)
+            want = {n.lower(): n for n in names}
+            for line in p.stdout.splitlines():
+                tok = line.split()[0].lower() if line.split() else ""
+                stem, _, arch = tok.rpartition(".")
+                for cand in (tok, stem if arch in _RPM_ARCHES else ""):
+                    if cand in want:
+                        found.add(want[cand])
+                        break
+            # `dnf list` matches package NAMES only, but `dnf install` also
+            # resolves virtual provides — "docker" installs moby-engine,
+            # which merely Provides it. Probing with list alone would report a
+            # name as unavailable that installs perfectly well, so ask what
+            # provides the ones that missed before giving up on them.
+            for n in (n for n in names if n not in found):
                 q = subprocess.run(
                     ["dnf", "--quiet", "repoquery", "--whatprovides", n],
-                    capture_output=True, text=True, timeout=180)
+                    env=env, capture_output=True, text=True, timeout=180)
                 if q.returncode == 0 and q.stdout.strip():
                     found.add(n)
             return found or None
@@ -2547,9 +2571,22 @@ def ensure_pykickstart(x: Ctx) -> None:
     if not py.is_file():
         x.run(sys.executable, "-m", "venv", str(venv), check=False, live=True)
     if not py.is_file():
-        x.warn("could not create the virtualenv (is python3-venv installed?) — "
-               "the generated kickstart will be checked after the build "
+        x.warn("could not create the virtualenv — install python3-venv "
+               "(Debian, Kali, Ubuntu) and re-run ./build_iso.py setup-host. "
+               "Until then the generated kickstart is checked after the build "
                "instead of before it")
+        return
+    # A virtualenv left behind by an interrupted run, or one made with
+    # --without-pip, has an interpreter but nothing to install with. Repair it
+    # rather than running pip against it and reporting the failure as a
+    # network problem, which is what the error would otherwise look like.
+    if not x.quiet(str(py), "-m", "pip", "--version"):
+        x.info("the virtualenv has no pip — repairing it")
+        x.run(str(py), "-m", "ensurepip", "--upgrade", check=False, live=True)
+    if not x.quiet(str(py), "-m", "pip", "--version"):
+        x.warn(f"{venv} has no working pip and ensurepip could not add one — "
+               "remove it and re-run ./build_iso.py setup-host, or accept "
+               "that the kickstart is checked after the build instead")
         return
     x.run(str(py), "-m", "pip", "install", "--quiet", "--upgrade",
           "pykickstart", check=False, live=True)
@@ -2568,10 +2605,17 @@ def iso_reader() -> str:
 
 
 def _have_module(name: str) -> bool:
+    """Whether this interpreter can import `name`.
+
+    Catches every exception, not just ImportError: a half-installed or
+    version-mismatched module can raise almost anything at import time, and a
+    host-readiness probe must report "no" rather than take setup-host down
+    with it.
+    """
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -2640,6 +2684,9 @@ def setup_host(x: Ctx) -> int:
                     "     qubes-builderv2 ships dependency lists for Debian and\n"
                     "     Fedora families only, and this needs apt-get or dnf.")
     x.info(f"build host: {d.described()}  [detected via {d.how}]")
+    # Before the plan names a directory to create and a virtualenv to put
+    # inside it.
+    resolve_work_dir(x, fatal=False)
     ce = x.c["container_engine"]
     plan: list[list[str]] = []
 
@@ -3134,24 +3181,52 @@ def largest_writable_mount(need_gb: int) -> Path | None:
     return best
 
 
+def resolve_work_dir(x: Ctx, fatal: bool = True) -> None:
+    """Turn work_dir "auto" into a real path and re-point everything at it.
+
+    This used to happen only on the build path, so `doctor` and `setup-host`
+    saw the literal string "auto" — a RELATIVE path. `doctor` then measured
+    free space on the current directory and reported "will be created under
+    .", and `setup-host` planned `mkdir -p auto`, creating a directory of that
+    name wherever you happened to be standing. Both are asked, by name, to
+    tell you whether the host is ready; both have to resolve it first.
+
+    `fatal` is False for those two, because a read-only report and a host
+    setup step should say what is wrong rather than abort.
+    """
+    if str(x.c.get("work_dir", "")).lower() != "auto":
+        return
+    need = 250 if int(x.c["tier"]) == 2 else 100
+    mp = largest_writable_mount(need)
+    if mp is None and not fatal:
+        # Nothing is big enough. Still resolve somewhere real, so the report
+        # that follows is about a filesystem rather than about "auto".
+        mp = largest_writable_mount(0)
+        if mp is not None:
+            x.warn(f"work_dir is 'auto' and no writable filesystem has {need}G "
+                   f"free — reporting against the largest one, {mp}")
+    if mp is None:
+        if not fatal:
+            x.warn("work_dir is 'auto' and no writable filesystem could be "
+                   "found to resolve it against")
+            return
+        raise Fatal(f"work_dir is 'auto' but no writable filesystem has "
+                    f"{need}G free. Point it somewhere explicitly:\n"
+                    f"     ./build_iso.py --set work_dir=/path/with/space")
+    chosen = mp / "investigator-iso"
+    x.c["work_dir"] = str(chosen)
+    x.work = chosen
+    x.builder = chosen / "qubes-builderv2"
+    x.component = chosen / "qubes-template-investigator"
+    x.out_dir = chosen / "output"
+    x.log = chosen / "build.log"
+    x.state = chosen / ".state"
+    x.info(f"work_dir resolved to {chosen} ({_free_gb(mp)}G free)")
+
+
 def resolve_auto_values(x: Ctx) -> None:
     """Derive the settings the guide used to make the operator match by hand."""
-    if str(x.c.get("work_dir", "")).lower() == "auto":
-        need = 250 if int(x.c["tier"]) == 2 else 100
-        mp = largest_writable_mount(need)
-        if mp is None:
-            raise Fatal(f"work_dir is 'auto' but no writable filesystem has "
-                        f"{need}G free. Point it somewhere explicitly:\n"
-                        f"     ./build_iso.py --set work_dir=/path/with/space")
-        chosen = mp / "investigator-iso"
-        x.c["work_dir"] = str(chosen)
-        x.work = chosen
-        x.builder = chosen / "qubes-builderv2"
-        x.component = chosen / "qubes-template-investigator"
-        x.out_dir = chosen / "output"
-        x.log = chosen / "build.log"
-        x.state = chosen / ".state"
-        x.info(f"work_dir resolved to {chosen} ({_free_gb(mp)}G free)")
+    resolve_work_dir(x)
     if str(x.c.get("mock_config", "")).lower() in ("", "auto"):
         rel = str(x.c["qubes_release"]).lstrip("rR")
         # The Mock chroot must match the HOST distribution of the Qubes release,
