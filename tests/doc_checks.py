@@ -33,6 +33,35 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     (PASSED if ok else FAILED).append(name if ok else f"{name}\n          {detail}")
 
 
+def positional_choices(script: str) -> set[str]:
+    """The subcommands a script accepts, read from its POSITIONAL argument.
+
+    A regex for the first `choices=[...]` in the file matched whichever option
+    happened to be declared first — so adding `--case-mode` with choices turned
+    every word in the docs into a candidate subcommand. Ask the AST which
+    add_argument call is the positional one.
+    """
+    tree = ast.parse((ROOT / script).read_text())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "add_argument"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            continue
+        if first.value.startswith("-"):
+            continue                      # an option, not the subcommand
+        for kw in node.keywords:
+            if kw.arg == "choices":
+                try:
+                    return {str(v) for v in ast.literal_eval(kw.value)}
+                except (ValueError, SyntaxError):
+                    return set()
+    return set()
+
+
 def _lit(node):
     """literal_eval, but tolerant of the odd computed default (Path.home()/...)."""
     try:
@@ -146,8 +175,7 @@ def check_cli() -> None:
                   re.finditer(r'add_argument\(\s*"(--[a-z0-9-]+)"((?:[^()]|\([^()]*\))*?)\)',
                               src, re.S)
                   if 'action="store_true"' not in m.group(2)}
-        m = re.search(r"choices=\[([^\]]*)\]", src)
-        actions = set(re.findall(r'"([a-z][a-z-]*)"', m.group(1))) if m else set()
+        actions = positional_choices(script)
         for doc in DOCS:
             for line in _command_lines(doc.read_text()):
                 toks = line.split()

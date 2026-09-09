@@ -516,6 +516,20 @@ plugged in last and a backup written to the wrong disk is worse than none.
   inspected. `kali-tor` for OSINT where your IP must not appear — but Tor carries
   TCP only, so SYN scans, UDP scans and ICMP will not work there.
 
+**For a case that demands zero linkage.** Tor-branch telemetry reaches the same
+SIEM index as attributed telemetry. The correlation stays on this laptop, but if
+a case cannot tolerate it at all:
+
+```bash
+sudo golden-image-provision --case-mode anonymous --case 2026-0417
+# ...and when the case closes:
+sudo golden-image-provision --case-mode normal --case 2026-0417
+```
+
+It stops and *masks* the agent in `kali-tor`, `sys-whonix` and `anon-whonix`, so
+the per-boot start does not quietly undo it, and appends both actions to
+`~/golden-image/case-mode.log` for the case file.
+
 ---
 
 ## 12. Ongoing maintenance
@@ -536,7 +550,16 @@ instead. Nothing below needs a calendar entry or a named owner.
 
 **Failures are not silent.** Each of these writes to the journal under
 `golden-image` and raises a banner in `/etc/motd.d/`, so the next person to log
-in sees it. Watch them with:
+in sees it. One command answers "where is this machine":
+
+```bash
+sudo golden-image-provision --status
+```
+
+It prints which phases completed, whether the credentials are still on the
+machine and whether they were escrowed, whether each timer is enabled and when it
+next runs, and the last line of the self-check, restore-test and first-boot
+records. The underlying detail is still there if you want it:
 
 ```bash
 systemctl list-timers 'golden-*'

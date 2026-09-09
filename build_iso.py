@@ -1571,9 +1571,22 @@ def build_iso(x: Ctx, payload: Path):
             x.warn("  their RPMs into the ISO repository.")
     x.info(f"tier {x.c['tier']}; ISO installs: {', '.join(iso_tpls)}")
 
-    if not x.c["iso_sign_key"]:
-        x.warn("iso_sign_key is empty — the ISO will be UNSIGNED")
+    if not x.c["iso_sign_key"] and x.args.dry_run:
+        # A dry run prints a plan; it produces nothing to distribute. Say what
+        # would happen rather than refusing to describe it.
+        x.warn("iso_sign_key is empty — a real build would REFUSE to produce an "
+               "unsigned image")
         x.warn('  ./build_iso.py gen-key --uid "Your Unit <you@example.org>"')
+    elif not x.c["iso_sign_key"] and not getattr(x.args, "allow_unsigned", False):
+        raise Fatal(
+            "iso_sign_key is empty, so this image would be UNSIGNED — and an "
+            "unsigned image\n     passed around on USB sticks is exactly the "
+            "supply-chain problem this design\n     exists to prevent.\n\n"
+            '     ./build_iso.py gen-key --uid "Your Unit <you@example.org>"\n'
+            "     ./build_iso.py gen-key --use-key auto      (adopt an existing key)\n\n"
+            "     Or --allow-unsigned to build one deliberately for testing.")
+    if not x.c["iso_sign_key"]:
+        x.warn("--allow-unsigned: this image will be UNSIGNED. Do not distribute it.")
 
     kickstart_rel = write_kickstart(x, base_ks, payload, extra)
     x.phase("2b", "builder.yml iso: block")
@@ -1648,8 +1661,8 @@ def build_iso(x: Ctx, payload: Path):
                         f"distribute it.\n     Sign it on the machine holding the "
                         f"key, or fix the key and re-run './build_iso.py iso'.")
     else:
-        x.warn("UNSIGNED. Set iso_sign_key and re-run to sign before distributing.")
-        x.warn("  ./build_iso.py gen-key --use-key auto   (or --uid \"...\")")
+        x.warn("UNSIGNED, because --allow-unsigned was passed. Do not distribute "
+               "this image.")
 
     # The %packages question, answered against the artefact rather than left as
     # a note: are the custom template RPMs actually inside the image?
@@ -1990,10 +2003,38 @@ def doctor(x: Ctx) -> int:
     rc = _print_checks(x, c)
     if rc == 0:
         print(f"\n  Ready. Next:  ./build_iso.py --dry-run all\n")
-    else:
-        print(f"\n  Run  ./build_iso.py setup-host  to fix what can be fixed "
-              f"automatically.\n")
-    return rc
+        return 0
+
+    if not getattr(x.args, "fix", False):
+        print(f"\n  ./build_iso.py doctor --fix   runs the fixes above that this "
+              f"script owns.\n")
+        return rc
+
+    # Only this script's own subcommands, and only for blocking rows. Nothing
+    # here reaches for sudo on its own account beyond what setup-host already
+    # does with your confirmation.
+    blocking = [ch for ch in c if ch.state == FAIL and ch.fix]
+    ran = set()
+    for ch in blocking:
+        fix = ch.fix.splitlines()[0].strip()
+        if not fix.startswith("./build_iso.py") or fix in ran:
+            continue
+        ran.add(fix)
+        argv = shlex.split(fix.split("(")[0].strip())
+        print(f"\n  running: {' '.join(argv)}")
+        rc2 = subprocess.run([sys.executable, *argv[1:]] if argv[0].endswith(".py")
+                             else argv).returncode
+        if rc2 != 0:
+            x.warn(f"that did not succeed (exit {rc2})")
+    unfixable = [ch.name for ch in blocking
+                 if not ch.fix.splitlines()[0].strip().startswith("./build_iso.py")]
+    if unfixable:
+        print()
+        for n in unfixable:
+            x.warn(f"not something this script can fix: {n}")
+    print("\n  re-checking\n")
+    x.args.fix = False
+    return doctor(x)
 
 
 def key_expiry(fpr: str) -> int | None:
@@ -2154,6 +2195,13 @@ def gen_key(x: Ctx) -> int:
         return _adopt_key(x, fpr)
 
     uid = getattr(x.args, "uid", None)
+    if not uid and len({f for f, _ in have}) == 1:
+        # Exactly one signing key in this keyring and no identity given: adopting
+        # it is the only thing the operator can have meant.
+        fpr = have[0][0]
+        x.info(f"one secret key in this keyring — adopting it rather than making "
+               f"a second")
+        return _adopt_key(x, fpr)
     if not uid:
         raise Fatal('gen-key needs an identity:\n'
                     '     ./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"\n'
@@ -2184,15 +2232,21 @@ def gen_key(x: Ctx) -> int:
         raise Fatal("aborted")
 
     before = {f for f, _ in secret_key_fingerprints()}
-    if nopass:
+    pf = getattr(x.args, "passphrase_file", None)
+    if pf and not nopass:
+        x.run("gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
+              "--passphrase-file", str(pf), "--quick-generate-key", uid,
+              "rsa4096", "sign", expire, live=True)
+    elif nopass:
         x.run("gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
               "--passphrase", "", "--quick-generate-key", uid,
               "rsa4096", "sign", expire, live=True)
     else:
         if not sys.stdin.isatty():
             raise Fatal("generating a passphrase-protected key needs a terminal.\n"
-                        "     Run this in an interactive shell, or accept an\n"
-                        "     unprotected key with --no-passphrase.")
+                        "     Run this in an interactive shell, pass\n"
+                        "     --passphrase-file <path> for a scripted process, or\n"
+                        "     accept an unprotected key with --no-passphrase.")
         # pinentry needs the real terminal, so stdio is inherited rather than
         # captured. Nothing here belongs in the build log anyway.
         rc = subprocess.run(["gpg", "--quick-generate-key", uid,
@@ -3363,6 +3417,10 @@ lifecycle
                    help="what to do (default: iso)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true", help="skip the warning prompt")
+    p.add_argument("--fix", action="store_true",
+                   help="doctor: run the fixes it would otherwise only print")
+    p.add_argument("--allow-unsigned", action="store_true",
+                   help="build an unsigned image deliberately (testing only)")
     p.add_argument("--yes", action="store_true",
                    help="answer every prompt with yes (for unattended runs)")
     p.add_argument("--write-config", action="store_true")
@@ -3395,6 +3453,8 @@ lifecycle
     p.add_argument("--iso", metavar="PATH",
                    help="sign: the image to sign (default: the built one)")
     c = p.add_argument_group("check-upstream")
+    p.add_argument("--skip-upstream", action="store_true",
+                   help="do not check the supply chain before building")
     c.add_argument("--update", action="store_true",
                    help="record what upstream currently offers as the new baseline")
     args = p.parse_args()
@@ -3466,6 +3526,16 @@ lifecycle
 
         resolve_auto_values(x)
         payload = preflight(x, tier2)
+        if args.action in ("templates", "iso", "all") and not args.dry_run \
+                and not args.skip_upstream:
+            # "Remember to run check-upstream before a first build" is not a
+            # thing to remember. A rotated key or a dom0 bulletin found here
+            # costs a minute; found afterwards it costs the build.
+            if check_upstream(x):
+                raise Fatal(
+                    "the supply-chain check above found something blocking.\n"
+                    "     Resolve it, or pass --skip-upstream to build anyway "
+                    "(and record why).")
         if not x.done("builder") or args.dry_run:
             setup_builder(x)
         else:

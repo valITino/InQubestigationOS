@@ -186,6 +186,38 @@ as a manual procedure. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
   systemd as PID 1) rather than letting a build fail obscurely later.
 - Group 13 asserts the Wazuh certificate layout and reads the first-boot record.
 
+**Automated — what the survey listed and this pass had left**
+
+- `doctor --fix` runs the fixes it would otherwise only print.
+- `templates`, `iso` and `all` run `check-upstream` themselves and refuse to
+  start on a blocking finding. `--skip-upstream` opts out deliberately.
+- An empty `iso_sign_key` is now fatal for a real build. Shipping an unsigned
+  image was a warning you could walk past; `--allow-unsigned` is explicit.
+- `use_fixed_defaults` FAILS the acceptance tests unless `credentials.lab_mode`
+  says you meant it. `--verify` decides whether a machine is fit to issue, and
+  warnings do not block.
+- Phase 7 refuses to mark itself complete when a chain qube will not start;
+  phase 10 refuses when a timer will not enable. Both used to warn and continue.
+- Group 7 fails when `dig` is missing rather than warning (dnsutils is in the
+  office template's package list now), and group 13 drives its own traffic
+  before reading the Squid counters instead of asking the operator to browse.
+- Phase 8 installs the SIEM stack itself on a Tier 1 build, and fetches the two
+  vendor tools checksum-pinned when the template did not bake them in.
+- The apt update-proxy CONNECT workaround is performed — netvm attached for that
+  one install, and always restored — rather than described.
+- `--status` replaces `journalctl -f`, `systemctl list-timers` and knowing which
+  files to read.
+- `--case-mode anonymous|normal --case <id>` stops and masks Tor-branch
+  telemetry for a case that demands zero linkage, and writes the log entry the
+  guide asked the operator to remember.
+- `gen-key` adopts the only key in the keyring rather than asking; it takes
+  `--passphrase-file` for a scripted key-management process.
+
+**Deliberately still manual**, because automating them would be wrong: reading
+the fingerprint out over an independent channel, choosing the disk-encryption
+passphrase, accepting a rotated upstream signing key, applying dom0 updates that
+may require a reboot, and deciding a machine is fit to issue.
+
 **No unconditional `[VERIFY]` notes remain.** The two that can still print are
 fallbacks for a missing tool or an upstream layout change.
 

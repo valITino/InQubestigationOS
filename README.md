@@ -146,6 +146,13 @@ Most of those steps are now commands or timers.
 | "Confirm on your hardware that the first-boot service fires" | the runner records what it did; group 13 reads the record, and a timer retries until the machine is provisioned |
 | "Confirm pykickstart merges two %packages sections" | the generated kickstart is parsed and its package list read back; the finished ISO is opened and the template RPMs confirmed present |
 | Move the component to your git server and sign its tags "before production" | `component_remote` + `component_sign_key` — the build pushes a signed tag and turns `verification-mode` back on |
+| Read each `doctor` row and run the fix it printed | `doctor --fix` runs the ones this script owns |
+| Remember to run `check-upstream` before a first build | `templates`, `iso` and `all` run it themselves and refuse to start on a blocking finding |
+| Notice `iso_sign_key` is empty before shipping an unsigned image | a real build refuses; `--allow-unsigned` is an explicit, testing-only choice |
+| "Disable the agent in kali-tor for the duration and note it in the case log" | `--case-mode anonymous --case <id>`, which masks the agent and writes the log entry |
+| `journalctl -f`, `systemctl list-timers`, and knowing which files to read | `--status` |
+| Give the template a netvm when apt fails through the update proxy, then clear it | done automatically for that one install, and the netvm is always restored |
+| Install the SIEM stack by hand on a Tier 1 build | phase 8 installs it from the already-configured, already-verified repository |
 | Decide whether this machine has the RAM for a local SIEM | `wazuh.mode: auto` |
 | Three verification commands emailed to colleagues | `verify-iso.sh` and `FINGERPRINT.txt`, generated beside the image |
 | "Confirm by hand the four things the tests cannot check" | acceptance-test group 13 |

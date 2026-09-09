@@ -49,8 +49,37 @@ def vm(w: dict, name: str) -> dict:
 # --------------------------------------------------------------------------
 #  predicate answers for in-qube shell snippets
 # --------------------------------------------------------------------------
+PKG_RE = re.compile(r"(?:apt-get|dnf)\s+install\s+(?:-y\s+|--no-install-recommends\s+|-t\s+\S+\s+)*"
+                    r"(?P<pkgs>[^|&;]+)")
+
+
+def record_installs(w: dict, name: str, script: str) -> None:
+    """Model the effect of an install, so a re-check after one succeeds.
+
+    Without this the fake qube answers 'not installed' forever, and any code
+    that installs a package and then verifies it looks broken.
+    """
+    changed = False
+    for m in PKG_RE.finditer(script):
+        for tok in m.group("pkgs").split():
+            if tok.startswith("-") or "=" in tok and not tok[0].isalpha():
+                continue
+            pkg = tok.split("=")[0]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", pkg):
+                continue
+            vm(w, name).setdefault("pkgs", []).append(pkg)
+            changed = True
+    if changed:
+        save(w)
+
+
 def answer(w: dict, name: str, script: str) -> int:
     """Exit code the fake qube returns for a shell snippet."""
+    # Package state first: it changes as the run proceeds, so it outranks the
+    # static rules below.
+    m = re.search(r"dpkg -s (\S+)", script)
+    if m:
+        return 0 if m.group(1) in vm(w, name).get("pkgs", []) else 1
     for rule in w.get("qtest", []):
         if rule.get("vm") not in (None, name):
             continue
@@ -114,6 +143,7 @@ def cmd_qvm_run(w: dict, argv: list[str]) -> int:
         except (ValueError, IndexError):
             script = script[len("bash -c "):]
     record("qrun", vm=name, script=script)
+    record_installs(w, name, script)
     return answer(w, name, script)
 
 

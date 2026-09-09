@@ -371,6 +371,16 @@ four. It is now zero unconditional ones. The last four went like this:
 Two conditional notes remain, and only fire when something is absent: no
 pykickstart on the build host, or a qubes-secpack whose key layout has moved.
 
+### Warnings that should have been failures
+
+`--verify` is what decides a machine is fit to issue, and phase 12 marks the
+build complete on `fail == 0` — so every warning was a way through the gate.
+Four of them were load-bearing: shared credentials (`use_fixed_defaults`), a
+missing `dig` (which made the DNS group prove nothing), a Squid counter at zero,
+and any qube that did not exist. All fail now. Likewise phases 7 and 10 used to
+warn and carry on when a chain qube would not start or a timer would not enable;
+both refuse to mark themselves complete.
+
 ## Still not verified — requires real hardware
 
 Everything that could become an automated check has: see acceptance-test group 13

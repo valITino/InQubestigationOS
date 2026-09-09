@@ -68,9 +68,12 @@ def build_world(path: Path) -> None:
         # model the parts that must answer "no" on a fresh install.
         "qtest": [
             {"match": "test -d /var/ossec", "rc": 1},
-            {"match": "dpkg -s wazuh-manager", "rc": 1},
-            {"match": "test -x /opt/wazuh-certs-tool.sh", "rc": 1},
-            {"match": "test -x /opt/wazuh-passwords-tool.sh", "rc": 1},
+            # The Tier 2 template bakes the vendor tools in; the SIEM packages
+            # are modelled as absent so the Tier 1 install path is exercised,
+            # and the stub records the install so the re-check afterwards passes.
+            {"match": "test -x /opt/wazuh-certs-tool.sh", "rc": 0},
+            {"match": "test -x /opt/wazuh-passwords-tool.sh", "rc": 0},
+            {"match": "test -f /opt/wazuh-certificates/root-ca.pem", "rc": 0},
         ],
     }
     path.write_text(json.dumps(world, indent=2) + "\n")

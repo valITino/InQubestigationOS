@@ -200,8 +200,11 @@ DEFAULT_CONFIG: dict = {
 
     "credentials": {
         # false (recommended): unique random secrets per build.
-        # true: fixed shared strings. Isolated lab only.
+        # true: fixed shared strings. Isolated lab only — and the acceptance
+        # tests FAIL on it unless lab_mode says you meant it, because --verify is
+        # what decides a machine is fit to issue.
         "use_fixed_defaults": False,
+        "lab_mode": False,
         "fixed": {
             "dashboard": "ChangeMe-Dashboard-01",
             "api": "ChangeMe-Api-01",
@@ -932,21 +935,24 @@ an escrow record that no longer matches.
         o, r = self.out, self.r
         o.warn("templates reach the network through the Qubes update proxy (qrexec), "
                "not a netvm.")
-        o.info("if apt fails with a proxy/CONNECT error on an HTTPS repo, "
-               "temporarily assign the template a netvm, install, then clear it "
-               "— a workaround, not something to verify")
+        o.info("if apt fails with a proxy/CONNECT error, the template is given a "
+               "netvm for the duration of that one install and it is cleared "
+               "again afterwards — see _qrun_apt")
 
         # --- office ---
         if self._tier2_ready("personal"):
             o.skip(f"{self.t['personal']} payload (baked in by the Tier 2 ISO)")
         else:
             o.info(f"{self.t['personal']}: LibreOffice suite and desktop tooling")
-            r.qrun(self.t["personal"],
+            self._qrun_apt(self.t["personal"],
                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                    "apt-get install -y --no-install-recommends "
                    "libreoffice libreoffice-l10n-de libreoffice-help-de "
                    "hunspell-de-ch hyphen-de thunderbird keepassxc gimp vlc "
-                   "pdfarranger p7zip-full unzip curl ca-certificates gnupg")
+                   "pdfarranger p7zip-full unzip curl ca-certificates gnupg "
+                   # dnsutils so acceptance group 7 can actually test the
+                   # enforced DNS path instead of warning that dig is absent.
+                   "dnsutils")
             o.ok(f"{self.t['personal']} payload installed")
 
         # --- sys template: service-qube packages ---
@@ -980,7 +986,7 @@ an escrow record that no longer matches.
             o.skip(f"{self.t['proxy']} payload (baked in)")
         else:
             o.info(f"{self.t['proxy']}: Squid + unbound")
-            r.qrun(self.t["proxy"],
+            self._qrun_apt(self.t["proxy"],
                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                    "(apt-get install -y squid-openssl ca-certificates openssl || "
                    " apt-get install -y squid ca-certificates openssl)")
@@ -993,7 +999,7 @@ an escrow record that no longer matches.
         else:
             z = self.c["zeek"]
             o.info(f"{self.t['ids']}: Suricata (Debian main)")
-            r.qrun(self.t["ids"],
+            self._qrun_apt(self.t["ids"],
                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                    "apt-get install -y suricata suricata-update jq curl gnupg ca-certificates")
             o.info(f"{self.t['ids']}: {z['package']} from the Zeek project's OBS repository")
@@ -1326,6 +1332,41 @@ an escrow record that no longer matches.
     # =======================================================================
     #  7 — chain configuration
     # =======================================================================
+    def _qrun_apt(self, tpl: str, script: str) -> None:
+        """Run an apt operation in a template, working around the update proxy.
+
+        Templates reach the network through the Qubes update proxy over qrexec,
+        and some HTTPS repositories fail through it with a CONNECT error. The
+        documented workaround is to give the template a netvm for the duration
+        and clear it afterwards. That was a note telling the operator to do it
+        by hand; this does it, and always puts the netvm back.
+        """
+        o, r = self.out, self.r
+        try:
+            r.qrun(tpl, script)
+            return
+        except Fatal:
+            pass
+        o.warn(f"{tpl}: apt failed through the update proxy — retrying with a "
+               f"temporary netvm")
+        before = r.run("qvm-prefs", tpl, "netvm", check=False, capture=True).strip()
+        try:
+            r.run("qvm-prefs", tpl, "netvm", self.q["proxy"])
+            r.shutdown(tpl)
+            r.ensure_running(tpl)
+            r.qrun(tpl, script)
+            o.ok(f"{tpl}: succeeded with a temporary netvm")
+        finally:
+            # Always. A template left attached to the network is a template that
+            # is no longer isolated, and that must not depend on the retry
+            # having worked.
+            r.run("qvm-prefs", tpl, "netvm",
+                  before if before and before.lower() not in ("", "none") else "none",
+                  check=False)
+            r.shutdown(tpl)
+            o.info(f"{tpl}: netvm restored to "
+                   f"{before or 'none'}")
+
     def _install_timer(self, tpl: str, name: str, description: str,
                        script_path: str, oncalendar: str, body: str,
                        condition: str = "") -> None:
@@ -1814,11 +1855,20 @@ WantedBy=multi-user.target
         for vm in reversed(down):
             if not r.vm_exists(vm):
                 continue
-            if r.quiet("qvm-start", "--skip-if-running", vm):
-                time.sleep(3)
-                o.ok(f"{vm} restarted with the golden-image configuration")
-            else:
-                o.warn(f"{vm} did not start — check 'qvm-start {vm}' by hand")
+            started = False
+            for attempt in (1, 2):
+                if r.quiet("qvm-start", "--skip-if-running", vm):
+                    started = True
+                    break
+                o.warn(f"{vm} did not start (attempt {attempt}); retrying")
+                time.sleep(5)
+            if not started:
+                raise Fatal(
+                    f"{vm} will not start, so the inspection chain is broken and "
+                    f"phase 7 is NOT\n     marked complete. Investigate with "
+                    f"'qvm-start {vm}', then re-run --from-phase 7.")
+            time.sleep(3)
+            o.ok(f"{vm} restarted with the golden-image configuration")
 
     # =======================================================================
     #  8 — wazuh manager
@@ -1870,14 +1920,30 @@ WantedBy=multi-user.target
         # are generated HERE, never in a shared template.
         baked = r.qtest(q["wazuh"], "dpkg -s wazuh-manager >/dev/null 2>&1")
         if not baked:
-            o.warn("the Wazuh stack is not present in this qube.")
-            o.warn("  Tier 2 bakes it into the investigator-wazuh template. On a Tier 1")
-            o.warn("  build, install indexer + server + dashboard from the configured")
-            o.warn("  repository, then re-run:  sudo ./golden_image.py --phase 8")
-            self._mark(8)
-            return
+            # Tier 2 bakes the stack into the template. On Tier 1 it is absent —
+            # and the repository, the pinned version and the verified key are all
+            # already configured here, so install it rather than handing the
+            # operator a three-line instruction.
+            o.info("the Wazuh stack is not in this qube (Tier 1) — installing it "
+                   "from the configured repository")
+            r.qrun(q["wazuh"], "export DEBIAN_FRONTEND=noninteractive; "
+                               "apt-get update && apt-get install -y "
+                               f"wazuh-indexer={shlex.quote(w['version'])}-1 "
+                               f"wazuh-manager={shlex.quote(w['version'])}-1 "
+                               f"wazuh-dashboard={shlex.quote(w['version'])}-1 "
+                               "|| apt-get install -y wazuh-indexer wazuh-manager "
+                               "wazuh-dashboard", check=False)
+            baked = r.qtest(q["wazuh"], "dpkg -s wazuh-manager >/dev/null 2>&1")
+            if not baked:
+                raise Fatal(
+                    f"could not install the Wazuh stack in {q['wazuh']}.\n"
+                    "     A Tier 1 build needs network in that qube for this "
+                    "step. Check its netvm,\n     then re-run:  sudo "
+                    "./golden_image.py --phase 8")
+            o.ok("Wazuh indexer, manager and dashboard installed")
+        else:
+            o.ok("Wazuh packages present (baked in by the Tier 2 template)")
 
-        o.ok("Wazuh packages present (baked in by the Tier 2 template)")
         o.info("generating per-machine certificates and starting the stack")
 
         # Baked into the template by the ISO build, then run as root against the
@@ -1901,6 +1967,35 @@ WantedBy=multi-user.target
                     "     current file at packages.wazuh.com and update "
                     f"wazuh.{key},\n     or rebuild the template.")
             o.ok(f"{tool} matches its pinned checksum")
+
+        # If the template did not bake them in, fetch them — checksum-pinned, so
+        # this is the same trust decision the build already made, not a new one.
+        series = ".".join(str(w["version"]).split(".")[:2])
+        for tool, key in (("wazuh-certs-tool.sh", "certs_tool_sha256"),
+                          ("wazuh-passwords-tool.sh", "passwords_tool_sha256")):
+            if r.qtest(q["wazuh"], f"test -x /opt/{tool}", dry_default=True):
+                continue
+            want = (w.get(key) or "").strip()
+            if not want:
+                o.warn(f"{tool} is absent and no checksum is pinned for it — "
+                       f"cannot fetch it safely")
+                continue
+            o.info(f"{tool} not baked in — fetching it (pinned {want[:16]}…)")
+            r.qrun(q["wazuh"],
+                   f"curl -fsSL https://packages.wazuh.com/{shlex.quote(series)}/"
+                   f"{shlex.quote(tool)} -o /opt/{shlex.quote(tool)} && "
+                   f"chmod 755 /opt/{shlex.quote(tool)}", check=False)
+            if r.qtest(q["wazuh"],
+                       f"sha256sum /opt/{tool} | grep -qF {shlex.quote(want)}",
+                       dry_default=False):
+                o.ok(f"{tool} fetched and matches its pinned checksum")
+            else:
+                r.qrun(q["wazuh"], f"rm -f /opt/{shlex.quote(tool)}", check=False)
+                raise Fatal(
+                    f"{tool} could not be fetched, or did not match the pinned "
+                    f"checksum\n     {want}\n     It has been removed rather "
+                    f"than run. Confirm the current file at packages.wazuh.com "
+                    f"and\n     update wazuh.{key}, or bake it into the template.")
 
         certs_ok = r.qtest(q["wazuh"], "test -x /opt/wazuh-certs-tool.sh")
         if certs_ok:
@@ -2266,10 +2361,15 @@ fi
                 f"[Timer]\nOnCalendar={b['schedule']}\nPersistent=true\n"
                 "[Install]\nWantedBy=timers.target\n")
             r.quiet("systemctl", "daemon-reload")
-            if r.quiet("systemctl", "enable", "--now", "golden-backup.timer"):
-                o.ok(f"backup timer enabled ({b['schedule']})")
-            else:
-                o.warn("could not enable golden-backup.timer — enable it manually")
+            if not r.quiet("systemctl", "enable", "--now", "golden-backup.timer"):
+                r.quiet("systemctl", "daemon-reload")
+                if not r.quiet("systemctl", "enable", "--now",
+                               "golden-backup.timer"):
+                    raise Fatal(
+                        "could not enable golden-backup.timer. Phase 10 is NOT "
+                        "marked complete —\n     a laptop that does not back "
+                        "itself up must not look like one that does.")
+            o.ok(f"backup timer enabled ({b['schedule']})")
 
         o.info("the backup profile schema is validated by the acceptance tests "
                "(phase 12, group 11) — no manual qvm-backup run needed")
@@ -2339,10 +2439,13 @@ systemctl start {unit}.mount 2>/dev/null || true
             f"RandomizedDelaySec=1800\n"
             f"\n[Install]\nWantedBy=timers.target\n")
         r.quiet("systemctl", "daemon-reload")
-        if r.quiet("systemctl", "enable", "--now", f"{name}.timer"):
-            o.ok(f"{name}.timer enabled ({oncalendar})")
-        else:
-            o.warn(f"could not enable {name}.timer")
+        if not r.quiet("systemctl", "enable", "--now", f"{name}.timer"):
+            r.quiet("systemctl", "daemon-reload")
+            if not r.quiet("systemctl", "enable", "--now", f"{name}.timer"):
+                raise Fatal(f"could not enable {name}.timer. This machine would "
+                            f"not maintain itself, and phase 10 is not marked "
+                            f"complete.")
+        o.ok(f"{name}.timer enabled ({oncalendar})")
 
     def _install_dom0_timers(self) -> None:
         """Everything GUIDE section 12 listed as a cadence for a human."""
@@ -2623,7 +2726,11 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                "(nothing beacons")
         o.warn("  clearnet from an anonymous context). If a case demands zero linkage, "
                "disable the")
-        o.warn(f"  agent in {q['kali_tor']} for the duration and note it in the case log.")
+        o.warn(f"  For a case that demands zero linkage:")
+        o.warn(f"      sudo {Path(sys.argv[0]).name} --case-mode anonymous "
+               f"--case <id>")
+        o.warn(f"  and --case-mode normal when it closes. Both are recorded in "
+               f"{self.build_dir / 'case-mode.log'}.")
         self._mark(11)
 
     # =======================================================================
@@ -2784,8 +2891,12 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if r.vm_exists("personal"):
             r.ensure_running("personal")
             if not r.qtest("personal", "command -v dig >/dev/null"):
-                self._t("warn", "dig is not installed in personal — install "
-                                "dnsutils or this group proves nothing")
+                # dnsutils is in the office template's package list precisely so
+                # this cannot happen; if it is missing, the group proves nothing
+                # and saying so as a warning would let it pass.
+                self._t("fail", "dig is not installed in personal, so DNS "
+                                "enforcement cannot be tested at all — install "
+                                "dnsutils in " + self.t["personal"])
             else:
                 # The old test read 'dig @8.8.8.8 exited 0' as 'the packet
                 # reached Google'. It does not: a WORKING intercept answers that
@@ -2883,8 +2994,16 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             mode = oct(self.cred_file.stat().st_mode)[-3:]
             self._t("pass" if mode == "600" else "fail", f"credentials.json mode {mode}")
             if self.c["credentials"]["use_fixed_defaults"]:
-                self._t("warn", "use_fixed_defaults is on — secrets shared across builds. "
-                                "Rotate now.")
+                # --verify is the gate that decides a machine is fit to issue, and
+                # warnings do not block. A laptop with secrets shared across every
+                # build in the estate is not fit to issue, whatever else passes.
+                lab = self.c["credentials"]["lab_mode"]
+                self._t("warn" if lab else "fail",
+                        "use_fixed_defaults with lab_mode — an isolated lab only"
+                        if lab else
+                        "use_fixed_defaults is on: this machine's four secrets are "
+                        "shared with every other build from this config. Rotate "
+                        "them, or set credentials.lab_mode if this really is a lab.")
         else:
             self._t("warn", "credentials.json not found")
 
@@ -2928,6 +3047,14 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         # 2. The Squid intercept is actually receiving packets. Test 7 above
         #    generated traffic through it; the counters prove it arrived.
         if r.vm_exists(q["proxy"]):
+            # Drive the traffic rather than reporting "nothing counted yet" and
+            # asking the operator to go and browse from an app qube.
+            if r.vm_exists("personal"):
+                r.ensure_running("personal")
+                r.quiet("qvm-run", "--no-gui", "personal",
+                        "timeout 15 curl -s -o /dev/null "
+                        "http://example.com/golden-image-counter-probe")
+                time.sleep(2)
             ch = r.run("qvm-run", "--no-gui", "--pass-io", "-u", "root", q["proxy"],
                        "nft list chain ip qubes custom-dnat-squid",
                        check=False, capture=True)
@@ -2938,8 +3065,9 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                 self._t("pass", f"custom-dnat-squid counters are incrementing "
                                 f"({max(nums)} packets redirected)")
             else:
-                self._t("warn", "custom-dnat-squid exists but has counted nothing "
-                                "yet — browse from an app qube and re-run")
+                self._t("fail", "custom-dnat-squid counted nothing, even after "
+                                "this test drove a request through it — the "
+                                "redirect is not working")
 
         # 3. Squid's peek/splice directives are accepted by the shipped build.
         if r.vm_exists(q["proxy"]):
@@ -3465,6 +3593,68 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
              f"by label, whenever it is attached")
         return 0
 
+    def status(self) -> int:
+        """Where this machine actually is: phases, credentials, timers, tests.
+
+        The guide said to watch `journalctl -t golden-image -f` and to run
+        `systemctl list-timers 'golden-*'`, and to know which files to look in
+        for the rest. This is those answers in one place.
+        """
+        o, r, q = self.out, self.r, self.q
+        print(f"\n{Out.B}{Out.C}══ {self.c['image_name']} "
+              f"v{self.c['image_version']}{Out.RST}\n")
+
+        done = set()
+        if self.state_file.exists():
+            done = {t for t in self.state_file.read_text().split()
+                    if t.startswith("phase:")}
+        for i, name in enumerate(self.PHASES, start=1):
+            mark = f"{Out.G}✓{Out.RST}" if f"phase:{i}" in done else f"{Out.Y}·{Out.RST}"
+            print(f"  {mark} {i:2d}  {name}")
+        if len(done) < len(self.PHASES):
+            print(f"\n  {len(done)}/{len(self.PHASES)} phases complete — "
+                  f"resume with:  sudo {Path(sys.argv[0]).name}")
+
+        print(f"\n{Out.B}  Credentials{Out.RST}")
+        rec = self.build_dir / self.ESCROW_RECORD
+        if self.cred_file.exists():
+            mode = oct(self.cred_file.stat().st_mode)[-3:]
+            print(f"    present at {self.cred_file} (mode {mode})")
+            if rec.exists():
+                e = json.loads(rec.read_text())
+                print(f"    escrowed to {e['qube']}:{e['path']} at {e['at']}")
+                print(f"    next:  sudo {Path(sys.argv[0]).name} "
+                      f"--shred-credentials")
+            else:
+                print(f"    {Out.Y}not escrowed{Out.RST} — next:  sudo "
+                      f"{Path(sys.argv[0]).name} --handover")
+        else:
+            print("    shredded" if rec.exists() else
+                  f"    {Out.Y}absent and never escrowed{Out.RST}")
+
+        print(f"\n{Out.B}  Maintenance{Out.RST}")
+        for unit in ("golden-backup.timer", "golden-template-update.timer",
+                     "golden-selfcheck.timer", "golden-restore-test.timer",
+                     "golden-staleness.timer"):
+            on = r.quiet("systemctl", "is-enabled", unit)
+            when = r.run("systemctl", "show", unit, "-p", "NextElapseUSecRealtime",
+                         "--value", check=False, capture=True).strip()
+            state = f"{Out.G}enabled{Out.RST}" if on else f"{Out.R}NOT ENABLED{Out.RST}"
+            print(f"    {unit:32s} {state}" + (f"   next {when}" if on and when else ""))
+
+        print(f"\n{Out.B}  Recent{Out.RST}")
+        for label, path in (("self-check", "/var/log/golden-image-selfcheck.log"),
+                            ("restore test", "/var/log/golden-image-restore-test.log"),
+                            ("first boot", "/var/lib/golden-image/firstboot-status")):
+            f = dom0(path)
+            if f.exists():
+                tail = [l for l in f.read_text().splitlines() if l.strip()]
+                print(f"    {label:14s} {tail[-1][:80] if tail else '(empty)'}")
+            else:
+                print(f"    {label:14s} —")
+        print(f"\n  Acceptance tests:  sudo {Path(sys.argv[0]).name} --verify\n")
+        return 0
+
     def initial_setup(self) -> int:
         """Create the default qubes Qubes' GUI initial setup would create.
 
@@ -3523,6 +3713,53 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if failed:
             o.warn(f"states with problems: {', '.join(sorted(set(failed)))}")
         o.ok("initial setup complete — the provisioner can run now")
+        return 0
+
+    def case_mode(self, mode: str) -> int:
+        """Stop, or restart, SIEM telemetry from the Tor branch.
+
+        Phase 11 records the risk in words: Tor-branch telemetry lands in the
+        same index as attributed telemetry, and if a case demands zero linkage
+        the operator was told to disable the agent there "and note it in the
+        case log". Two things a script can do: perform it reliably, and leave a
+        record that it happened.
+        """
+        o, r, q = self.out, self.r, self.q
+        if mode not in ("anonymous", "normal"):
+            raise Fatal("--case-mode takes 'anonymous' or 'normal'")
+        anon = mode == "anonymous"
+        targets = [v for v in (q["kali_tor"], q["whonix"], "anon-whonix")
+                   if r.vm_exists(v)]
+        if not targets:
+            raise Fatal("no Tor-branch qubes exist on this machine")
+        print(f"\n{Out.B}{Out.C}══ Case mode: {mode}{Out.RST}")
+        if self.args.dry_run:
+            for vm in targets:
+                o.info(f"[dry-run] {'stop and mask' if anon else 'unmask and start'}"
+                       f" wazuh-agent in {vm}")
+            return 0
+        for vm in targets:
+            r.ensure_running(vm)
+            if anon:
+                r.qrun(vm, "systemctl stop wazuh-agent 2>/dev/null; "
+                           "systemctl mask wazuh-agent", check=False)
+                # rc.local starts the agent on every boot; mask survives that.
+                o.ok(f"{vm}: agent stopped and masked")
+            else:
+                r.qrun(vm, "systemctl unmask wazuh-agent 2>/dev/null; "
+                           "systemctl start wazuh-agent", check=False)
+                o.ok(f"{vm}: agent unmasked and started")
+        rec = self.build_dir / "case-mode.log"
+        case = getattr(self.args, "case", None) or ""
+        with rec.open("a") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {mode} "
+                     f"{'case=' + case if case else '(no case id given)'} "
+                     f"qubes={','.join(targets)}\n")
+        o.ok(f"recorded in {rec}")
+        if anon:
+            o.warn("Tor-branch telemetry is OFF. This machine is no longer "
+                   "reporting from those qubes — put that in the case log, and "
+                   "run --case-mode normal when the case closes.")
         return 0
 
     def refresh_repo_keys(self) -> int:
@@ -3726,6 +3963,9 @@ def main() -> int:
     p.add_argument("--write-config", action="store_true",
                    help="emit golden-image.json and exit")
     p.add_argument("--list-phases", action="store_true")
+    p.add_argument("--status", action="store_true",
+                   help="what this machine's state actually is: phases, "
+                        "credentials, timers, recent results")
     p.add_argument("--initial-setup", action="store_true",
                    help="create the default qubes non-interactively, instead of "
                         "clicking through Qubes' initial-setup wizard")
@@ -3749,6 +3989,11 @@ def main() -> int:
     life.add_argument("--upgrade-wazuh", action="store_true",
                       help="upgrade the SIEM in the supported order: manager, "
                            "then agents")
+    life.add_argument("--case-mode", choices=["anonymous", "normal"],
+                      help="stop (or restart) SIEM telemetry from the Tor branch "
+                           "for a case that demands zero linkage")
+    life.add_argument("--case", metavar="ID",
+                      help="case identifier, recorded with --case-mode")
     life.add_argument("--prepare-backup-media", nargs="?", const="", metavar="DEV",
                       help="partition, format and label the backup disk in the "
                            "USB qube (default: the only removable disk attached)")
@@ -3770,8 +4015,12 @@ def main() -> int:
 
         if args.handover:
             return prov.handover_sequence(args.handover)
+        if args.status:
+            return prov.status()
         if args.initial_setup:
             return prov.initial_setup()
+        if args.case_mode:
+            return prov.case_mode(args.case_mode)
         if args.prepare_backup_media is not None:
             return prov.prepare_backup_media(args.prepare_backup_media)
         if args.refresh_repo_keys:
