@@ -49,7 +49,8 @@ templates, and Whonix.
 ## Quick start
 
 ```bash
-# On a Debian 13 or Fedora host with ~250 GB free — nothing pre-installed
+# On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~250 GB
+# free — nothing pre-installed
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
 ./build_iso.py bootstrap          # host, key, key backup, checks, plan, build
 ./build_iso.py write-usb --wait   # plug the stick in when it asks
@@ -95,7 +96,7 @@ the installer kickstart.
 
 | Script | Runs on | Does |
 |---|---|---|
-| `build_iso.py` | Build host (Debian 13, Docker, ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
+| `build_iso.py` | Build host (Debian 13, Kali or Fedora; Docker; ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
 | `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests |
 
 Both are standard-library Python 3 — no `pip install`, which matters because

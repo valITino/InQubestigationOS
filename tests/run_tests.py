@@ -261,6 +261,13 @@ def main() -> int:
           not (Path(ienv["HOME"]) / "investigator-iso").exists(),
           "a work tree was created by a run that says it changes nothing")
 
+    print("\nbuild host")
+    ph = subprocess.run([sys.executable, str(TESTS / "host_checks.py")],
+                        capture_output=True, text=True, cwd=ROOT)
+    print(ph.stdout.rstrip())
+    stage("build_iso.py supports the hosts it claims to", ph.returncode == 0,
+          "see output above")
+
     print("\nconfiguration")
     pc = subprocess.run([sys.executable, str(TESTS / "config_checks.py")],
                         capture_output=True, text=True, cwd=ROOT)

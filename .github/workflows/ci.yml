@@ -23,6 +23,9 @@ jobs:
       - name: Run the harness
         run: ./tests/run_tests.py
       # Also run standalone so a failure names itself in the job summary.
+      - name: The build-host support holds up
+        if: always()
+        run: ./tests/host_checks.py
       - name: Configuration agrees with the code
         if: always()
         run: ./tests/config_checks.py

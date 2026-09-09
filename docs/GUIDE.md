@@ -22,16 +22,17 @@ From an empty build host to an issued investigator laptop. Follow it in order.
 
 ## 1. What you need before starting
 
-**A build host.** Debian 13 preferred, Fedora works. This is *not* dom0 and not
-the laptop you are building — it is a separate machine or VM.
+**A build host.** Any Debian-family or Fedora-family Linux. This is *not* dom0
+and not the laptop you are building — it is a separate machine or VM.
 
 | Requirement | Why | Who satisfies it |
 |---|---|---|
-| Debian 13 or Fedora | qubes-builderv2 ships dependency lists for both | you |
+| A Debian-family or Fedora-family Linux | qubes-builderv2 ships dependency lists for both families. Debian, Kali and Ubuntu all qualify — see the next table | you |
 | Docker, usable without `sudo` | Build cages. Podman cannot currently build DEB packages | `setup-host` |
 | ~250 GB free disk | Five templates plus the ISO. Tier 1 needs ~100 GB | you |
 | 8 GB RAM minimum | Builds are slow and can OOM below this | you |
-| Several hours | The Kali template dominates | you |
+| 4 CPU cores recommended | Nothing enforces it, but two cores roughly doubles an already long build | you |
+| Several hours | The Kali *template* dominates — and see the warning below about the two different things called "Kali" here | you |
 
 Everything in that table that a script can do, a script does. Ask first:
 
@@ -42,6 +43,74 @@ Everything in that table that a script can do, a script does. Ask first:
 It checks each requirement, changes nothing, and prints the command that fixes
 whatever is missing. Every later step in this guide is also available as a
 `make` target — run `make` on its own for the list.
+
+### Which Linux, specifically
+
+`doctor` reads `/etc/os-release` and prints the distribution by name, so you
+never have to work out which of these you are on:
+
+```
+✓ supported build host  Kali GNU/Linux Rolling (debian-family) — detected via /etc/os-release
+```
+
+| Build host | Status | What is different about it |
+|---|---|---|
+| **Debian 13 (trixie)** | Preferred | Nothing. This is the reference host the rest of the guide assumes. |
+| **Kali Linux (rolling)** | Supported | Debian testing underneath, and it declares `ID_LIKE=debian`, so every Debian instruction applies unchanged. Two packages Debian proper also lacks are missing here — see below. |
+| **Ubuntu 22.04 / 24.04** | Supported | Same Debian-family path. Older Ubuntu may not carry the `sq`/`sqv` packages the builder wants; `setup-host` reports any it cannot find rather than failing. |
+| **Fedora 43 / 44** | Supported | Upstream's own build host. `mock` is packaged here, so the build cage image is seeded from a Mock chroot, which is upstream's preferred path. |
+
+**Two packages are missing on every Debian-family host, Kali included, and
+neither is fatal:**
+
+- **`mock`** was dropped from Debian in 2019 and is in no current Debian or
+  Kali suite. Upstream's `tools/generate-container-image.sh` takes the Mock
+  chroot as an *optional* argument; without it the build cage image is built
+  from `dockerfiles/fedora.Dockerfile`, which pulls the pinned Fedora
+  container and installs `mock`, `rpm-build` and `createrepo_c` *inside* it.
+  Both paths tag the same `qubes-builder-fedora` image, so nothing downstream
+  can tell which one ran. `build_iso.py` picks the path automatically based on
+  whether `mock` is actually installed.
+- **`pykickstart`** was removed from Debian in August 2019 and has never been
+  in Kali. It is only used to parse the generated kickstart *before* the
+  build. `setup-host` installs it into a virtualenv under `work_dir` instead;
+  if that is not possible — no network, say — the build still runs and the
+  same question is answered afterwards, by confirming the template RPMs are
+  present in the finished ISO. `doctor` says which of the two is in effect.
+
+> **"Kali" means two unrelated things in this repository.** Everywhere else in
+> this guide, Kali is a **template inside the image you are building** — the
+> `investigator-kali` qube, its apt repository and its signing key. Here, and
+> only in this section, Kali is a **distribution you might be running the
+> build on**. They are independent: you can build on Debian and get the Kali
+> template, or build on Kali and produce an image with no Kali template at
+> all. Building on Kali does not put anything from your build host into the
+> image.
+
+### Running the build host in a VM
+
+A VM is a first-class build host — the ISO does not care what built it. Size
+it as follows:
+
+| | |
+|---|---|
+| **Virtual disk** | 250 GB for Tier 2, 100 GB for Tier 1. Prefer a dynamically-allocated disk so it only consumes what it uses, but **check the host has the space to grow into** — running the physical disk out mid-build is the most common way this fails. |
+| **RAM** | 8 GB minimum, 12–16 GB if the physical machine allows. |
+| **CPUs** | 4 cores recommended, 2 workable. |
+| **Guest additions** | Not needed. Nothing here uses a GUI. |
+| **Shared folder** | Optional, and the easiest way to get the finished ISO back to the host. A `vboxsf`/`hgfs` mount is fine as a *destination*; do not put `work_dir` on one. |
+
+**You do not need nested virtualisation, and you should not turn it on for
+this.** Docker containers are not virtual machines — they are processes
+isolated by namespaces and cgroups on the VM's *own* kernel — so the build
+cages need no VT-x inside the guest. Nested virtualisation only matters if you
+intend to *boot* the finished ISO inside that same VM, which is a separate
+activity from building it and is not what this guide asks for.
+
+The one hardware requirement that is real: **the build host must be x86-64**,
+because every package and the installer itself are built for that
+architecture. An Apple Silicon Mac running an ARM Linux VM cannot build this
+image.
 
 **A target laptop** with VT-x and VT-d/IOMMU, 32 GB RAM comfortable (16 GB
 workable), 512 GB SSD minimum. Check it against the Qubes Hardware
@@ -58,8 +127,27 @@ You have two options on a Windows machine, and they are not equally proven:
 
 | | |
 |---|---|
-| **A Linux VM** — Hyper-V, VirtualBox or VMware, Debian 13, ~250 GB virtual disk, 8 GB RAM | **The path to use.** Inside the VM it is an ordinary Linux build host, so everything in this guide applies unchanged. |
+| **A Linux VM** — Hyper-V, VirtualBox or VMware; Debian 13, **Kali**, Ubuntu or Fedora; ~250 GB virtual disk, 8 GB RAM, 4 vCPU | **The path to use.** Inside the VM it is an ordinary Linux build host, so everything in this guide applies unchanged. |
 | **WSL2** — Debian from the Microsoft Store, `systemd=true` in `/etc/wsl.conf`, Docker | **Not verified.** WSL2 is a real Linux kernel and the scripts run, but nobody — upstream or here — has confirmed that the Mock chroots and loop-device work that the ISO build depends on behave under it. `./build_iso.py doctor` detects WSL and checks the parts it can (kernel type, `/dev/loop-control`, systemd as PID 1). If it fails, use a VM rather than fighting it. |
+
+**If you already have a Kali VM, use it.** A Kali VM installed for any other
+reason is a perfectly good build host: it is Debian testing underneath, it
+declares `ID_LIKE=debian`, and `setup-host` treats it exactly as it treats
+Debian. See [Which Linux, specifically](#which-linux-specifically) above for
+the two packages Kali does not carry and what the scripts do about them — and
+for the warning that "Kali the build host" has nothing to do with "the Kali
+template inside the image".
+
+Two questions that come up at this point, both answered above but worth
+repeating here because they decide whether you bother:
+
+- **Does the VM need nested virtualisation enabled?** No. Docker containers
+  are namespaced processes on the VM's own kernel, not virtual machines, so
+  the build cages need no VT-x inside the guest. Leave it off.
+- **Does it need to be a fresh VM?** No. The build touches `work_dir`,
+  `/var/lib/docker` and the packages `setup-host` names before it installs
+  anything. Run `./build_iso.py --dry-run setup-host` first if you want to see
+  that list before agreeing to it.
 
 Either way, remember that a WSL distro or a discarded VM takes your **signing
 key** with it. Back it up the moment you create it:
