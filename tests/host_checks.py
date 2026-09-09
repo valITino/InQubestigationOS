@@ -123,12 +123,16 @@ def check_package_plan(bi) -> None:
     # The specific regressions, named, so a failure says which bug came back.
     deb = {c for _, cands in bi.host_package_plan("debian", "docker") for c in cands}
     fed = {c for _, cands in bi.host_package_plan("fedora", "docker") for c in cands}
-    check("the Debian package list does not require python3-pykickstart",
-          "python3-pykickstart" not in deb or
-          any("python3-pykickstart" not in cands
-              for p, cands in bi.host_package_plan("debian", "docker")
-              if p != "kickstart validation"),
-          "it does not exist in Debian or Kali and fails the whole apt batch")
+    # `any(... not in ...)` here was a tautology — no other capability lists
+    # the package, so it was true whatever the code did. The invariant that
+    # actually matters is that the name appears ONLY under the capability
+    # documented as a gap, so no other install can be sunk by it.
+    elsewhere = [p_ for p_, cands in bi.host_package_plan("debian", "docker")
+                 if "python3-pykickstart" in cands and p_ != "kickstart validation"]
+    check("python3-pykickstart is named only under the capability known to lack it",
+          not elsewhere,
+          "also required for: " + ", ".join(elsewhere)
+          + " — it does not exist in Debian or Kali and fails the whole apt batch")
     check("no Debian capability asks for mock", "mock" not in deb,
           "mock is a Fedora tool and is in no Debian or Kali suite")
     check("the Fedora container engine is not requested as 'docker'",
@@ -243,11 +247,16 @@ def check_doctor_fix(bi) -> None:
             for kw in node.keywords:
                 if kw.arg == "choices":
                     actions = set(ast.literal_eval(kw.value))
+    # Without this, renaming the argparse positional makes `actions` empty and
+    # every check below silently disappears — the suite would still report
+    # "N/N pass", with N quietly smaller.
+    check("the list of subcommands could be read from build_iso.py",
+          bool(actions), "no positional with choices= found; the fix-line "
+          "checks below would silently not run")
     for m in re.finditer(r"\./build_iso\.py ([a-z][a-z-]*)", src):
-        if actions:
-            check(f"the fix line `./build_iso.py {m.group(1)}` names a real action",
-                  m.group(1) in actions,
-                  f"build_iso.py accepts: {' '.join(sorted(actions))}")
+        check(f"the fix line `./build_iso.py {m.group(1)}` names a real action",
+              m.group(1) in actions,
+              f"build_iso.py accepts: {' '.join(sorted(actions))}")
 
 
 def check_mock_is_conditional() -> None:
@@ -366,6 +375,149 @@ def check_install_gate(bi) -> None:
         bi.shutil.which, bi._have_module = real_which, real_mod
 
 
+def check_probe_itself(bi) -> None:
+    """The availability probe needs a control at each end, or it proves nothing.
+
+    Every other check here trusts packages_available(). If it silently
+    returned the empty set — a parser that stopped matching, a locale change —
+    the plan checks would still pass while setup-host installed nothing.
+    """
+    d = bi.host_distro()
+    if d.family == "unknown":
+        print("  SKIP  probe control: no apt-get or dnf on this host")
+        return
+    # A name no distribution has, and one every one of them does.
+    certainly_absent = "zzzz-not-a-real-package-name-9f3c"
+    certainly_present = "python3"
+    got = bi.packages_available(d.family, [certainly_present, certainly_absent])
+    if got is None:
+        print("  SKIP  probe control: the package manager could not be queried")
+        return
+    check("the probe finds a package that certainly exists",
+          certainly_present in got,
+          f"packages_available said {certainly_present} is unavailable — the "
+          "probe is broken and every plan check above is meaningless")
+    check("the probe rejects a package that certainly does not exist",
+          certainly_absent not in got,
+          "the probe reports made-up names as available, so it cannot catch "
+          "a package list naming something that does not exist")
+    check("the probe returns None rather than an empty set when nothing matches",
+          bi.packages_available(d.family, [certainly_absent]) is None,
+          "an all-miss result must read as 'could not tell' so the caller "
+          "still tries, rather than as 'install nothing'")
+    check("the probe returns an empty set for an empty request",
+          bi.packages_available(d.family, []) == set())
+
+    # An ACCEPTED_GAPS entry that has quietly become installable is good news,
+    # but the ledger has to be updated for it — the dated comment cannot
+    # notice on its own.
+    for (fam, purpose), _why in ACCEPTED_GAPS.items():
+        if fam != d.family:
+            continue
+        cands = next((c for p_, c in bi.host_package_plan(fam, "docker")
+                      if p_ == purpose), [])
+        avail = bi.packages_available(fam, cands) if cands else None
+        check(f"'{purpose}' is still genuinely unavailable on {d.id or fam}",
+              not avail,
+              f"{sorted(avail or [])} is installable here now — drop the "
+              "ACCEPTED_GAPS entry and the KNOWN_ABSENT rows, and let "
+              "setup-host install the package instead of building a virtualenv")
+
+
+def check_module_probe(bi) -> None:
+    """_have_module is monkeypatched by the gate test, so test the real one."""
+    check("_have_module finds a module that exists", bi._have_module("json"))
+    check("_have_module reports a module that does not exist as absent",
+          not bi._have_module("zzzz_not_a_module_9f3c"))
+    # A half-installed or version-mismatched module can raise anything at all
+    # at import time. A readiness probe must answer "no", not take the caller
+    # down with it. A real module on sys.path that raises is the only way to
+    # test this that does not depend on import-system internals.
+    import sys as _sys
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as tmp:
+        name = "zzzz_broken_module_9f3c"
+        Path(tmp, name + ".py").write_text(
+            'raise RuntimeError("this module is deliberately broken")\n')
+        _sys.path.insert(0, tmp)
+        try:
+            # The failure mode under test is an exception escaping, so catch
+            # it here and report it as a failed check rather than letting it
+            # abort the rest of the suite.
+            try:
+                survived = bi._have_module(name) is False
+                detail = ""
+            except Exception as e:
+                survived, detail = False, f"{type(e).__name__}: {e}"
+            check("_have_module survives a module that raises on import",
+                  survived,
+                  detail or "it returned True for a module that cannot be "
+                  "imported")
+        finally:
+            _sys.path.remove(tmp)
+            _sys.modules.pop(name, None)
+
+
+def check_resolution(bi) -> None:
+    """resolve_host_packages decides what actually gets installed."""
+    real = bi.packages_available
+    try:
+        # Pretend the host has everything except the known gap.
+        bi.packages_available = lambda fam, names: {
+            n for n in names if n != "python3-pykickstart"}
+        install, missing, probed = bi.resolve_host_packages(_Quiet(), "debian", "docker")
+        check("resolution reports that it probed", probed is True)
+        check("resolution picks the first available candidate per capability",
+              "docker.io" in install and "docker-ce" not in install,
+              str(install))
+        check("resolution names the capability it has no package for",
+              len(missing) == 1 and "kickstart" in missing[0].lower(), str(missing))
+        check("resolution never proposes a package the probe rejected",
+              "python3-pykickstart" not in install, str(install))
+
+        # Pretend the probe itself did not work.
+        bi.packages_available = lambda fam, names: None
+        install2, missing2, probed2 = bi.resolve_host_packages(_Quiet(), "debian", "docker")
+        check("an unusable probe is reported as not-probed", probed2 is False,
+              "the caller would batch-install a list it has no reason to trust")
+        check("an unusable probe still proposes every capability",
+              len(install2) == len(bi.host_package_plan("debian", "docker")),
+              str(install2))
+        check("an unusable probe claims nothing is unavailable", missing2 == [],
+              "it cannot know that, and saying so would skip real packages")
+    finally:
+        bi.packages_available = real
+
+
+class _Quiet:
+    """Just enough Ctx for the functions under test to report through."""
+    def info(self, *a, **k): pass
+    def ok(self, *a, **k): pass
+    def warn(self, *a, **k): pass
+
+
+def check_os_release_reading(bi) -> None:
+    """The real file reader and the $PATH fallback, not just injected dicts."""
+    osr = bi.host_os_release()
+    check("os-release is readable on this host and names an ID",
+          bool(osr.get("ID")),
+          f"parsed {sorted(osr)[:8]} — every check that injects a dict is "
+          "meaningless if the real reader cannot produce one")
+    check("os-release values are unquoted",
+          not any(v.startswith('"') or v.endswith('"') for v in osr.values()),
+          str({k: v for k, v in osr.items() if '"' in v}))
+    # An empty dict forces the fallback that used to be the ONLY detection.
+    d = bi.host_distro({})
+    check("with no os-release, detection falls back to the package manager",
+          d.how.endswith("on $PATH") or d.how == "no package manager found",
+          d.how)
+    check("the fallback agrees with what is actually installed",
+          (d.family == "debian") == bool(bi.shutil.which("apt-get"))
+          or d.family == "fedora",
+          f"{d.family} but apt-get is "
+          f"{'present' if bi.shutil.which('apt-get') else 'absent'}")
+
+
 def check_no_hardcoded_lists() -> None:
     """The two flat cross-distro lists must not come back."""
     src = (ROOT / "build_iso.py").read_text()
@@ -414,6 +566,10 @@ def check_pykickstart_advice() -> None:
 def main() -> int:
     bi = load_build_iso()
     check_package_plan(bi)
+    check_probe_itself(bi)
+    check_module_probe(bi)
+    check_resolution(bi)
+    check_os_release_reading(bi)
     check_live_availability(bi)
     check_distro_detection(bi)
     check_doctor_fix(bi)

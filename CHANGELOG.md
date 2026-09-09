@@ -272,7 +272,9 @@ packages.debian.org, pkg.kali.org and mdapi.fedoraproject.org.
   `mock` is actually installed, so Fedora keeps upstream's preferred path and
   Debian-family hosts build from `dockerfiles/fedora.Dockerfile`, which needs
   nothing but the container engine. Both branches of that script tag the same
-  `qubes-builder-fedora` image, so nothing downstream can tell which one ran.
+  `qubes-builder-fedora` tag. The two images are not identical — one is seeded
+  from a digest-pinned Fedora image, the other from a chroot built on the host
+  — but that tag is the only name anything in qubes-builderv2 looks for.
 - `setup-host`'s Debian package list contained `python3-pykickstart`, which was
   removed from Debian in August 2019 and has never been in Kali. `apt-get
   install -y` fails the whole batch on one unknown name, so `setup-host` died
@@ -310,11 +312,16 @@ packages.debian.org, pkg.kali.org and mdapi.fedoraproject.org.
   checks that `doctor --fix` invokes a script path that exists. Every fix was
   mutation-tested: re-introducing each bug fails the suite.
 
+- `doctor` now checks the build host is x86-64. The docs called that the one
+  real hardware requirement and nothing tested it, so an ARM VM would have got
+  hours in before failing.
+
 **Not verified on real hardware.** None of this has been run against a live
-Kali VM or a real Qubes 4.3.1 build. The upstream facts and package
-availability are checked against primary sources, the logic is exercised by the
-test suite on a Debian-family host, and the ISO build itself remains untested
-end to end.
+Kali VM or a real Qubes 4.3.1 build, on any distribution. The upstream facts
+and package availability are checked against primary sources; the host
+detection, package resolution and the pykickstart virtualenv are exercised
+against a real apt archive on a Debian-family host; the ISO build itself
+remains untested end to end.
 
 ## 2.1 — 2026-09-01
 

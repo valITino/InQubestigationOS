@@ -96,7 +96,7 @@ the installer kickstart.
 
 | Script | Runs on | Does |
 |---|---|---|
-| `build_iso.py` | Build host (Debian 13, Kali or Fedora; Docker; ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
+| `build_iso.py` | Build host (Debian-family — Debian 13, Kali, Ubuntu — or Fedora; Docker; ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
 | `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests |
 
 `golden_image.py` is standard-library Python 3 — no `pip install`, which

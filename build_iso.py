@@ -571,9 +571,17 @@ def setup_builder(x: Ctx):
     # Omitting it builds from dockerfiles/fedora.Dockerfile instead, which
     # pulls the pinned Fedora image and installs mock, rpm-build, createrepo_c
     # and the rest INSIDE the container, so the host needs only the container
-    # engine. Verified against upstream: both branches of that script tag the
-    # result `qubes-builder-fedora`, so nothing downstream can tell which one
-    # ran.
+    # engine.
+    #
+    # The two images are NOT identical: one is seeded from a digest-pinned
+    # Fedora image on Docker Hub, the other from a chroot mock built on this
+    # host, and the mock variant additionally installs sudo while the other
+    # pre-creates /builder/cache/mock. What was checked against upstream is
+    # narrower and is what actually matters here: both branches tag the result
+    # `qubes-builder-fedora`, and every consumer in qubes-builderv2 — the
+    # example configs, ci/benchmark.sh, the container executor — refers to it
+    # by that name and nothing else. So the builder finds an image either way;
+    # it is not that the image is the same.
     #
     # Keyed on whether `mock` is actually present rather than on the
     # distribution, because that is the real precondition: a Fedora host picks
@@ -584,12 +592,14 @@ def setup_builder(x: Ctx):
     if shutil.which("mock"):
         gci.append(x.c["mock_config"])
         x.info(f"mock is present — seeding the build cage from the "
-               f"{x.c['mock_config']} chroot, as upstream prefers")
+               f"{x.c['mock_config']} chroot, the path upstream's own Fedora "
+               f"dependency list equips a host for")
     else:
         x.info("mock is not installed here (it is not packaged for Debian or "
-               "Kali), so the image is built from dockerfiles/fedora.Dockerfile "
-               "instead — same qubes-builder-fedora image, seeded from the "
-               "pinned Fedora container rather than a host chroot")
+               "Kali), so the build cage is built from "
+               "dockerfiles/fedora.Dockerfile — seeded from the pinned Fedora "
+               "container rather than a host chroot, and carrying the same "
+               "qubes-builder-fedora tag the builder looks for")
     # check=True: without the container image nothing downstream can build, and
     # marking the phase done anyway meant every later run skipped the setup and
     # failed somewhere far less obvious.
@@ -2115,7 +2125,8 @@ def doctor(x: Ctx) -> int:
     if Path("/etc/qubes-release").exists() and not in_qube():
         c.append(Check("not running in dom0", FAIL,
                        "dom0 has no network and must not build images",
-                       "run this on a separate Debian 13 or Fedora host"))
+                       "run this on a separate Debian-family or Fedora-family "
+                       "host"))
     else:
         c.append(Check("not running in dom0", OK))
 
@@ -2128,6 +2139,15 @@ def doctor(x: Ctx) -> int:
     c.append(Check("supported build host", OK if fam != "unknown" else FAIL,
                    f"{d.described()} — detected via {d.how}",
                    "qubes-builderv2 ships dependency lists for Debian and Fedora only"))
+
+    # The docs called x86-64 the one real hardware requirement and nothing
+    # checked it, so an ARM VM — an Apple Silicon Mac running Linux, say —
+    # would have got hours in before failing. Every Qubes package and the
+    # installer itself are built for x86-64.
+    arch = os.uname().machine
+    c.append(Check("x86-64 build host", OK if arch in ("x86_64", "amd64") else FAIL,
+                   arch, "Qubes packages and the installer are x86-64 only — "
+                         "this cannot be built on an ARM host or VM"))
 
     for tool in ("git", "curl", "gpg", "rsync"):
         c.append(Check(f"{tool} installed", OK if shutil.which(tool) else FAIL,

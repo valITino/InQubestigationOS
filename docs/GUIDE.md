@@ -53,12 +53,20 @@ never have to work out which of these you are on:
 ✓ supported build host  Kali GNU/Linux Rolling (debian-family) — detected via /etc/os-release
 ```
 
-| Build host | Status | What is different about it |
+| Build host | Handled by the scripts | What is different about it |
 |---|---|---|
 | **Debian 13 (trixie)** | Preferred | Nothing. This is the reference host the rest of the guide assumes. |
-| **Kali Linux (rolling)** | Supported | Debian testing underneath, and it declares `ID_LIKE=debian`, so every Debian instruction applies unchanged. Two packages Debian proper also lacks are missing here — see below. |
-| **Ubuntu 22.04 / 24.04** | Supported | Same Debian-family path. Older Ubuntu may not carry the `sq`/`sqv` packages the builder wants; `setup-host` reports any it cannot find rather than failing. |
-| **Fedora 43 / 44** | Supported | Upstream's own build host. `mock` is packaged here, so the build cage image is seeded from a Mock chroot, which is upstream's preferred path. |
+| **Kali Linux (rolling)** | Yes | Debian testing underneath, and it declares `ID_LIKE=debian`, so every Debian instruction applies unchanged. Two packages Debian proper also lacks are missing here — see below. |
+| **Ubuntu 22.04 / 24.04** | Yes | Same Debian-family path. Older Ubuntu may not carry the `sq`/`sqv` packages the builder wants; `setup-builder` — the step that installs upstream's own dependency list, not `setup-host` — names any it cannot find and carries on. |
+| **Fedora 43 / 44** | Yes | Upstream's own build host, and the only family whose dependency list installs `mock`, so the build cage is seeded from a Mock chroot here and from the pinned Fedora container everywhere else. |
+
+> **What "handled" means, and what it does not.** Every row above is what the
+> code detects and adapts to, checked against each distribution's package
+> archives. **None of it has been run end to end on a real build host of any
+> distribution** — not Kali, not Debian, not Fedora. The regression suite
+> exercises the host-detection and package-resolution logic, and the guide is
+> honest about the difference: treat these as "the scripts know about this
+> host", not "somebody has built an ISO on it".
 
 **Two packages are missing on every Debian-family host, Kali included, and
 neither is fatal:**
@@ -68,9 +76,11 @@ neither is fatal:**
   chroot as an *optional* argument; without it the build cage image is built
   from `dockerfiles/fedora.Dockerfile`, which pulls the pinned Fedora
   container and installs `mock`, `rpm-build` and `createrepo_c` *inside* it.
-  Both paths tag the same `qubes-builder-fedora` image, so nothing downstream
-  can tell which one ran. `build_iso.py` picks the path automatically based on
-  whether `mock` is actually installed.
+  The two images are not identical — one is seeded from a digest-pinned Fedora
+  image, the other from a chroot built on your host — but both carry the
+  `qubes-builder-fedora` tag, and that name is the only thing the builder ever
+  looks for. `build_iso.py` picks the path automatically, based on whether
+  `mock` is actually installed rather than on which distribution you are on.
 - **`pykickstart`** was removed from Debian in August 2019 and has never been
   in Kali. It is only used to parse the generated kickstart *before* the
   build. `setup-host` installs it into a virtualenv under `work_dir` instead;
@@ -84,8 +94,11 @@ neither is fatal:**
 > only in this section, Kali is a **distribution you might be running the
 > build on**. They are independent: you can build on Debian and get the Kali
 > template, or build on Kali and produce an image with no Kali template at
-> all. Building on Kali does not put anything from your build host into the
-> image.
+> all. Which distribution you build on contributes nothing to the image's
+> contents — every package is built inside a container, from the pinned
+> sources in the configuration. What the build host does contribute is what
+> you would expect it to: your signing key, and the hostname and timestamps
+> the build record carries.
 
 ### Running the build host in a VM
 
@@ -110,7 +123,8 @@ activity from building it and is not what this guide asks for.
 The one hardware requirement that is real: **the build host must be x86-64**,
 because every package and the installer itself are built for that
 architecture. An Apple Silicon Mac running an ARM Linux VM cannot build this
-image.
+image — `./build_iso.py doctor` checks the architecture and fails on anything
+that is not x86-64, so you find out in a second rather than in an hour.
 
 **A target laptop** with VT-x and VT-d/IOMMU, 32 GB RAM comfortable (16 GB
 workable), 512 GB SSD minimum. Check it against the Qubes Hardware
@@ -119,9 +133,10 @@ Compatibility List before committing.
 ### If your workstation is Windows
 
 **The build host must be Linux.** This is not a limitation of these scripts —
-`qubes-builderv2` builds every package inside a Linux container using Mock
-chroots, and its dependency lists are Debian and Fedora packages. There is no
-Windows-native path, and the two scripts here are POSIX throughout.
+`qubes-builderv2` builds every package inside a Linux container, using Mock
+chroots for the RPMs and pbuilder for the DEBs, and its dependency lists are
+Debian and Fedora packages. There is no Windows-native path, and the two
+scripts here are POSIX throughout.
 
 You have two options on a Windows machine, and they are not equally proven:
 
@@ -145,9 +160,12 @@ repeating here because they decide whether you bother:
   are namespaced processes on the VM's own kernel, not virtual machines, so
   the build cages need no VT-x inside the guest. Leave it off.
 - **Does it need to be a fresh VM?** No. The build touches `work_dir`,
-  `/var/lib/docker` and the packages `setup-host` names before it installs
-  anything. Run `./build_iso.py --dry-run setup-host` first if you want to see
-  that list before agreeing to it.
+  `/var/lib/docker`, and packages. `./build_iso.py --dry-run setup-host`
+  prints exactly what that step would run, including the virtualenv and the
+  PyPI download it uses for `pykickstart`, before you agree to any of it. Note
+  that this is the *host* setup only: `setup-builder`, later in the run, also
+  installs `qubes-builderv2`'s own dependency list, which is upstream's and
+  not shown by that dry run.
 
 Either way, remember that a WSL distro or a discarded VM takes your **signing
 key** with it. Back it up the moment you create it:
@@ -221,11 +239,24 @@ cd InQubestigationOS
 ```
 
 It prints every command it intends to run and asks once before running any of
-them. It installs Docker, git, curl, gnupg, rsync and python3-yaml, enables the
-Docker service, adds you to its group, and — if the build host is a Qubes app
-qube rather than a normal machine — writes the bind-dirs entry that keeps
-`/var/lib/docker` across reboots and seeds the directory so the first copy does
-not fail silently.
+them. Rather than a fixed list of package names — which is how it used to
+break, by naming one that a distribution had removed years earlier — it lists
+what it needs by *capability* (a container engine, git, curl, gpg, rsync, YAML
+for `builder.yml`, something that can read an ISO), asks your package manager
+which name provides each, and installs those. Anything your distribution has
+no package for at all is named and skipped rather than failing the rest.
+
+It then enables the Docker service, adds you to its group, and — if the build
+host is a Qubes app qube rather than a normal machine — writes the bind-dirs
+entry that keeps `/var/lib/docker` across reboots, seeding the directory so the
+first copy does not fail silently.
+
+One step is listed conditionally: on Debian and Kali, which have not packaged
+`pykickstart` since 2019, the plan offers to create a virtualenv under
+`work_dir` and `pip install pykickstart` into it from PyPI. It is shown before
+you agree, and it is optional — declining costs you the kickstart check that
+runs *before* the build, and the same thing is confirmed afterwards from the
+finished ISO instead.
 
 Group membership does not apply to a shell that was already open. Rather than
 telling you to log out and back in, `setup-host` verifies through `sg` and tells
