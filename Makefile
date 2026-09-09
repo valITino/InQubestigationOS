@@ -78,6 +78,10 @@ check-docs:  ## check the documentation still matches the code
 check-config:  ## check the code and its configuration agree
 	./tests/config_checks.py
 
+.PHONY: check-host
+check-host:  ## check the build-host support holds up on the distributions it claims
+	./tests/host_checks.py
+
 .PHONY: rotate escrow shred
 rotate:  ## (on the laptop) new secrets, applied everywhere
 	sudo ./golden_image.py --rotate-credentials
@@ -110,6 +114,7 @@ backup-media:  ## (on the laptop) partition, format and label the backup disk
 ci:  ## exactly what .github/workflows/ci.yml runs, locally
 	python3 -m py_compile golden_image.py build_iso.py
 	./tests/run_tests.py
+	./tests/host_checks.py
 	./tests/config_checks.py
 	./tests/doc_checks.py
 	./build_iso.py check-upstream

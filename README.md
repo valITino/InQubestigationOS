@@ -49,7 +49,8 @@ templates, and Whonix.
 ## Quick start
 
 ```bash
-# On a Debian 13 or Fedora host with ~250 GB free — nothing pre-installed
+# On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~250 GB
+# free — nothing pre-installed
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
 ./build_iso.py bootstrap          # host, key, key backup, checks, plan, build
 ./build_iso.py write-usb --wait   # plug the stick in when it asks
@@ -82,7 +83,9 @@ InQubestigationOS/
 ├── tests/
 │   ├── run_tests.py           fake-dom0 harness: runs all 12 phases off Qubes
 │   ├── static_checks.py       assertions over every generated config file
+│   ├── host_checks.py         the build-host support must hold up per distro
 │   ├── doc_checks.py          the docs must not drift from the code
+│   ├── config_checks.py       the code and its configuration must agree
 │   └── qubes_stub.py          one stand-in for every dom0 command
 ├── .github/workflows/ci.yml   harness on every push, supply chain every Monday
 └── .gitignore                 keeps credentials and build artifacts out of git
@@ -95,13 +98,19 @@ the installer kickstart.
 
 | Script | Runs on | Does |
 |---|---|---|
-| `build_iso.py` | Build host (Debian 13, Docker, ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
+| `build_iso.py` | Build host (Debian-family — Debian 13, Kali, Ubuntu — or Fedora; Docker; ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
 | `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests |
 
-Both are standard-library Python 3 — no `pip install`, which matters because
-dom0 has no network by design. Both embed their configuration, write it as JSON
-on first run, and never overwrite your edits. Both are resumable: completed
-phases are recorded and skipped.
+`golden_image.py` is standard-library Python 3 — no `pip install`, which
+matters because dom0 has no network by design. `build_iso.py` runs on a
+networked build host, and needs PyYAML to edit `builder.yml` safely;
+`setup-host` installs your distribution's package for it. It also uses
+pykickstart to check the generated kickstart before the build, and on Debian
+and Kali — which have not packaged pykickstart since 2019 — `setup-host` puts
+that one, alone, in a virtualenv under `work_dir` rather than installing into
+the system interpreter. Both scripts embed their configuration, write it as
+JSON on first run, and never overwrite your edits. Both are resumable:
+completed phases are recorded and skipped.
 
 ## Before you ship this to anyone
 

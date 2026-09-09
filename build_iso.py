@@ -7,8 +7,10 @@ the investigator templates baked in (Tier 2) so the target installs with no
 network at all.
 
 *** RUNS ON A BUILD HOST, NEVER IN DOM0 ***
-Needs Fedora or Debian, Docker or Podman, ~100 GB free (Tier 1) or ~250 GB
-(Tier 2), and several hours.
+Needs a Debian-family host (Debian, Kali, Ubuntu) or a Fedora-family one,
+Docker or Podman, ~100 GB free (Tier 1) or ~250 GB (Tier 2), and several
+hours. `doctor` names the distribution it found; a VM is a first-class host
+and needs no nested virtualisation, because the build cages are containers.
 
     ./build_iso.py --write-config          # emit iso-build.json, review, edit
     ./build_iso.py --dry-run               # print the plan
@@ -448,9 +450,11 @@ def preflight(x: Ctx, tier2: bool):
         if not shutil.which(tool):
             gate(f"{tool} not installed — ./build_iso.py setup-host")
 
-    host = "debian/ubuntu" if shutil.which("apt-get") else (
-        "fedora" if shutil.which("dnf") else "unknown")
-    x.info(f"build host: {host}")
+    # A third place that used to guess the distribution from $PATH, in yet
+    # another order. One function answers this now, from /etc/os-release.
+    d = host_distro()
+    host = d.family
+    x.info(f"build host: {d.described()}  [detected via {d.how}]")
     if x.c["prefer_debian_build_host"] and host == "fedora":
         x.info("a Debian 13 build host is preferred here, but Fedora works — "
                "qubes-builderv2 ships dependency lists for both")
@@ -525,24 +529,81 @@ def setup_builder(x: Ctx):
     verify_builder(x)
 
     if not x.args.dry_run:
-        if shutil.which("dnf"):
-            deps = (x.builder / "dependencies-fedora.txt").read_text().split()
-            x.run("sudo", "dnf", "install", "-y", *deps, live=True, check=False)
-        elif shutil.which("apt-get"):
-            deps = (x.builder / "dependencies-debian.txt").read_text().split()
-            x.run("sudo", "apt-get", "install", "-y", *deps, live=True, check=False)
-        else:
-            raise Fatal("no dnf or apt-get — builderv2 supports Fedora or Debian hosts")
+        # host_family(), not a second `which` probe in the opposite order:
+        # this asked dnf first while host_family() asked apt-get first, so a
+        # host with both was classified one way here and the other way in
+        # setup-host. _sudo() rather than a literal "sudo" so this still works
+        # when already running as root, where sudo may not be installed.
+        fam = host_family()
+        deps_file = {"debian": "dependencies-debian.txt",
+                     "fedora": "dependencies-fedora.txt"}.get(fam)
+        if not deps_file:
+            raise Fatal(f"unsupported build host: {host_distro().described()} — "
+                        "builderv2 supports Fedora and Debian families")
+        deps = (x.builder / deps_file).read_text().split()
+        # Same reasoning as setup-host: one name the host does not have fails
+        # the whole apt-get batch, and upstream's list targets Debian proper —
+        # Kali and older Ubuntu do not carry all of it. Report what looks
+        # missing, but do NOT drop it: a Debian virtual package with a single
+        # provider installs by name while reporting Candidate: (none), and
+        # dropping those would lose dependencies the unfiltered install used
+        # to get. Anything genuinely absent costs only its own retry.
+        avail = packages_available(fam, deps)
+        if avail is not None and set(deps) - avail:
+            x.warn("upstream lists these but this host's package sources do "
+                   "not appear to have them: " + " ".join(sorted(set(deps) - avail)))
+        install_packages(x, fam, deps)
         x.info("builder dependencies installed (failures above are not fatal — the "
                "container image build below is the real test)")
 
     x.info("building the container image for the build cages (slow, one-off)")
     resolve_auto_values(x)
+    # tools/generate-container-image.sh takes the mock configuration as an
+    # OPTIONAL second argument, and passing it selects a completely different
+    # code path: `sudo mock -r <conf> --scrub=all`, then --init, then a build
+    # from dockerfiles/fedora-mock.Dockerfile with the mock root cache as
+    # context. `mock` is a Fedora tool. It was dropped from Debian in 2019 and
+    # is in no current Debian or Kali suite, and the script runs under
+    # `set -ex`, so passing the argument unconditionally — which this did —
+    # aborted the container image build on EVERY Debian-family host, including
+    # the Debian 13 host the guide recommends.
+    #
+    # Omitting it builds from dockerfiles/fedora.Dockerfile instead, which
+    # pulls the pinned Fedora image and installs mock, rpm-build, createrepo_c
+    # and the rest INSIDE the container, so the host needs only the container
+    # engine.
+    #
+    # The two images are NOT identical: one is seeded from a digest-pinned
+    # Fedora image on Docker Hub, the other from a chroot mock built on this
+    # host, and the mock variant additionally installs sudo while the other
+    # pre-creates /builder/cache/mock. What was checked against upstream is
+    # narrower and is what actually matters here: both branches tag the result
+    # `qubes-builder-fedora`, and every consumer in qubes-builderv2 — the
+    # example configs, ci/benchmark.sh, the container executor — refers to it
+    # by that name and nothing else. So the builder finds an image either way;
+    # it is not that the image is the same.
+    #
+    # Keyed on whether `mock` is actually present rather than on the
+    # distribution, because that is the real precondition: a Fedora host picks
+    # up mock from dependencies-fedora.txt just above and keeps upstream's
+    # preferred path, and a Debian host that has built mock by hand keeps it
+    # too.
+    gci = ["tools/generate-container-image.sh", x.c["container_engine"]]
+    if shutil.which("mock"):
+        gci.append(x.c["mock_config"])
+        x.info(f"mock is present — seeding the build cage from the "
+               f"{x.c['mock_config']} chroot, the path upstream's own Fedora "
+               f"dependency list equips a host for")
+    else:
+        x.info("mock is not installed here (it is not packaged for Debian or "
+               "Kali), so the build cage is built from "
+               "dockerfiles/fedora.Dockerfile — seeded from the pinned Fedora "
+               "container rather than a host chroot, and carrying the same "
+               "qubes-builder-fedora tag the builder looks for")
     # check=True: without the container image nothing downstream can build, and
     # marking the phase done anyway meant every later run skipped the setup and
     # failed somewhere far less obvious.
-    x.run("tools/generate-container-image.sh", x.c["container_engine"],
-          x.c["mock_config"], cwd=x.builder, live=True)
+    x.run(*gci, cwd=x.builder, live=True)
 
     bcfg = x.builder / "builder.yml"
     if not bcfg.exists():
@@ -1205,7 +1266,8 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
         import yaml
     except ImportError:
         raise Fatal(
-            "python3-yaml is needed to edit builder.yml safely.\n"
+            "PyYAML is needed to edit builder.yml safely "
+            "(python3-yaml on Debian and Kali, python3-pyyaml on Fedora).\n"
             "     Appending raw text would create duplicate top-level keys, and\n"
             "     YAML keeps only the last one — that silently drops the upstream\n"
             "     component list and the rpm/deb signing keys.\n"
@@ -1572,7 +1634,16 @@ p = KickstartParser(makeVersion())
 p.readKickstart(sys.argv[1])
 print("\\n".join(str(g) for g in p.handler.packages.packageList))
 """
-    out = x.run(sys.executable, "-c", probe, str(ks), check=False, capture=True)
+    # Whichever interpreter can import pykickstart: this one on Fedora, or the
+    # virtualenv setup-host builds on Debian and Kali, which have no package
+    # for it at all.
+    py, _ = kickstart_python(x)
+    if not py:
+        x.verify("pykickstart is not installed here, so the generated kickstart "
+                 "was not parsed. The build checks the template RPMs are in the "
+                 "finished ISO, which answers the same question after the fact.")
+        return
+    out = x.run(py, "-c", probe, str(ks), check=False, capture=True)
     if "ModuleNotFoundError" in out or "ImportError" in out:
         x.verify("pykickstart is not installed here, so the generated kickstart "
                  "was not parsed. The build checks the template RPMs are in the "
@@ -1873,12 +1944,107 @@ def _print_checks(x: Ctx, checks: list[Check]) -> int:
     return 1 if bad else 0
 
 
-def host_family() -> str:
+def host_os_release() -> dict[str, str]:
+    """/etc/os-release as a dict, or {} if there is no readable one.
+
+    systemd defines the format: shell-style KEY=VALUE, values optionally
+    quoted. Reading it is the only way to learn that a host calling itself
+    "debian" underneath is actually Kali, or Ubuntu, or Mint.
+    """
+    out: dict[str, str] = {}
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+        if out:
+            break
+    return out
+
+
+# ID and ID_LIKE values that mean "packages are installed the Debian way" and
+# "…the Fedora way". Kali is why this table exists: it is Debian testing
+# underneath and declares ID_LIKE=debian, but nothing here could say so, so
+# every Debian derivative was reported to the operator as the bare word
+# "debian" and the one distribution-specific bug (no `mock`, no
+# `python3-pykickstart`) was invisible.
+DEBIAN_IDS = {"debian", "ubuntu", "kali", "raspbian", "linuxmint", "pop",
+              "elementary", "devuan", "parrot", "neon", "zorin", "trisquel"}
+FEDORA_IDS = {"fedora", "rhel", "centos", "rocky", "almalinux", "ol",
+              "scientific"}
+# "qubes" is deliberately in NEITHER table. dom0 is the only place that ID is
+# expected, and doctor refuses to build there anyway; leaving it out means an
+# ID this script does not know falls through to ID_LIKE, which is what
+# actually says how packages are installed. Claiming "qubes" for one family
+# would classify a Qubes app qube of the OTHER family wrongly, and an app qube
+# is a supported build host.
+
+
+class HostDistro:
+    """What this build host actually is, and how we worked that out."""
+
+    def __init__(self, family: str, ident: str, name: str, version: str,
+                 how: str):
+        self.family = family      # "debian", "fedora" or "unknown"
+        self.id = ident           # os-release ID, e.g. "kali"
+        self.name = name          # PRETTY_NAME, e.g. "Kali GNU/Linux Rolling"
+        self.version = version    # VERSION_ID — empty on a rolling release
+        self.how = how            # what decided the family
+
+    def described(self) -> str:
+        """A one-line description for the operator, never just the family."""
+        # PRETTY_NAME normally carries the version already; fall back to
+        # ID plus VERSION_ID for an os-release that omits it.
+        label = (self.name or f"{self.id} {self.version}".strip()
+                 or "unidentified")
+        if self.family == "unknown":
+            return f"{label} — neither apt-get nor dnf"
+        if self.id and self.id not in ("debian", "fedora"):
+            return f"{label} ({self.family}-family)"
+        return label
+
+
+def host_distro(osr: dict[str, str] | None = None) -> HostDistro:
+    """Identify the build host from /etc/os-release, falling back to $PATH.
+
+    `osr` overrides the file, so the mapping from a distribution's real
+    os-release to a packaging family can be tested without a host of that
+    distribution to hand.
+
+    Detecting the distribution by which package manager happens to be on
+    $PATH — which is all this used to do — cannot distinguish Kali from
+    Debian from Ubuntu, and two code paths probed in opposite orders, so a
+    host with both apt-get and dnf was classified differently depending on
+    which function asked. os-release is the primary source; the $PATH probe
+    stays as the fallback for a distribution not in the tables above, in one
+    fixed order.
+    """
+    osr = host_os_release() if osr is None else osr
+    ident = osr.get("ID", "").strip().lower()
+    likes = osr.get("ID_LIKE", "").strip().lower().split()
+    name = osr.get("PRETTY_NAME") or osr.get("NAME") or ""
+    ver = osr.get("VERSION_ID", "")
+    for cand in [ident, *likes]:
+        if cand in DEBIAN_IDS:
+            return HostDistro("debian", ident, name, ver, "/etc/os-release")
+        if cand in FEDORA_IDS:
+            return HostDistro("fedora", ident, name, ver, "/etc/os-release")
     if shutil.which("apt-get"):
-        return "debian"
+        return HostDistro("debian", ident, name, ver, "apt-get on $PATH")
     if shutil.which("dnf"):
-        return "fedora"
-    return "unknown"
+        return HostDistro("fedora", ident, name, ver, "dnf on $PATH")
+    return HostDistro("unknown", ident, name, ver, "no package manager found")
+
+
+def host_family() -> str:
+    """"debian", "fedora" or "unknown" — the packaging convention to use."""
+    return host_distro().family
 
 
 def in_qube() -> bool:
@@ -1928,11 +2094,31 @@ def secret_key_fingerprints() -> list[tuple[str, str]]:
     return out
 
 
+def fix_argv(fix_line: str) -> list[str]:
+    """The argv `doctor --fix` should run for one `fix:` line.
+
+    A fix line reads "./build_iso.py setup-host", which is only executable
+    from the repository root and only if the file is marked executable. This
+    used to build [sys.executable, *argv[1:]] — dropping the script path
+    altogether — so every fix ran as `python3 setup-host` and died with
+    "can't open file 'setup-host'". `doctor --fix` could not repair anything,
+    on any host, ever. Re-running THIS file by its resolved path works from
+    any directory. Split out so the invariant can be tested directly rather
+    than by triggering a repair.
+    """
+    argv = shlex.split(fix_line.split("(")[0].strip())
+    if argv and argv[0].endswith(".py"):
+        return [sys.executable, str(Path(__file__).resolve()), *argv[1:]]
+    return argv
+
+
 # ---------------------------------------------------------------------------
 #  doctor — read-only readiness report
 # ---------------------------------------------------------------------------
 def doctor(x: Ctx) -> int:
     x.phase("doctor", "is this build host ready?")
+    # Before anything measures work_dir or reports where it will be.
+    resolve_work_dir(x, fatal=False)
     c: list[Check] = []
     ce = x.c["container_engine"]
     tier2 = int(x.c["tier"]) == 2
@@ -1940,28 +2126,57 @@ def doctor(x: Ctx) -> int:
     if Path("/etc/qubes-release").exists() and not in_qube():
         c.append(Check("not running in dom0", FAIL,
                        "dom0 has no network and must not build images",
-                       "run this on a separate Debian 13 or Fedora host"))
+                       "run this on a separate Debian-family or Fedora-family "
+                       "host"))
     else:
         c.append(Check("not running in dom0", OK))
 
-    fam = host_family()
-    c.append(Check("supported build host", OK if fam != "unknown" else FAIL, fam,
+    d = host_distro()
+    fam = d.family
+    # Naming the distribution, not just the family: "debian" was printed for
+    # Kali, Ubuntu and Mint alike, so this could not tell you what you were
+    # actually running on — and the one thing that differs between them is
+    # exactly which packages exist.
+    c.append(Check("supported build host", OK if fam != "unknown" else FAIL,
+                   f"{d.described()} — detected via {d.how}",
                    "qubes-builderv2 ships dependency lists for Debian and Fedora only"))
+
+    # The docs called x86-64 the one real hardware requirement and nothing
+    # checked it, so an ARM VM — an Apple Silicon Mac running Linux, say —
+    # would have got hours in before failing. Every Qubes package and the
+    # installer itself are built for x86-64.
+    arch = os.uname().machine
+    c.append(Check("x86-64 build host", OK if arch in ("x86_64", "amd64") else FAIL,
+                   arch, "Qubes packages and the installer are x86-64 only — "
+                         "this cannot be built on an ARM host or VM"))
 
     for tool in ("git", "curl", "gpg", "rsync"):
         c.append(Check(f"{tool} installed", OK if shutil.which(tool) else FAIL,
                        fix="./build_iso.py setup-host"))
     # Without one of these the build cannot confirm the investigator templates
     # actually made it into the finished image, which is the whole Tier 2 promise.
-    reader = next((t for t in ("bsdtar", "7z", "7za", "isoinfo", "xorriso")
-                   if shutil.which(t)), "")
+    reader = iso_reader()
     c.append(Check("a tool that can read an ISO's contents", OK if reader else FAIL,
                    reader or "none of bsdtar, 7z, isoinfo, xorriso",
                    fix="./build_iso.py setup-host"))
-    try:
-        import pykickstart                                   # noqa: F401
-        c.append(Check("pykickstart present (validates the generated kickstart)", OK))
-    except ImportError:
+    ks_py, ks_from = kickstart_python(x)
+    if ks_py:
+        c.append(Check("pykickstart present (validates the generated kickstart)",
+                       OK, ks_from))
+    elif fam == "debian":
+        # Telling a Debian or Kali operator to run setup-host here was advice
+        # that could not work: pykickstart was removed from Debian in 2019 and
+        # no suite of Debian or Kali carries it. setup-host now builds a
+        # virtualenv for it, and if that is not wanted, saying what the
+        # consequence actually is beats repeating an impossible fix.
+        c.append(Check("pykickstart present (validates the generated kickstart)",
+                       WARN, "no Debian or Kali package provides it",
+                       "./build_iso.py setup-host  (installs it into a "
+                       "virtualenv under work_dir)\n"
+                       "           or accept it: the kickstart is then checked "
+                       "after the build, by confirming the template RPMs are "
+                       "in the finished ISO"))
+    else:
         c.append(Check("pykickstart present (validates the generated kickstart)",
                        WARN, "missing — the kickstart is checked after the build "
                        "instead of before it", "./build_iso.py setup-host"))
@@ -2077,11 +2292,12 @@ def doctor(x: Ctx) -> int:
 
     try:
         import yaml                                          # noqa: F401
-        c.append(Check("python3-yaml present (builder.yml is merged, not appended)",
+        c.append(Check("PyYAML present (builder.yml is merged, not appended)",
                        OK))
     except ImportError:
-        c.append(Check("python3-yaml present (builder.yml is merged, not appended)",
-                       FAIL, "missing", "./build_iso.py setup-host"))
+        c.append(Check("PyYAML present (builder.yml is merged, not appended)",
+                       FAIL, "missing — python3-yaml on Debian and Kali, "
+                       "python3-pyyaml on Fedora", "./build_iso.py setup-host"))
 
     payload = Path(__file__).resolve().parent / "golden_image.py"
     c.append(Check("provisioning payload beside this script",
@@ -2113,10 +2329,9 @@ def doctor(x: Ctx) -> int:
         if not fix.startswith("./build_iso.py") or fix in ran:
             continue
         ran.add(fix)
-        argv = shlex.split(fix.split("(")[0].strip())
-        print(f"\n  running: {' '.join(argv)}")
-        rc2 = subprocess.run([sys.executable, *argv[1:]] if argv[0].endswith(".py")
-                             else argv).returncode
+        argv = fix_argv(fix)
+        print(f"\n  running: {fix}")
+        rc2 = subprocess.run(argv).returncode
         if rc2 != 0:
             x.warn(f"that did not succeed (exit {rc2})")
     unfixable = [ch.name for ch in blocking
@@ -2150,32 +2365,393 @@ def key_expiry(fpr: str) -> int | None:
 # ---------------------------------------------------------------------------
 #  setup-host — GUIDE section 2, performed instead of described
 # ---------------------------------------------------------------------------
-# python3-yaml is not optional: builder.yml is merged rather than appended, and
-# without it this script refuses to edit builder.yml at all. bsdtar lets the
-# build confirm the investigator templates are actually inside the finished ISO.
-DEB_PACKAGES = ["docker.io", "git", "curl", "gnupg", "rsync", "python3",
-                "python3-yaml", "libarchive-tools", "python3-pykickstart"]
-RPM_PACKAGES = ["docker", "git", "curl", "gnupg2", "rsync", "python3",
-                "python3-pyyaml", "bsdtar", "pykickstart"]
+# What the build host needs, by CAPABILITY rather than by package name.
+#
+# Two hardcoded lists — one for Debian, one for Fedora — asserted that a given
+# name exists on every distribution in that family, and twice it did not:
+#
+#   * `python3-pykickstart` was removed from Debian in 2019 and has never been
+#     in Kali. `apt-get install -y` fails the WHOLE batch on one unknown name
+#     and exits 100, so setup-host died on a fresh Debian-family host before
+#     installing anything at all.
+#   * `pykickstart` and `bsdtar` are not Fedora binary package names either
+#     (Fedora ships python3-kickstart, and bsdtar comes from libarchive).
+#
+# Naming several candidates per capability and asking the package manager
+# which of them exists fixes the class of bug rather than the two instances.
+# Order within a list is preference order; the first one the host can actually
+# install wins.
+def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
+    """(what it is for, candidate package names in preference order)."""
+    if fam == "debian":
+        engine = {"docker": ["docker.io", "docker-ce"],
+                  "podman": ["podman"]}.get(ce, [ce])
+        return [
+            (f"{ce} (the build cages)", engine),
+            ("git", ["git"]),
+            ("curl", ["curl"]),
+            ("gpg", ["gnupg", "gnupg2"]),
+            ("rsync", ["rsync"]),
+            ("python3", ["python3"]),
+            # builder.yml is merged rather than appended, and without PyYAML
+            # this script refuses to edit it at all.
+            ("YAML, to edit builder.yml safely", ["python3-yaml"]),
+            # Lets the build confirm the investigator templates are really
+            # inside the finished ISO — the whole Tier 2 promise.
+            ("a reader for the finished ISO",
+             ["libarchive-tools", "p7zip-full", "xorriso"]),
+            # For the pykickstart virtualenv below, when the distribution has
+            # no package for it.
+            ("venv support, for the kickstart validator",
+             ["python3-venv", "python3-virtualenv"]),
+            ("kickstart validation", ["python3-pykickstart"]),
+        ]
+    # "docker" is NOT a Fedora binary package name — it is a virtual provide of
+    # moby-engine, so `dnf list docker` finds nothing and the old hardcoded
+    # entry could never have been resolved by name. Fedora also splits the CLI
+    # out of the engine, hence the separate docker-cli capability below.
+    engine = {"docker": ["moby-engine", "docker-ce"],
+              "podman": ["podman"]}.get(ce, [ce])
+    plan = [
+        (f"{ce} (the build cages)", engine),
+        ("git", ["git"]),
+        ("curl", ["curl"]),
+        ("gpg", ["gnupg2", "gnupg"]),
+        ("rsync", ["rsync"]),
+        ("python3", ["python3"]),
+        ("YAML, to edit builder.yml safely", ["python3-pyyaml"]),
+        # bsdtar is its own Fedora binary package, built from the libarchive
+        # source package but not shipped by the libarchive binary one.
+        ("a reader for the finished ISO", ["bsdtar", "p7zip", "xorriso"]),
+        # python3-kickstart is the importable module, which is all this needs
+        # — nothing here runs ksvalidator or ksflatten. The package named
+        # "pykickstart" is the command-line tool; it depends on the module, so
+        # it works too, and is kept as a fallback for a Fedora that has only
+        # that name.
+        ("kickstart validation", ["python3-kickstart", "pykickstart"]),
+    ]
+    if ce == "docker":
+        plan.insert(1, ("the docker command (split from the engine in Fedora)",
+                        ["docker-cli"]))
+    return plan
+
+
+# `dnf list` prints "name.arch"; strip only a real architecture suffix, so a
+# package whose name legitimately contains a dot is not truncated.
+_RPM_ARCHES = ("x86_64", "noarch", "i686", "aarch64", "src")
+
+
+def packages_available(fam: str, names: list[str]) -> set[str] | None:
+    """Which of `names` this host's package manager can actually install.
+
+    Returns None — meaning "could not tell" — rather than an empty set when
+    the probe itself did not work, because an empty set and a broken probe
+    demand opposite responses: skip those packages, versus try them anyway.
+    A completely empty result is treated as a broken probe too, since an apt
+    cache that has never been updated answers "no" to everything.
+
+    Known limitation, and it fails safe: on Debian a purely virtual package
+    with exactly ONE provider is installable by name, but `apt-cache policy`
+    reports it as `Candidate: (none)`, so it is treated as unavailable here.
+    The caller names every package it skips, so the worst case is a visible
+    warning about something that would have installed — not a silent drop.
+    """
+    if not names:
+        return set()
+    # apt and dnf translate their output. Parsing "Candidate:" against a
+    # localised host would find nothing, and this would report every package
+    # as missing on, say, a French install.
+    env = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C", "LANG": "C"}
+    try:
+        if fam == "debian":
+            if not shutil.which("apt-cache"):
+                return None
+            p = subprocess.run(["apt-cache", "policy", *names], env=env,
+                               capture_output=True, text=True, timeout=180)
+            found, cur = set(), ""
+            for line in p.stdout.splitlines():
+                if line[:1] not in (" ", "\t") and line.rstrip().endswith(":"):
+                    cur = line.rstrip()[:-1].strip()
+                elif cur and line.strip().startswith("Candidate:"):
+                    if line.split(":", 1)[1].strip() not in ("(none)", ""):
+                        found.add(cur)
+                    cur = ""
+            found &= set(names)
+            return found or None
+        if fam == "fedora":
+            if not shutil.which("dnf"):
+                return None
+            found = set()
+            # One call for the whole set rather than one per package: dnf
+            # lists every name it knows and complains about the rest.
+            p = subprocess.run(["dnf", "--quiet", "list", *names], env=env,
+                               capture_output=True, text=True, timeout=300)
+            want = {n.lower(): n for n in names}
+            for line in p.stdout.splitlines():
+                tok = line.split()[0].lower() if line.split() else ""
+                stem, _, arch = tok.rpartition(".")
+                for cand in (tok, stem if arch in _RPM_ARCHES else ""):
+                    if cand in want:
+                        found.add(want[cand])
+                        break
+            # `dnf list` matches package NAMES only, but `dnf install` also
+            # resolves virtual provides — "docker" installs moby-engine,
+            # which merely Provides it. Probing with list alone would report a
+            # name as unavailable that installs perfectly well, so ask what
+            # provides the ones that missed before giving up on them.
+            for n in (n for n in names if n not in found):
+                q = subprocess.run(
+                    ["dnf", "--quiet", "repoquery", "--whatprovides", n],
+                    env=env, capture_output=True, text=True, timeout=180)
+                if q.returncode == 0 and q.stdout.strip():
+                    found.add(n)
+            return found or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
+def resolve_host_packages(x: Ctx, fam: str,
+                          ce: str) -> tuple[list[str], list[str], bool]:
+    """Pick one real package per capability.
+
+    Returns (install, unavailable, probed). `unavailable` names the
+    capabilities this distribution has no package for at all, so setup-host
+    can say which ones it is skipping and why instead of failing the whole
+    batch on them. `probed` is False when the package manager could not be
+    asked, which tells the caller not to bother with a batch install — a name
+    in the list is then expected to be wrong.
+    """
+    plan = host_package_plan(fam, ce)
+    every = sorted({n for _, cands in plan for n in cands})
+    avail = packages_available(fam, every)
+    if avail is None:
+        x.info("could not ask the package manager what it has (no cache yet?) "
+               "— trying the preferred name for each, one at a time so a "
+               "single unknown name cannot fail the rest")
+        return [cands[0] for _, cands in plan], [], False
+    install, missing = [], []
+    for purpose, cands in plan:
+        pick = next((c for c in cands if c in avail), "")
+        if pick:
+            install.append(pick)
+        else:
+            missing.append(f"{purpose} (no package named {' or '.join(cands)})")
+    return install, missing, True
+
+
+# ---------------------------------------------------------------------------
+#  pykickstart — available on Fedora as a package, nowhere on Debian
+#
+#  pykickstart was removed from Debian unstable in August 2019 and is in no
+#  current Debian or Kali suite. `doctor` warned that it was missing and told
+#  the operator to run `setup-host`, which could not install it either: advice
+#  that cannot work is worse than no advice. It is a pure-Python package on
+#  PyPI, so the honest options are to install it into a virtualenv owned by
+#  this script, or to say plainly that the kickstart is checked after the
+#  build instead of before it. Both are implemented; setup-host tries the
+#  first, and doctor reports whichever is true.
+# ---------------------------------------------------------------------------
+def kickstart_venv(x: Ctx) -> Path:
+    return x.work / ".venv-pykickstart"
+
+
+def _can_import_pykickstart(python: str) -> bool:
+    try:
+        return subprocess.run([python, "-c", "import pykickstart"],
+                              capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=120).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def kickstart_python(x: Ctx) -> tuple[str, str]:
+    """(interpreter that can import pykickstart, where it came from).
+
+    ("", "") when there is none, which is not fatal anywhere — it downgrades
+    kickstart validation from before the build to after it.
+    """
+    if _can_import_pykickstart(sys.executable):
+        return sys.executable, "system"
+    venv = kickstart_venv(x) / "bin" / "python3"
+    if venv.is_file() and _can_import_pykickstart(str(venv)):
+        return str(venv), f"virtualenv at {kickstart_venv(x)}"
+    return "", ""
+
+
+def ensure_pykickstart(x: Ctx) -> None:
+    """Install pykickstart into a virtualenv when no package provides it.
+
+    Deliberately not `pip install --break-system-packages`: Debian and Kali
+    mark their system interpreter externally managed (PEP 668) and overriding
+    that to satisfy a build-time validator is not a trade this script should
+    make on the operator's behalf. A virtualenv under work_dir is disposable
+    and touches nothing the distribution owns.
+    """
+    if kickstart_python(x)[0]:
+        return
+    venv = kickstart_venv(x)
+    x.info(f"no distribution package provides pykickstart here — installing it "
+           f"into {venv}")
+    try:
+        venv.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        x.warn(f"cannot create {venv.parent} ({e}) — the generated kickstart "
+               "will be checked after the build instead of before it")
+        return
+    py = venv / "bin" / "python3"
+    if not py.is_file():
+        x.run(sys.executable, "-m", "venv", str(venv), check=False, live=True)
+    if not py.is_file():
+        x.warn("could not create the virtualenv — install python3-venv "
+               "(Debian, Kali, Ubuntu) and re-run ./build_iso.py setup-host. "
+               "Until then the generated kickstart is checked after the build "
+               "instead of before it")
+        return
+    # A virtualenv left behind by an interrupted run, or one made with
+    # --without-pip, has an interpreter but nothing to install with. Repair it
+    # rather than running pip against it and reporting the failure as a
+    # network problem, which is what the error would otherwise look like.
+    if not x.quiet(str(py), "-m", "pip", "--version"):
+        x.info("the virtualenv has no pip — repairing it")
+        x.run(str(py), "-m", "ensurepip", "--upgrade", check=False, live=True)
+    if not x.quiet(str(py), "-m", "pip", "--version"):
+        x.warn(f"{venv} has no working pip and ensurepip could not add one — "
+               "remove it and re-run ./build_iso.py setup-host, or accept "
+               "that the kickstart is checked after the build instead")
+        return
+    x.run(str(py), "-m", "pip", "install", "--quiet", "--upgrade",
+          "pykickstart", check=False, live=True)
+    if kickstart_python(x)[0]:
+        x.ok(f"pykickstart available via {venv}")
+    else:
+        x.warn("pip could not install pykickstart (no network?) — the "
+               "generated kickstart will be checked after the build instead "
+               "of before it")
+
+
+def iso_reader() -> str:
+    """The first tool on this host that can list an ISO's contents, or ""."""
+    return next((t for t in ("bsdtar", "7z", "7za", "isoinfo", "xorriso")
+                 if shutil.which(t)), "")
+
+
+def _have_module(name: str) -> bool:
+    """Whether this interpreter can import `name`.
+
+    Catches every exception, not just ImportError: a half-installed or
+    version-mismatched module can raise almost anything at import time, and a
+    host-readiness probe must report "no" rather than take setup-host down
+    with it.
+    """
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
+
+
+def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
+    """Everything the build host is missing that a package can supply.
+
+    This used to probe five binaries and nothing else, so on a host that
+    already had git, curl, gpg, rsync and Docker — which is to say, most
+    hosts — setup-host installed no packages at all. python3-yaml and the ISO
+    reader stayed missing, and `doctor` then blocked on python3-yaml with the
+    fix "./build_iso.py setup-host", which had just decided there was nothing
+    to do. Probing the capabilities that are actually required breaks that
+    loop.
+    """
+    gaps = [t for t in ("git", "curl", "gpg", "rsync", ce) if not shutil.which(t)]
+    if not _have_module("yaml"):
+        # Named by what it is, not by one distribution's package name: this
+        # message is printed on Fedora hosts too, where it is python3-pyyaml.
+        gaps.append("PyYAML")
+    if not iso_reader():
+        gaps.append("an ISO reader (bsdtar/7z/isoinfo/xorriso)")
+    # A missing kickstart validator is a gap on BOTH families, and probing
+    # only Debian's half of it — ensurepip, which python3-venv supplies — left
+    # the worse case unfixed: a Fedora host that already had everything else
+    # skipped the package step entirely and went to PyPI for a module dnf
+    # packages as python3-kickstart. Whatever the distribution has for this,
+    # the install step is what fetches it.
+    if need_ks:
+        gaps.append("a kickstart validator (a package where one exists, or "
+                    "the venv support to install one where none does)")
+    return gaps
+
+
+def install_packages(x: Ctx, fam: str, pkgs: list[str], batch: bool = True) -> None:
+    """Install pkgs so that one bad name cannot cost you the rest.
+
+    `apt-get install -y` exits 100 on a single unknown name and installs
+    nothing at all — which is how one package removed from Debian in 2019
+    stopped setup-host from installing the other eight. The batch is tried
+    first because it is much faster; on failure every package is retried on
+    its own. Pass batch=False when the availability probe did not work, since
+    then a name in the list is expected to be wrong.
+    """
+    if not pkgs:
+        x.warn("nothing left to install")
+        return
+    base = ["apt-get", "install", "-y"] if fam == "debian" else ["dnf", "install", "-y"]
+    if batch:
+        try:
+            x.run(*_sudo([*base, *pkgs]), live=True)
+            x.ok(f"installed: {' '.join(pkgs)}")
+            return
+        except Fatal:
+            x.warn("the batch install failed — retrying one package at a time "
+                   "so one unavailable package cannot block the rest")
+    done, failed = [], []
+    for pkg in pkgs:
+        try:
+            x.run(*_sudo([*base, pkg]), live=True)
+            done.append(pkg)
+        except Fatal:
+            failed.append(pkg)
+    if done:
+        x.ok(f"installed: {' '.join(done)}")
+    if failed:
+        x.warn(f"could not install: {' '.join(failed)} — "
+               "./build_iso.py doctor says whether that actually blocks a build")
+
+
+def install_host_packages(x: Ctx, fam: str, ce: str) -> None:
+    """Install one real package per capability, and say what it could not."""
+    install, unavailable, probed = resolve_host_packages(x, fam, ce)
+    for gap in unavailable:
+        x.warn(f"no package on this host for {gap} — skipping it rather than "
+               "failing the whole install")
+    install_packages(x, fam, install, batch=probed)
 
 
 def setup_host(x: Ctx) -> int:
     x.phase("setup-host", "install and configure the build host")
-    fam = host_family()
+    d = host_distro()
+    fam = d.family
     if fam == "unknown":
-        raise Fatal("unsupported host: need apt-get (Debian/Ubuntu) or dnf (Fedora)")
+        raise Fatal(f"unsupported build host: {d.described()}.\n"
+                    "     qubes-builderv2 ships dependency lists for Debian and\n"
+                    "     Fedora families only, and this needs apt-get or dnf.")
+    x.info(f"build host: {d.described()}  [detected via {d.how}]")
+    # Before the plan names a directory to create and a virtualenv to put
+    # inside it.
+    resolve_work_dir(x, fatal=False)
     ce = x.c["container_engine"]
     plan: list[list[str]] = []
 
-    pkgs = DEB_PACKAGES if fam == "debian" else RPM_PACKAGES
-    missing_tools = [t for t in ("git", "curl", "gpg", "rsync", ce)
-                     if not shutil.which(t)]
-    if missing_tools:
+    # Resolved once: it decides both whether the package step has something to
+    # fetch for the kickstart validator and whether the virtualenv step is
+    # listed at all. The virtualenv step re-checks and does nothing if the
+    # package install satisfied it, so a Fedora host uses its own package.
+    need_ks = not kickstart_python(x)[0]
+    gaps = host_gaps(ce, need_ks)
+    if gaps:
+        x.info("missing on this host: " + ", ".join(gaps))
         if fam == "debian":
             plan.append(_sudo(["apt-get", "update"]))
-            plan.append(_sudo(["apt-get", "install", "-y", *pkgs]))
-        else:
-            plan.append(_sudo(["dnf", "install", "-y", *pkgs]))
+        plan.append(["__packages__", fam, ce])
 
     if ce == "docker":
         plan.append(_sudo(["systemctl", "enable", "--now", "docker"]))
@@ -2184,10 +2760,25 @@ def setup_host(x: Ctx) -> int:
         if user and "docker" not in groups:
             plan.append(_sudo(["usermod", "-aG", "docker", user]))
 
+    # pykickstart is not packaged on every distribution, and where it is not
+    # the only way to have it is a virtualenv and a download from PyPI. That
+    # is a network install of third-party code: it belongs in the plan the
+    # operator approves, not quietly after it. Listed conditionally because
+    # the package install above may still provide it — ensure_pykickstart
+    # re-checks and does nothing if it did.
+    # Before the virtualenv that goes inside it, so the plan reads in the
+    # order it runs. Only when it is actually absent: appending it
+    # unconditionally made the "nothing to do — the host is already set up"
+    # branch below unreachable, so a fully prepared host was still asked to
+    # approve a plan.
+    if not x.work.is_dir():
+        plan.append(["__mkdir__", str(x.work)])
+
+    if need_ks:
+        plan.append(["__pykickstart__"])
+
     if in_qube():
         plan.append(["__bind_dirs__"])
-
-    plan.append(["__mkdir__", str(x.work)])
 
     if not plan:
         x.ok("nothing to do — the host is already set up")
@@ -2198,6 +2789,22 @@ def setup_host(x: Ctx) -> int:
         if cmd[0] == "__bind_dirs__":
             print("      write /rw/config/qubes-bind-dirs.d/50_docker.conf "
                   "(persist /var/lib/docker across reboots)")
+        elif cmd[0] == "__packages__":
+            mgr = "apt-get" if cmd[1] == "debian" else "dnf"
+            print(f"      {mgr} install -y  — one package per capability below,")
+            for purpose, cands in host_package_plan(cmd[1], cmd[2]):
+                print(f"          {purpose}: {' or '.join(cands)}")
+            print("        whichever of each line this host actually has; "
+                  "anything it has none of is reported and skipped")
+        elif cmd[0] == "__pykickstart__":
+            print("      IF no package on this host provides pykickstart:")
+            print(f"          python3 -m venv {kickstart_venv(x)}")
+            print("          then, inside it:  pip install pykickstart   "
+                  "(downloaded from PyPI)")
+            print("        it validates the generated kickstart BEFORE the "
+                  "build. Decline and the")
+            print("        build still runs — the same thing is confirmed "
+                  "afterwards from the ISO.")
         elif cmd[0] == "__mkdir__":
             print(f"      mkdir -p {cmd[1]}")
         else:
@@ -2215,6 +2822,10 @@ def setup_host(x: Ctx) -> int:
             x.ok(f"created {cmd[1]}")
         elif cmd[0] == "__bind_dirs__":
             setup_qube_bind_dirs(x)
+        elif cmd[0] == "__packages__":
+            install_host_packages(x, cmd[1], cmd[2])
+        elif cmd[0] == "__pykickstart__":
+            ensure_pykickstart(x)
         else:
             x.run(*cmd, live=True)
             x.ok(" ".join(cmd[:3]))
@@ -2647,24 +3258,52 @@ def largest_writable_mount(need_gb: int) -> Path | None:
     return best
 
 
+def resolve_work_dir(x: Ctx, fatal: bool = True) -> None:
+    """Turn work_dir "auto" into a real path and re-point everything at it.
+
+    This used to happen only on the build path, so `doctor` and `setup-host`
+    saw the literal string "auto" — a RELATIVE path. `doctor` then measured
+    free space on the current directory and reported "will be created under
+    .", and `setup-host` planned `mkdir -p auto`, creating a directory of that
+    name wherever you happened to be standing. Both are asked, by name, to
+    tell you whether the host is ready; both have to resolve it first.
+
+    `fatal` is False for those two, because a read-only report and a host
+    setup step should say what is wrong rather than abort.
+    """
+    if str(x.c.get("work_dir", "")).lower() != "auto":
+        return
+    need = 250 if int(x.c["tier"]) == 2 else 100
+    mp = largest_writable_mount(need)
+    if mp is None and not fatal:
+        # Nothing is big enough. Still resolve somewhere real, so the report
+        # that follows is about a filesystem rather than about "auto".
+        mp = largest_writable_mount(0)
+        if mp is not None:
+            x.warn(f"work_dir is 'auto' and no writable filesystem has {need}G "
+                   f"free — reporting against the largest one, {mp}")
+    if mp is None:
+        if not fatal:
+            x.warn("work_dir is 'auto' and no writable filesystem could be "
+                   "found to resolve it against")
+            return
+        raise Fatal(f"work_dir is 'auto' but no writable filesystem has "
+                    f"{need}G free. Point it somewhere explicitly:\n"
+                    f"     ./build_iso.py --set work_dir=/path/with/space")
+    chosen = mp / "investigator-iso"
+    x.c["work_dir"] = str(chosen)
+    x.work = chosen
+    x.builder = chosen / "qubes-builderv2"
+    x.component = chosen / "qubes-template-investigator"
+    x.out_dir = chosen / "output"
+    x.log = chosen / "build.log"
+    x.state = chosen / ".state"
+    x.info(f"work_dir resolved to {chosen} ({_free_gb(mp)}G free)")
+
+
 def resolve_auto_values(x: Ctx) -> None:
     """Derive the settings the guide used to make the operator match by hand."""
-    if str(x.c.get("work_dir", "")).lower() == "auto":
-        need = 250 if int(x.c["tier"]) == 2 else 100
-        mp = largest_writable_mount(need)
-        if mp is None:
-            raise Fatal(f"work_dir is 'auto' but no writable filesystem has "
-                        f"{need}G free. Point it somewhere explicitly:\n"
-                        f"     ./build_iso.py --set work_dir=/path/with/space")
-        chosen = mp / "investigator-iso"
-        x.c["work_dir"] = str(chosen)
-        x.work = chosen
-        x.builder = chosen / "qubes-builderv2"
-        x.component = chosen / "qubes-template-investigator"
-        x.out_dir = chosen / "output"
-        x.log = chosen / "build.log"
-        x.state = chosen / ".state"
-        x.info(f"work_dir resolved to {chosen} ({_free_gb(mp)}G free)")
+    resolve_work_dir(x)
     if str(x.c.get("mock_config", "")).lower() in ("", "auto"):
         rel = str(x.c["qubes_release"]).lstrip("rR")
         # The Mock chroot must match the HOST distribution of the Qubes release,
@@ -2672,11 +3311,24 @@ def resolve_auto_values(x: Ctx) -> None:
         # rather than guessing; fall back to the release's known host.
         derived = mock_config_from_builder(x) or {"4.3": "fedora-41-x86_64",
                                                   "4.2": "fedora-37-x86_64"}.get(rel)
-        if not derived:
+        if derived:
+            x.c["mock_config"] = derived
+            x.info(f"mock_config derived as {derived}")
+        elif not shutil.which("mock"):
+            # Only the mock branch of tools/generate-container-image.sh reads
+            # this value, and that branch is taken only when mock is on the
+            # host. Failing the whole run over a value about to be discarded
+            # made a release this script has no fallback for unbuildable on
+            # exactly the hosts — Debian, Kali — where mock does not exist.
+            # mock_config is left as "auto" rather than blanked: nothing reads
+            # it on this path, and a later run on a host that HAS mock derives
+            # it properly.
+            x.info(f"no mock_config for Qubes {rel}, but mock is not installed "
+                   "here, so the container image is built from the pinned "
+                   "Fedora image and does not need one")
+        else:
             raise Fatal(f"cannot derive mock_config for Qubes {rel}. "
                         f'Set it explicitly:  ./build_iso.py --set mock_config=fedora-NN-x86_64')
-        x.c["mock_config"] = derived
-        x.info(f"mock_config derived as {derived}")
 
 
 def mock_config_from_builder(x: Ctx) -> str | None:

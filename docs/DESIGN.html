@@ -239,7 +239,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
   <tr><td class="qn" style="border-left-color:var(--z-orange)">tpl-proxy, tpl-ids</td><td class="ok">Debian 13</td><td>Cloned from <code>debian-13-xfce</code></td></tr>
   <tr><td class="qn" style="border-left-color:var(--z-yellow)">tpl-kali, tpl-personal, tpl-wazuh</td><td class="ok">Debian 13</td><td>Cloned from <code>debian-13-xfce</code></td></tr>
   <tr><td class="qn" style="border-left-color:var(--z-purple)">sys-whonix, anon-whonix, kali-tor</td><td class="ok">Debian 13</td><td>Whonix 18 is built on Debian trixie</td></tr>
-  <tr><td class="qn" style="border-left-color:var(--z-gray)">ISO build host</td><td class="ok">Debian 13 preferred</td><td>Fedora also supported by qubes-builderv2</td></tr>
+  <tr><td class="qn" style="border-left-color:var(--z-gray)">ISO build host</td><td class="ok">Debian 13 preferred</td><td>Any Debian-family host (Kali, Ubuntu) or Fedora. Unrelated to the Kali template above: the build host contributes nothing to the image</td></tr>
 </table></div>
 
 <h3>Why Debian service qubes are safe</h3>
@@ -793,7 +793,7 @@ deb [<span class="hl">signed-by=/usr/share/keyrings/kali-archive-keyring.gpg</sp
 <p>Zeek is not in Debian main; upstream ships binaries through the openSUSE Build Service, and Zeek state plainly that OBS signs these packages outside the Zeek project's control. Their documentation also warns that on Debian you must re-add the key manually when it expires. That belongs on the monthly checklist: an expired key silently stops Zeek updates, and a DPI recorder that quietly goes stale is worse than one that fails loudly.</p>
 
 <h2 id="deploy"><span class="num">13</span>Deployment</h2>
-<p class="section-note">Two Python 3 scripts, standard library only — which matters because dom0 has no network by design. Both embed their configuration and write it as JSON on first run, never overwriting your edits.</p>
+<p class="section-note">Two Python 3 scripts. <code>golden_image.py</code> is standard library only — which matters because dom0 has no network by design. <code>build_iso.py</code> runs on a networked build host and uses PyYAML, plus pykickstart where the build host can provide it. Both embed their configuration and write it as JSON on first run, never overwriting your edits.</p>
 <div class="tw"><table>
   <tr><th>Script</th><th>Runs on</th><th>Purpose</th></tr>
   <tr><td class="qn zc-green">golden_image.py</td><td><strong>dom0</strong>, each laptop</td><td>Twelve phases: templates, chain, SIEM, segmentation, backups, acceptance tests. Resumable.</td></tr>

@@ -256,6 +256,76 @@ fallbacks for a missing tool or an upstream layout change.
 - qubes-issues #9056 is Closed as not planned and labelled `R: declined`; it was
   cited as "the working pattern". Its value is the ordering fact, nothing more.
 
+**Build hosts — Debian-family support, which had never actually worked**
+
+The image version is unchanged: none of this alters what is built, only what can
+build it. Verified 2026-09-09 against upstream `qubes-builderv2`,
+packages.debian.org, pkg.kali.org and mdapi.fedoraproject.org.
+
+- The container image build passed the Mock chroot to upstream's
+  `tools/generate-container-image.sh` as a positional argument, and that
+  argument selects a `sudo mock -r … --scrub=all` code path. `mock` was dropped
+  from Debian in 2019 and is in no Debian or Kali suite; the script runs under
+  `set -ex` and the call had the default `check=True`. **The build cage image
+  therefore could not be built on any Debian-family host — including the
+  Debian 13 host the guide recommends.** The argument is now passed only when
+  `mock` is actually installed, so Fedora keeps upstream's preferred path and
+  Debian-family hosts build from `dockerfiles/fedora.Dockerfile`, which needs
+  nothing but the container engine. Both branches of that script tag the same
+  `qubes-builder-fedora` tag. The two images are not identical — one is seeded
+  from a digest-pinned Fedora image, the other from a chroot built on the host
+  — but that tag is the only name anything in qubes-builderv2 looks for.
+- `setup-host`'s Debian package list contained `python3-pykickstart`, which was
+  removed from Debian in August 2019 and has never been in Kali. `apt-get
+  install -y` fails the whole batch on one unknown name, so `setup-host` died
+  on a fresh Debian-family host before installing anything.
+- The package install was gated on five binaries. On a host that already had
+  them, nothing was installed at all — so `python3-yaml` stayed missing and
+  `doctor` blocked on it with the fix `./build_iso.py setup-host`, which had
+  just decided there was nothing to do. The gate now covers Python modules and
+  the ISO reader as well as binaries.
+- `doctor --fix` built its argv without the script path, so every repair ran as
+  `python3 setup-host` and failed with "can't open file". It could never fix
+  anything, on any host.
+- Package names are no longer hardcoded per distribution. Each requirement
+  names several candidates and the package manager is asked which exist
+  (`apt-cache policy`, `dnf list` plus a `repoquery --whatprovides` pass so a
+  virtual provide is not mistaken for an absent package). Anything a
+  distribution has no package for at all is reported and skipped instead of
+  failing the batch. This is what fixed the class rather than the instances —
+  the Fedora list had the same defect, asking for `docker`, which is not a
+  Fedora binary package name.
+- The build host is identified from `/etc/os-release` rather than guessed from
+  which package manager is on `$PATH`. Three code paths guessed, two of them in
+  opposite orders. Kali, Ubuntu and Mint are now recognised as Debian-family
+  **and named**: `doctor` prints "Kali GNU/Linux Rolling (debian-family)".
+- `pykickstart` is not packaged for Debian or Kali, so `setup-host` installs it
+  into a virtualenv under `work_dir` — not with `--break-system-packages`,
+  which would override PEP 668 on the operator's behalf. When that is not
+  possible `doctor` says the kickstart is validated after the build instead,
+  rather than repeating a fix that cannot work.
+- `resolve_auto_values` raised `Fatal` for an underivable `mock_config` even on
+  hosts where the value is then discarded unused.
+- New `tests/host_checks.py`, wired into the harness, the Makefile and CI. It
+  pins each of the above against a dated ledger of packages verified absent
+  from each distribution, probes this host's real package manager (with a
+  control at both ends, so a broken probe cannot pass silently), and checks
+  that `doctor --fix` invokes a script path that exists. It reports what it
+  could not exercise — the other family's package names, on a one-distribution
+  CI runner — rather than letting a green run imply more than it covered.
+  Every fix was mutation-tested: re-introducing each bug fails the suite.
+
+- `doctor` now checks the build host is x86-64. The docs called that the one
+  real hardware requirement and nothing tested it, so an ARM VM would have got
+  hours in before failing.
+
+**Not verified on real hardware.** None of this has been run against a live
+Kali VM or a real Qubes 4.3.1 build, on any distribution. The upstream facts
+and package availability are checked against primary sources; the host
+detection, package resolution and the pykickstart virtualenv are exercised
+against a real apt archive on a Debian-family host; the ISO build itself
+remains untested end to end.
+
 ## 2.1 — 2026-09-01
 
 Verification pass against primary sources. Six defects found and fixed, three of
