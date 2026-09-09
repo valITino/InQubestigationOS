@@ -14,11 +14,12 @@ jobs:
     name: fake-dom0 harness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install review tools
         run: python3 -m pip install -r requirements-dev.txt
       # host_checks asks apt-cache about every package in the build-host plan.
@@ -53,7 +54,7 @@ jobs:
     container:
       image: fedora:43
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Python
         run: dnf install -y python3
       - name: Check Fedora packages against live DNF repositories
@@ -65,8 +66,8 @@ jobs:
     # Network-dependent: informational on a normal push, blocking on schedule.
     continue-on-error: ${{ github.event_name != 'schedule' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Compare pinned keys and versions against upstream
@@ -81,7 +82,7 @@ jobs:
           fi
       - name: Upload the refreshed baseline
         if: github.event_name == 'schedule'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain-lock
           path: supply-chain.lock.json

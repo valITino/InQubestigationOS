@@ -622,6 +622,11 @@ def check_ci_covers_both_families() -> None:
           and "run: ./tests/host_checks.py" in ubuntu_job,
           "the normal Ubuntu host check is missing")
     if ubuntu_job:
+        check("setup-python caches against the review dependency file",
+              "cache: pip" in ubuntu_job
+              and "cache-dependency-path: requirements-dev.txt" in ubuntu_job,
+              "setup-python otherwise searches only requirements.txt or "
+              "pyproject.toml and fails before any tests run")
         universe = ubuntu_job.find("add-apt-repository --yes universe")
         apt_update = ubuntu_job.find("sudo apt-get update")
         harness = ubuntu_job.find("run: ./tests/run_tests.py")
@@ -643,6 +648,11 @@ def check_ci_covers_both_families() -> None:
         check("the Fedora job runs the complete host-check suite",
               "python3 ./tests/host_checks.py" in fedora_job,
               "Fedora starts, but host_checks.py is not executed there")
+    for action in ("checkout", "setup-python", "upload-artifact"):
+        old = re.findall(rf"actions/{action}@v([1-6])\b", workflow)
+        check(f"actions/{action} does not use a deprecated Node runtime",
+              not old,
+              f"found major version(s) {', '.join(old)}; use the Node 24-based v7")
 
 
 def check_no_hardcoded_lists() -> None:
