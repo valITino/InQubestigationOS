@@ -12,7 +12,7 @@ with no network and configures itself on first boot.
                               ┌─────┴─────┐
                               │  sys-net  │  red · NIC · untrusted
                               └─────▲─────┘
-                              ┌─────┴─────┐
+                              ┌─────┴──────┐
                               │sys-firewall│ orange · DNS → 9.9.9.9 over TLS
                               └──▲──────▲──┘
                      ┌───────────┘      └──────────┐
