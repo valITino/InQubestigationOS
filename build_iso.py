@@ -238,11 +238,22 @@ class Ctx:
         except OSError:
             pass
 
-    def say(self, m=""):  print(m); self._log(m)
-    def info(self, m):    print(f"  {D}{m}{RST}"); self._log(f"INFO  {m}")
-    def ok(self, m):      print(f"  {G}\u2713{RST} {m}"); self._log(f"OK    {m}")
+    def say(self, m=""):
+        print(m)
+        self._log(m)
+
+    def info(self, m):
+        print(f"  {D}{m}{RST}")
+        self._log(f"INFO  {m}")
+
+    def ok(self, m):
+        print(f"  {G}\u2713{RST} {m}")
+        self._log(f"OK    {m}")
+
     def skip(self, m):    print(f"  {D}\u00b7{RST} {m} {D}(done){RST}")
-    def warn(self, m):    print(f"  {Y}!{RST} {m}"); self._log(f"WARN  {m}")
+    def warn(self, m):
+        print(f"  {Y}!{RST} {m}")
+        self._log(f"WARN  {m}")
 
     def verify(self, m):
         print(f"  {Y}?{RST} {Y}[VERIFY] {m}{RST}")
@@ -668,7 +679,7 @@ def bootstrap(x: Ctx, args) -> int:
     print("\n  This runs, stopping at the first failure:\n")
     for i, (name, why, argv) in enumerate(steps, start=1):
         print(f"    {i}. {name:15s} {why}")
-    print(f"""
+    print("""
   Each is resumable and each is idempotent, so if one fails you can fix the
   cause and run bootstrap again — the completed ones are skipped.
 
@@ -2219,8 +2230,8 @@ def doctor(x: Ctx) -> int:
                        "./build_iso.py --set work_dir=/path/with/space"))
 
     try:
-        kb = int(next(l for l in Path("/proc/meminfo").read_text().splitlines()
-                      if l.startswith("MemTotal")).split()[1])
+        kb = int(next(line for line in Path("/proc/meminfo").read_text().splitlines()
+                      if line.startswith("MemTotal")).split()[1])
         gb = kb // 1024 // 1024
         c.append(Check("RAM", OK if gb >= 8 else WARN, f"{gb}G",
                        "builds can OOM below 8G"))
@@ -2311,12 +2322,12 @@ def doctor(x: Ctx) -> int:
 
     rc = _print_checks(x, c)
     if rc == 0:
-        print(f"\n  Ready. Next:  ./build_iso.py --dry-run all\n")
+        print("\n  Ready. Next:  ./build_iso.py --dry-run all\n")
         return 0
 
     if not getattr(x.args, "fix", False):
-        print(f"\n  ./build_iso.py doctor --fix   runs the fixes above that this "
-              f"script owns.\n")
+        print("\n  ./build_iso.py doctor --fix   runs the fixes above that this "
+              "script owns.\n")
         return rc
 
     # Only this script's own subcommands, and only for blocking rows. Nothing
@@ -2903,8 +2914,8 @@ def gen_key(x: Ctx) -> int:
         # Exactly one signing key in this keyring and no identity given: adopting
         # it is the only thing the operator can have meant.
         fpr = have[0][0]
-        x.info(f"one secret key in this keyring — adopting it rather than making "
-               f"a second")
+        x.info("one secret key in this keyring — adopting it rather than making "
+               "a second")
         return _adopt_key(x, fpr)
     if not uid:
         raise Fatal('gen-key needs an identity:\n'
@@ -3443,7 +3454,11 @@ def check_upstream(x: Ctx) -> int:
     try:
         blob = _fetch(k["keyring_url"])
         import hashlib
-        sha1 = hashlib.sha1(blob).hexdigest()
+        # Kali publishes this legacy digest as an advisory file-identity
+        # value. Trust comes from the full GPG fingerprint checked below, not
+        # from SHA-1; tell security tooling that this is not a cryptographic
+        # use rather than hiding the scan finding.
+        sha1 = hashlib.sha1(blob, usedforsecurity=False).hexdigest()
         keys = _gpg_scan(blob)
         fprs = [key["fpr"] for key in keys]
         seen["kali"] = {"key_fpr": k["key_fpr"], "fingerprints": fprs,
@@ -3880,7 +3895,7 @@ if ($Fpr -and $signer -ne $Fpr) {{
     exit 1
 }}
 if ($Expect) {{
-    $e = ($Expect -replace '\s','').ToUpper()
+    $e = ($Expect -replace '\\s','').ToUpper()
     if ($e -eq $signer) {{ Write-Host '  Matches the fingerprint you supplied.' -f Green }}
     else {{
         Write-Host "  Expected:   $e" -f Red
@@ -3927,8 +3942,8 @@ def _mounted_partitions(dev: str) -> list[str]:
         mounts = Path("/proc/mounts").read_text()
     except OSError:
         return []
-    return [l.split()[0] for l in mounts.splitlines()
-            if l.split()[0].startswith(f"/dev/{base}")]
+    return [line.split()[0] for line in mounts.splitlines()
+            if line.split()[0].startswith(f"/dev/{base}")]
 
 
 def write_usb(x: Ctx) -> int:
@@ -4330,7 +4345,7 @@ lifecycle
                 gen_component(x)
                 build_templates(x)
             if args.action == "templates":
-                print(f"\n  Next:  ./build_iso.py iso\n")
+                print("\n  Next:  ./build_iso.py iso\n")
                 return 0
 
         if args.action in ("iso", "all"):

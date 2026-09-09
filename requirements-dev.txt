@@ -1,0 +1,4 @@
+# Review-only tooling. The production scripts retain their documented runtime
+# dependency model; these packages are installed only by CI and contributors.
+bandit==1.9.4
+ruff==0.15.12

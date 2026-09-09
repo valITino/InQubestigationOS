@@ -323,13 +323,24 @@ class Out:
         except OSError:
             pass
 
-    def say(self, m=""):   print(m);                                  self._log(m)
-    def info(self, m):     print(f"  {self.D}{m}{self.RST}");         self._log(f"INFO  {m}")
-    def ok(self, m):       print(f"  {self.G}\u2713{self.RST} {m}");  self._log(f"OK    {m}")
+    def say(self, m=""):
+        print(m)
+        self._log(m)
+
+    def info(self, m):
+        print(f"  {self.D}{m}{self.RST}")
+        self._log(f"INFO  {m}")
+
+    def ok(self, m):
+        print(f"  {self.G}\u2713{self.RST} {m}")
+        self._log(f"OK    {m}")
+
     def skip(self, m):
         print(f"  {self.D}\u00b7{self.RST} {m} {self.D}(already present){self.RST}")
         self._log(f"SKIP  {m}")
-    def warn(self, m):     print(f"  {self.Y}!{self.RST} {m}");       self._log(f"WARN  {m}")
+    def warn(self, m):
+        print(f"  {self.Y}!{self.RST} {m}")
+        self._log(f"WARN  {m}")
 
     def verify(self, m):
         print(f"  {self.Y}?{self.RST} {self.Y}[VERIFY] {m}{self.RST}")
@@ -668,8 +679,8 @@ class Provisioner:
         except OSError:
             pass
         try:
-            kb = int(next(l for l in Path("/proc/meminfo").read_text().splitlines()
-                          if l.startswith("MemTotal")).split()[1])
+            kb = int(next(line for line in Path("/proc/meminfo").read_text().splitlines()
+                          if line.startswith("MemTotal")).split()[1])
             gb = kb // 1024 // 1024
             o.info(f"system RAM: {gb}G")
             if self.c["wazuh"]["mode"] == "auto":
@@ -2140,11 +2151,11 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
             r.quiet("qvm-firewall", vm, "reset")
             o.info(f"{vm}: rules cleared with 'reset'")
             return
-        o.warn(f"this qvm-firewall has no 'reset' subcommand — falling back to "
-               f"deleting rules one at a time")
+        o.warn("this qvm-firewall has no 'reset' subcommand — falling back to "
+               "deleting rules one at a time")
         for _ in range(64):
             listing = r.run("qvm-firewall", vm, "list", check=False, capture=True)
-            rows = [l for l in listing.splitlines()[1:] if l.strip()]
+            rows = [line for line in listing.splitlines()[1:] if line.strip()]
             if not rows:
                 break
             if not r.quiet("qvm-firewall", vm, "del", "--rule-no", "0"):
@@ -2459,7 +2470,6 @@ systemctl start {unit}.mount 2>/dev/null || true
 
     def _install_dom0_timers(self) -> None:
         """Everything GUIDE section 12 listed as a cadence for a human."""
-        o = self.out
         me = Path(sys.argv[0]).resolve()
 
         self._dom0_unit(
@@ -2767,7 +2777,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                "(nothing beacons")
         o.warn("  clearnet from an anonymous context). If a case demands zero linkage, "
                "disable the")
-        o.warn(f"  For a case that demands zero linkage:")
+        o.warn("  For a case that demands zero linkage:")
         o.warn(f"      sudo {Path(sys.argv[0]).name} --case-mode anonymous "
                f"--case <id>")
         o.warn(f"  and --case-mode normal when it closes. Both are recorded in "
@@ -3221,13 +3231,14 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         its key names against ours validates the schema. docs/REVIEW.md listed
         this as something to check by hand with a real backup run.
         """
-        o, r, b = self.out, self.r, self.c["backup"]
+        r, b = self.r, self.c["backup"]
         prof = dom0("/etc/qubes/backup/golden-image.conf")
         if not prof.exists():
             self._t("fail", "backup profile /etc/qubes/backup/golden-image.conf missing")
             return
-        ours = {l.split(":", 1)[0].strip() for l in prof.read_text().splitlines()
-                if ":" in l and not l.startswith(" ")}
+        ours = {line.split(":", 1)[0].strip()
+                for line in prof.read_text().splitlines()
+                if ":" in line and not line.startswith(" ")}
         probe = dom0("/etc/qubes/backup/golden-image-schema-probe.conf")
         made = r.quiet("qvm-backup", "--save-profile", "golden-image-schema-probe",
                        "--dest-vm", b["dest_qube"], b["dest_dir"], "dom0")
@@ -3238,8 +3249,9 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             probe.unlink(missing_ok=True)
             return
         try:
-            ref = {l.split(":", 1)[0].strip() for l in probe.read_text().splitlines()
-                   if ":" in l and not l.startswith(" ")}
+            ref = {line.split(":", 1)[0].strip()
+                   for line in probe.read_text().splitlines()
+                   if ":" in line and not line.startswith(" ")}
             # No exemptions. passphrase_file in particular is the key the
             # admin API is guaranteed to reject, and subtracting it here would
             # have hidden exactly the defect this test exists to catch.
@@ -3686,7 +3698,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         `systemctl list-timers 'golden-*'`, and to know which files to look in
         for the rest. This is those answers in one place.
         """
-        o, r, q = self.out, self.r, self.q
+        r = self.r
         print(f"\n{Out.B}{Out.C}══ {self.c['image_name']} "
               f"v{self.c['image_version']}{Out.RST}\n")
 
@@ -3734,7 +3746,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                             ("first boot", "/var/lib/golden-image/firstboot-status")):
             f = dom0(path)
             if f.exists():
-                tail = [l for l in f.read_text().splitlines() if l.strip()]
+                tail = [line for line in f.read_text().splitlines() if line.strip()]
                 print(f"    {label:14s} {tail[-1][:80] if tail else '(empty)'}")
             else:
                 print(f"    {label:14s} —")
@@ -3917,7 +3929,6 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
     def handover(self):
         if self.args.dry_run:
             return
-        q = self.q
         print(f"\n{Out.B}{Out.C}\u2550\u2550 Handover{Out.RST}")
         me = Path(sys.argv[0]).name
         print(f"""

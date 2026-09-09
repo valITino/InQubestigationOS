@@ -70,6 +70,14 @@ usb:  ## verify the ISO and write it to a removable device (DEVICE=/dev/sdX)
 check:  ## run the whole test suite (no Qubes machine needed)
 	./tests/run_tests.py
 
+.PHONY: lint
+lint:  ## lint all Python code (requires requirements-dev.txt)
+	ruff check .
+
+.PHONY: security
+security:  ## scan Python for high-severity security defects
+	python3 -m bandit -q -lll -r build_iso.py golden_image.py tests
+
 .PHONY: check-docs
 check-docs:  ## check the documentation still matches the code
 	./tests/doc_checks.py
@@ -111,8 +119,10 @@ backup-media:  ## (on the laptop) partition, format and label the backup disk
 	sudo ./golden_image.py --prepare-backup-media
 
 .PHONY: ci
-ci:  ## exactly what .github/workflows/ci.yml runs, locally
+ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
 	python3 -m py_compile golden_image.py build_iso.py
+	ruff check .
+	python3 -m bandit -q -lll -r build_iso.py golden_image.py tests
 	./tests/run_tests.py
 	./tests/host_checks.py
 	./tests/config_checks.py

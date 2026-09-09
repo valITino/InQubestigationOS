@@ -590,10 +590,10 @@ def check_family_neutral_messages() -> None:
 def note_unprobed_family(bi) -> None:
     """Say which family's package names were only checked against the ledger.
 
-    CI runs on one distribution, so the other family's names are verified
-    against KNOWN_ABSENT and nothing else. That is a real limit on what a
-    green run means, and it belongs in the output rather than in a reviewer's
-    head.
+    One process runs on one distribution, so the other family's names are
+    verified against KNOWN_ABSENT in that process. CI runs this suite once on
+    each family, but a standalone run must still state its own coverage rather
+    than silently taking credit for a different job.
     """
     fam = bi.host_distro().family
     other = {"debian": "fedora", "fedora": "debian"}.get(fam)
@@ -601,6 +601,58 @@ def note_unprobed_family(bi) -> None:
         skip(f"live {other} package names",
              f"this host is {fam}-family; {other} names are checked only "
              "against the dated KNOWN_ABSENT ledger")
+
+
+def check_ci_covers_both_families() -> None:
+    """CI must live-query both supported package-manager families."""
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    def job_body(name: str) -> str | None:
+        match = re.search(
+            rf"(?ms)^  {re.escape(name)}:\n"
+            rf"(?P<body>.*?)(?=^  [A-Za-z_][A-Za-z0-9_-]*:\n|\Z)",
+            workflow,
+        )
+        return match.group("body") if match else None
+
+    ubuntu_job = job_body("harness")
+    check("CI runs the Debian-family live package probe on Ubuntu",
+          ubuntu_job is not None
+          and "runs-on: ubuntu-latest" in ubuntu_job
+          and "run: ./tests/host_checks.py" in ubuntu_job,
+          "the normal Ubuntu host check is missing")
+    if ubuntu_job:
+        check("setup-python caches against the review dependency file",
+              "cache: pip" in ubuntu_job
+              and "cache-dependency-path: requirements-dev.txt" in ubuntu_job,
+              "setup-python otherwise searches only requirements.txt or "
+              "pyproject.toml and fails before any tests run")
+        universe = ubuntu_job.find("add-apt-repository --yes universe")
+        apt_update = ubuntu_job.find("sudo apt-get update")
+        harness = ubuntu_job.find("run: ./tests/run_tests.py")
+        check("CI enables Ubuntu universe before probing build-host packages",
+              0 <= universe < apt_update,
+              "docker.io and libarchive-tools are in universe; apt-get update "
+              "cannot expose a repository that is disabled")
+        check("CI refreshes APT metadata before either live package probe",
+              0 <= apt_update < harness,
+              "stale hosted-runner indexes make host_checks fail both inside "
+              "run_tests.py and in its standalone CI step")
+    fedora_job = job_body("fedora-host")
+    check("CI has a dedicated Fedora host-check job", fedora_job is not None,
+          "add a fedora-host job so DNF package availability is tested live")
+    if fedora_job:
+        check("the Fedora host-check job runs in a Fedora container",
+              re.search(r"(?m)^\s+image:\s*fedora:\d+\s*$", fedora_job) is not None,
+              "the fedora-host job has no versioned Fedora container")
+        check("the Fedora job runs the complete host-check suite",
+              "python3 ./tests/host_checks.py" in fedora_job,
+              "Fedora starts, but host_checks.py is not executed there")
+    for action in ("checkout", "setup-python", "upload-artifact"):
+        old = re.findall(rf"actions/{action}@v([1-6])\b", workflow)
+        check(f"actions/{action} does not use a deprecated Node runtime",
+              not old,
+              f"found major version(s) {', '.join(old)}; use the Node 24-based v7")
 
 
 def check_no_hardcoded_lists() -> None:
@@ -663,6 +715,7 @@ def main() -> int:
     check_install_gate(bi)
     check_family_neutral_messages()
     note_unprobed_family(bi)
+    check_ci_covers_both_families()
     check_no_hardcoded_lists()
     check_pykickstart_advice()
 
