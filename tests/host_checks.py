@@ -367,10 +367,26 @@ def check_install_gate(bi) -> None:
               not any(g in ("python3-yaml", "python3-pyyaml") for g in gaps),
               f"{gaps} — this message is printed on both families")
 
+        # The virtualenv the kickstart validator needs on Debian and Kali is
+        # only usable if ensurepip is there — Debian splits it into
+        # python3-venv, and `import venv` succeeds either way, so probing venv
+        # would miss it. Without this the package step never installs
+        # python3-venv unless something ELSE happened to be missing too.
+        bi._have_module = lambda n: n != "ensurepip"
+        check("a missing ensurepip triggers the install when a venv is needed",
+              bi.host_gaps("docker", True) != [],
+              "setup-host would list the virtualenv step and then find it has "
+              "no way to build one")
+        check("a missing ensurepip is not a gap when no venv is needed",
+              bi.host_gaps("docker", False) == [],
+              "a Fedora host, which has a pykickstart package, would be told "
+              "to install packages it does not need")
+
         # A genuinely complete host must still report nothing to do.
         bi._have_module = lambda n: True
-        check("a host with everything reports no gaps", bi.host_gaps("docker") == [],
-              str(bi.host_gaps("docker")))
+        check("a host with everything reports no gaps",
+              bi.host_gaps("docker", True) == [],
+              str(bi.host_gaps("docker", True)))
     finally:
         bi.shutil.which, bi._have_module = real_which, real_mod
 

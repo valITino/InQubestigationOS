@@ -2649,7 +2649,7 @@ def _have_module(name: str) -> bool:
         return False
 
 
-def host_gaps(ce: str) -> list[str]:
+def host_gaps(ce: str, need_venv: bool = False) -> list[str]:
     """Everything the build host is missing that a package can supply.
 
     This used to probe five binaries and nothing else, so on a host that
@@ -2667,6 +2667,13 @@ def host_gaps(ce: str) -> list[str]:
         gaps.append("PyYAML")
     if not iso_reader():
         gaps.append("an ISO reader (bsdtar/7z/isoinfo/xorriso)")
+    # Debian-family distributions split ensurepip out of python3 and into
+    # python3-venv, and without it `python3 -m venv` produces an environment
+    # with no pip. `venv` itself imports fine either way, so it is not the
+    # thing to probe. Only a gap when a virtualenv is actually going to be
+    # built — which is only where the distribution has no pykickstart package.
+    if need_venv and not _have_module("ensurepip"):
+        gaps.append("ensurepip, for the kickstart validator's virtualenv")
     return gaps
 
 
@@ -2730,7 +2737,10 @@ def setup_host(x: Ctx) -> int:
     ce = x.c["container_engine"]
     plan: list[list[str]] = []
 
-    gaps = host_gaps(ce)
+    # Resolved once: it decides both whether the package step needs to supply
+    # ensurepip and whether the virtualenv step is listed at all.
+    need_venv = not kickstart_python(x)[0]
+    gaps = host_gaps(ce, need_venv)
     if gaps:
         x.info("missing on this host: " + ", ".join(gaps))
         if fam == "debian":
@@ -2754,7 +2764,7 @@ def setup_host(x: Ctx) -> int:
     # order it runs.
     plan.append(["__mkdir__", str(x.work)])
 
-    if not kickstart_python(x)[0]:
+    if need_venv:
         plan.append(["__pykickstart__"])
 
     if in_qube():

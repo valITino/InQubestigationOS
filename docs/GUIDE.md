@@ -83,7 +83,9 @@ neither is fatal:**
   `mock` is actually installed rather than on which distribution you are on.
 - **`pykickstart`** was removed from Debian in August 2019 and has never been
   in Kali. It is only used to parse the generated kickstart *before* the
-  build. `setup-host` installs it into a virtualenv under `work_dir` instead;
+  build. `setup-host` offers to install it into a virtualenv under `work_dir`
+  instead — the plan shows that step, and the PyPI download it involves,
+  before you agree to it, and it pulls in `python3-venv` if that is missing;
   if that is not possible — no network, say — the build still runs and the
   same question is answered afterwards, by confirming the template RPMs are
   present in the finished ISO. `doctor` says which of the two is in effect.
