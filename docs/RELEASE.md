@@ -47,7 +47,12 @@ builds an ISO; it is not, and must not be described as, running Qubes in VMware.
 ## One build entry point
 
 Review a commit, place its full SHA in `TRUSTED_BUILD_REF`, then dispatch using
-that exact SHA and type `BUILD_TIER2_RELEASE_CANDIDATE`. For an equivalent
+that exact SHA and type `BUILD_TIER2_RELEASE_CANDIDATE`. The job-level condition
+checks the manual trigger, default branch and confirmation without consulting an
+environment-scoped variable. After `production-build` approval, the first step
+requires both the input and environment `TRUSTED_BUILD_REF` to be non-empty full
+40-hex SHAs and equal; it runs before checkout, secret materialization, or any
+repository code. For an equivalent
 owner-controlled invocation on the runner:
 
 ```bash

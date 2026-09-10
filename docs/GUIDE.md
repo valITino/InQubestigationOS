@@ -189,7 +189,8 @@ Rufus does not verify the image, so verify it on Windows first. The build writes
 a PowerShell script beside the ISO for exactly this:
 
 ```powershell
-.erify-iso.ps1 <the fingerprint you were given out of band>
+.\verify-iso.ps1 <the fingerprint you were given out of band>
+erify-iso.ps1 <the fingerprint you were given out of band>
 ```
 
 # The administrator mounts the removable backup filesystem first. Merely
@@ -507,6 +508,10 @@ It checks the checksum, imports the key, verifies the signature, and then prints
   --set install.disk=/dev/disk/by-id/wwn-0x5002538d00000000
 ```
 
+`wwn-0x5002538d00000000` is an example only. Record the actual stable identifier
+from the Qubes target machine and use that exact value for its image; never copy
+the example or derive the value from the build host.
+
 It is **off by default** on purpose. The disk value is a stable identity read
 from the laptop being installed (use the exact `/dev/disk/by-id/` or
 `/dev/disk/by-path/` link recorded for that machine), not `/dev/sda` or the
@@ -527,8 +532,9 @@ neighbor. Per-machine credentials are still generated only after installation.
    target; a mismatch stops before partitioning.
 3. Enroll the machine's unique LUKS passphrase when Anaconda asks. No shared
    passphrase is embedded and encryption cannot be disabled in unattended mode.
-4. The installer completes and reboots. `install.auto_initial_setup` (on by default) means the first-boot
-Provisioning starts automatically. On a Tier 2 image the required packages and
+4. The installer completes and reboots. `install.auto_initial_setup` (on by
+   default) means the first-boot runner completes Qubes' own initial setup
+   non-interactively, and retries
 templates are already on disk, so installation and local provisioning do not
 need a repository download. This is **not** a claim that online acceptance has
 passed: first boot runs local/offline checks and records DNS resolution and Tor

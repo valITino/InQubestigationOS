@@ -26,16 +26,39 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      inputs.confirmation == 'BUILD_TIER2_RELEASE_CANDIDATE' &&
-      inputs.trusted_commit == vars.TRUSTED_BUILD_REF
+      inputs.confirmation == 'BUILD_TIER2_RELEASE_CANDIDATE'
     environment: production-build
     runs-on: [self-hosted, linux, x64, inqubestigation-trusted-build]
     timeout-minutes: 1440
     steps:
+      # Environment variables exist only after the protected environment has
+      # approved and started this job. Validate before checkout, secrets, or
+      # any code from the requested revision can execute.
+      - name: Validate the environment-approved immutable commit
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ inputs.trusted_commit }}
+          APPROVED_SHA: ${{ vars.TRUSTED_BUILD_REF }}
+        run: |
+          set -eu
+          sha_pattern='^[0-9a-fA-F]{40}$'
+          if ! [[ "${REQUESTED_SHA:-}" =~ $sha_pattern ]]; then
+            echo 'trusted_commit must be a non-empty full 40-hex commit SHA' >&2
+            exit 1
+          fi
+          if ! [[ "${APPROVED_SHA:-}" =~ $sha_pattern ]]; then
+            echo 'production-build TRUSTED_BUILD_REF must be a non-empty full 40-hex commit SHA' >&2
+            exit 1
+          fi
+          if [[ "${REQUESTED_SHA,,}" != "${APPROVED_SHA,,}" ]]; then
+            echo 'requested commit does not match production-build TRUSTED_BUILD_REF' >&2
+            exit 1
+          fi
+          echo "TRUSTED_SHA=${REQUESTED_SHA,,}" >> "$GITHUB_ENV"
       - name: Check out only the environment-approved immutable commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.trusted_commit }}
+          ref: ${{ env.TRUSTED_SHA }}
           fetch-depth: 1
           persist-credentials: false
           clean: true
