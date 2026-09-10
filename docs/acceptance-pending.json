@@ -1,0 +1,104 @@
+{
+  "checks": {
+    "backup_media_absent": {
+      "description": "Backup operation fails observably when media is absent",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "changed_credentials": {
+      "description": "Changed credentials invalidate prior escrow and prevent shredding",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "credential_handover": {
+      "description": "Credential rotation, verified escrow and dom0-copy removal",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "golden_verify": {
+      "description": "golden-image-provision --verify acceptance suite",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "initial_setup_recovery_reboot": {
+      "description": "Initial setup, interrupted provisioning, recovery and reboot",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "inspected_path_fail_closed": {
+      "description": "Complete inspected path and Suricata fail-closed behavior",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "installation_encryption": {
+      "description": "Installation and unique per-machine LUKS enrollment",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "maintenance_failures": {
+      "description": "Maintenance failures reach systemd and status output",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "real_isolated_restore": {
+      "description": "Encrypted backup fully restored into an isolated destination",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "repository_key_mismatch": {
+      "description": "Repository-key mismatch rolls back and fails",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "services_and_agent_identity": {
+      "description": "Squid, Suricata, Zeek, Wazuh and distinct agent identities",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "tor_and_offline_qubes": {
+      "description": "Tor routing and offline-qube isolation (not an anonymity guarantee)",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    },
+    "wazuh_upgrade_order": {
+      "description": "Wazuh manager upgrades before all agents",
+      "evidence": "not executed on an authorized Qubes spare",
+      "status": "pending"
+    }
+  },
+  "created_utc": "2026-09-10T08:43:23.314476+00:00",
+  "hardware": {},
+  "image": {
+    "path": null,
+    "sha256": null
+  },
+  "kind": "Qubes hardware acceptance",
+  "logs": {},
+  "platform": {},
+  "provisioning": {},
+  "release_status": "release-candidate-not-hardware-verified",
+  "repository_revision": "d2337ca779a88c2be0a5f272be6a89baa9a5488c",
+  "schema": 1,
+  "summary": {
+    "fail": 0,
+    "failures": [],
+    "pass": 0,
+    "pending": 13,
+    "pending_checks": [
+      "installation_encryption",
+      "initial_setup_recovery_reboot",
+      "inspected_path_fail_closed",
+      "tor_and_offline_qubes",
+      "services_and_agent_identity",
+      "credential_handover",
+      "real_isolated_restore",
+      "backup_media_absent",
+      "changed_credentials",
+      "repository_key_mismatch",
+      "wazuh_upgrade_order",
+      "maintenance_failures",
+      "golden_verify"
+    ]
+  },
+  "updated_utc": "2026-09-10T08:43:23.314500+00:00"
+}

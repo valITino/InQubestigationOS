@@ -8,6 +8,7 @@ SHELL := /bin/bash
 
 UID ?= Investigator Image Signing <cyber@example.invalid>
 DEVICE ?=
+RC_ARGS ?=
 
 .PHONY: help
 help:  ## show this help
@@ -61,6 +62,17 @@ iso:  ## build, checksum and sign the ISO
 all-build:  ## templates, then the ISO
 	./build_iso.py all
 
+.PHONY: release-candidate
+release-candidate:  ## trusted host: preflight, build, verify and stage an RC (RC_ARGS=...)
+	./release_candidate.py $(RC_ARGS)
+
+.PHONY: acceptance-pending acceptance-collect
+acceptance-pending:  ## create a pending report off-Qubes (REPORT=... IMAGE=...)
+	./acceptance_runner.py --report "$(or $(REPORT),acceptance-report.json)" \
+		--revision "$$(git rev-parse HEAD)" $(if $(IMAGE),--image "$(IMAGE)",) --prepare-pending
+acceptance-collect:  ## authorized Qubes dom0 only: collect safe automated evidence
+	sudo ./acceptance_runner.py --report "$(or $(REPORT),acceptance-report.json)" --collect
+
 .PHONY: usb
 usb:  ## verify the ISO and write it to a removable device (DEVICE=/dev/sdX)
 	./build_iso.py write-usb $(if $(DEVICE),--device $(DEVICE),)
@@ -69,6 +81,10 @@ usb:  ## verify the ISO and write it to a removable device (DEVICE=/dev/sdX)
 .PHONY: check
 check:  ## run the whole test suite (no Qubes machine needed)
 	./tests/run_tests.py
+	./tests/orchestration_checks.py
+	./tests/install_path_checks.py
+	./tests/release_checks.py
+	./tests/acceptance_checks.py
 
 .PHONY: lint
 lint:  ## lint all Python code (requires requirements-dev.txt)
@@ -76,7 +92,7 @@ lint:  ## lint all Python code (requires requirements-dev.txt)
 
 .PHONY: security
 security:  ## scan Python for high-severity security defects
-	python3 -m bandit -q -lll -r build_iso.py golden_image.py tests
+	python3 -m bandit -q -lll -r build_iso.py golden_image.py release_candidate.py acceptance_runner.py tests
 
 .PHONY: check-docs
 check-docs:  ## check the documentation still matches the code
@@ -120,10 +136,14 @@ backup-media:  ## (on the laptop) partition, format and label the backup disk
 
 .PHONY: ci
 ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
-	python3 -m py_compile golden_image.py build_iso.py
+	python3 -m py_compile golden_image.py build_iso.py release_candidate.py acceptance_runner.py
 	ruff check .
-	python3 -m bandit -q -lll -r build_iso.py golden_image.py tests
+	python3 -m bandit -q -lll -r build_iso.py golden_image.py release_candidate.py acceptance_runner.py tests
 	./tests/run_tests.py
+	./tests/orchestration_checks.py
+	./tests/install_path_checks.py
+	./tests/release_checks.py
+	./tests/acceptance_checks.py
 	./tests/host_checks.py
 	./tests/config_checks.py
 	./tests/doc_checks.py
