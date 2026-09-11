@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
-import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -121,20 +118,26 @@ def main():
         x.c["tier"] = 1
         assert not x.done("templates")
 
-        # Bootstrap applies --set before Ctx derives work/output paths and
-        # persists it even when the later root safety gate blocks this test.
-        sandbox = Path(td) / "override"
-        sandbox.mkdir()
-        shutil.copy2(ROOT / "build_iso.py", sandbox / "build_iso.py")
-        shutil.copy2(ROOT / "bootstrap_workflow.py", sandbox / "bootstrap_workflow.py")
+        # Bootstrap applies --set before Ctx derives work/output paths. Mock
+        # only the expensive dispatcher: relying on the caller being root made
+        # this regression test pass locally but fail on non-root CI runners.
+        config = Path(td) / "override-config.json"
         chosen = Path(td) / "chosen work"
-        result = subprocess.run([
-            sys.executable, str(sandbox / "build_iso.py"), "bootstrap",
-            "--set", f"work_dir={chosen}", "--yes"], cwd=sandbox,
-            capture_output=True, text=True)
-        assert result.returncode == 1 and "non-root build user" in result.stderr
-        saved = json.loads((sandbox / "iso-build.json").read_text())
-        assert saved["work_dir"] == str(chosen)
+        observed = {}
+
+        def dispatch(effective, _args):
+            observed["work"] = effective.work
+            observed["configured"] = effective.c["work_dir"]
+            return 0
+
+        argv = ["build_iso.py", "bootstrap", "--set", f"work_dir={chosen}",
+                "--yes"]
+        with mock.patch.object(bi, "CONF_PATH", config), \
+                mock.patch.object(bi, "bootstrap", side_effect=dispatch), \
+                mock.patch.object(sys, "argv", argv):
+            assert bi.main() == 0
+        assert observed == {"work": chosen, "configured": str(chosen)}
+        assert config.is_file() and str(chosen) in config.read_text()
 
     print("  16/16 unattended orchestration checks pass")
     return 0
