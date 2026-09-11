@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -166,9 +167,14 @@ DEFAULT_CONFIG: dict = {
     # alone are not identities: source and filesystem type are captured from
     # findmnt and must match again immediately before backup/export.
     "bootstrap": {
+        "dependencies_authorized": False,
         "backup_path": "", "backup_source": "", "backup_fstype": "",
         "backup_kind": "",  # physical-device | host-share
         "export_path": "", "export_source": "", "export_fstype": "",
+        # Only an authenticated host integration may satisfy distribution
+        # export.  A removable filesystem visible to the guest is not evidence
+        # that bytes reached the physical host.
+        "export_kind": "",  # host-share (or blank until onboarding)
         "host_path": "",    # operator supplied mapping; may remain unknown
         "build_only": False,
         "min_backup_mb": 64, "min_export_mb": 22000,
@@ -219,7 +225,8 @@ DEFAULT_CONFIG: dict = {
     },
 }
 
-CONF_PATH = Path(__file__).resolve().parent / "iso-build.json"
+CONF_PATH = Path(os.environ.get("INQUBESTIGATION_CONFIG",
+                                Path(__file__).resolve().parent / "iso-build.json")).resolve()
 RST, B, R, G, Y, C, D = ("\033[0m", "\033[1m", "\033[31m", "\033[32m",
                          "\033[33m", "\033[36m", "\033[2m")
 
@@ -740,10 +747,12 @@ def bootstrap(x: Ctx, args) -> int:
     # Keep the configuration contract statically auditable even though the
     # implementation lives in bootstrap_workflow.py.
     bootstrap_contract = (
+        x.c["bootstrap"]["dependencies_authorized"],
         x.c["bootstrap"]["backup_path"], x.c["bootstrap"]["backup_source"],
         x.c["bootstrap"]["backup_fstype"], x.c["bootstrap"]["backup_kind"],
         x.c["bootstrap"]["export_path"], x.c["bootstrap"]["export_source"],
-        x.c["bootstrap"]["export_fstype"], x.c["bootstrap"]["host_path"],
+        x.c["bootstrap"]["export_fstype"], x.c["bootstrap"]["export_kind"],
+        x.c["bootstrap"]["host_path"],
         x.c["bootstrap"]["build_only"], x.c["bootstrap"]["min_backup_mb"],
         x.c["bootstrap"]["min_export_mb"],
     )
@@ -758,6 +767,7 @@ def bootstrap(x: Ctx, args) -> int:
     workflow.acquire_lock()
     workflow.initialize_inventory()
     try:
+        workflow.prepare_dependencies(args)
         workflow.stage("onboarding", "running", "discovering resources and collecting approval")
         workflow.onboard(args)
     except Exception as exc:
@@ -767,7 +777,6 @@ def bootstrap(x: Ctx, args) -> int:
     try:
         workflow.stage("onboarding", "complete", "approved destinations validated")
         steps: list[tuple[str, str, list[str]]] = [
-            ("setup-host", "install and configure the build host", ["setup-host"]),
             ("gen-key", "create or adopt the signing key", ["gen-key"]),
             ("backup-key", "back up the signing key before anything can lose it",
              ["backup-key"]),
@@ -786,7 +795,7 @@ def bootstrap(x: Ctx, args) -> int:
             key_args.append("--no-passphrase")
         if args.passphrase_file:
             key_args += ["--passphrase-file", args.passphrase_file]
-        steps[1] = ("gen-key", steps[1][1], ["gen-key", *key_args])
+        steps[0] = ("gen-key", steps[0][1], ["gen-key", *key_args])
         backup_args: list[str] = []
         backup_to = workflow.backup_path
         if backup_to:
@@ -795,7 +804,7 @@ def bootstrap(x: Ctx, args) -> int:
             backup_args += ["--use-key", args.use_key]
         if args.passphrase_file:
             backup_args += ["--passphrase-file", args.passphrase_file]
-        steps[2] = ("backup-key", steps[2][1], ["backup-key", *backup_args])
+        steps[1] = ("backup-key", steps[1][1], ["backup-key", *backup_args])
 
         print(f"\n{B}{C}══ bootstrap{RST}")
         print("\n  This runs, stopping at the first failure:\n")
@@ -827,7 +836,7 @@ def bootstrap(x: Ctx, args) -> int:
             # process.  Enter only the docker group for subsequent children; sg
             # retains the unprivileged user's HOME/GNUPGHOME and therefore their
             # signing keyring. Never elevate the whole build.
-            if i > 1 and x.c["container_engine"] == "docker" \
+            if i > 0 and x.c["container_engine"] == "docker" \
                     and not x.quiet("docker", "ps"):
                 if shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps"):
                     child = ["sg", "docker", "-c", shlex.join(child)]
@@ -4587,7 +4596,9 @@ def load_config(write_only=False, dry_run=False) -> dict:
                     elif not isinstance(item, type(expected)):
                         raise ValueError(f"{name} must be {type(expected).__name__}")
             validate(DEFAULT_CONFIG, supplied)
-            return deep_merge(DEFAULT_CONFIG, supplied)
+            merged = deep_merge(DEFAULT_CONFIG, supplied)
+            validate_config(merged)
+            return merged
         except json.JSONDecodeError as e:
             print(f"{R}FATAL:{RST} {CONF_PATH.name} is not valid JSON: {e}",
                   file=sys.stderr)
@@ -4595,14 +4606,45 @@ def load_config(write_only=False, dry_run=False) -> dict:
     if dry_run and not write_only:
         print(f"  {Y}!{RST} no iso-build.json — planning against the embedded "
               f"defaults (a dry run writes nothing)\n")
-        return dict(DEFAULT_CONFIG)
-    CONF_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        return copy.deepcopy(DEFAULT_CONFIG)
+    CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONF_PATH.with_suffix(CONF_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONF_PATH)
     if write_only:
         print(f"Wrote {CONF_PATH}")
         print("Review and edit it, then run:  ./build_iso.py --dry-run iso")
         sys.exit(0)
     print(f"  {Y}!{RST} no iso-build.json found — wrote embedded defaults to {CONF_PATH}\n")
-    return dict(DEFAULT_CONFIG)
+    return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def validate_config(cfg: dict) -> None:
+    """Validate cross-field deployment semantics, not merely JSON types."""
+    bootstrap = cfg["bootstrap"]
+    export_kind = bootstrap.get("export_kind", "")
+    if export_kind not in ("", "host-share"):
+        raise ValueError(
+            "bootstrap.export_kind must be host-share; guest block/removable "
+            "storage cannot be classified as physical-host distribution")
+    if not bootstrap.get("build_only") and any(
+            bootstrap.get(k) for k in ("export_path", "export_source", "export_fstype")):
+        if export_kind != "host-share":
+            raise ValueError("configured export requires bootstrap.export_kind=host-share")
+        if bootstrap.get("export_fstype") not in ("virtiofs", "9p", "cifs", "nfs", "nfs4"):
+            raise ValueError("physical-host export requires a supported host-share transport")
+    install = cfg["install"]
+    if install.get("unattended"):
+        disk = install.get("disk", "")
+        if not disk.startswith("/dev/disk/by-id/"):
+            raise ValueError("unattended install requires an exact /dev/disk/by-id target binding")
+        if not install.get("encrypt_disk"):
+            raise ValueError("unattended install requires encrypted target storage")
+    elif install.get("disk"):
+        raise ValueError("manual installation must not persist a destructive target disk")
+    if not install.get("username", "").strip():
+        raise ValueError("install.username is required for target-local account enrollment")
 
 
 def main() -> int:
@@ -4644,6 +4686,8 @@ lifecycle
                    help="build an unsigned image deliberately (testing only)")
     p.add_argument("--yes", action="store_true",
                    help="answer every prompt with yes (for unattended runs)")
+    p.add_argument("--non-interactive", action="store_true",
+                   help="never prompt; fail early when the authorized profile is incomplete")
     p.add_argument("--write-config", action="store_true")
     p.add_argument("--set", dest="set_kv", action="append", metavar="KEY=VALUE",
                    help="set a configuration key (repeatable); implies action 'config'")

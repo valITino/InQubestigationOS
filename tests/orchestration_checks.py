@@ -90,6 +90,7 @@ def main():
                  passphrase_file=str(secret), to="/media/backup")
         x = ctx(td, a)
         x.c["bootstrap"]["backup_path"] = "/media/backup"
+        x.c["bootstrap"]["dependencies_authorized"] = True
         calls = []
 
         def child(argv, **_kw):

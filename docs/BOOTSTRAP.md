@@ -1,12 +1,21 @@
 # Bootstrap operator contract
 
-`./build_iso.py bootstrap` is the build-VM entry point. It performs mandatory
-upfront onboarding, validates both destinations, prepares the host, creates or
+`./build_iso.py bootstrap` is the build-VM entry point. It first requests narrow
+authorization and prepares discovery/transport helpers, then performs mandatory
+upfront onboarding, validates both destinations, creates or
 adopts a signing key, makes the encrypted key backup, runs readiness and
 supply-chain gates, builds and signs the image, and readback-verifies an
 allowlisted release on host-accessible storage. A failed required export is a
 failed bootstrap; valid guest output is retained. `bootstrap.build_only=true`
 is explicitly reported as build-only, never exported.
+
+The guided run asks for manual or unattended installation explicitly. Manual
+mode leaves destructive target selection to the target's Anaconda session;
+unattended mode requires an operator-approved `/dev/disk/by-id/...` binding and
+encrypted storage. A repeat run can use `--non-interactive` with a complete,
+previously authorized profile and a protected external secret provider. Generic
+`--yes` never authorizes disk erasure or turns guest block storage into a
+physical-host export.
 
 ## Implemented regression repairs
 
