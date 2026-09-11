@@ -1,0 +1,105 @@
+name: trusted Tier-2 release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      trusted_commit:
+        description: "Approved full 40-character commit SHA (must equal TRUSTED_BUILD_REF)"
+        required: true
+        type: string
+      confirmation:
+        description: "Type BUILD_TIER2_RELEASE_CANDIDATE"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-tier2-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Repository owners provide a dedicated, non-ephemeral trusted runner with
+    # these labels. Pull-request workflows never use any of them.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      inputs.confirmation == 'BUILD_TIER2_RELEASE_CANDIDATE'
+    environment: production-build
+    runs-on: [self-hosted, linux, x64, inqubestigation-trusted-build]
+    timeout-minutes: 1440
+    steps:
+      # Environment variables exist only after the protected environment has
+      # approved and started this job. Validate before checkout, secrets, or
+      # any code from the requested revision can execute.
+      - name: Validate the environment-approved immutable commit
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ inputs.trusted_commit }}
+          APPROVED_SHA: ${{ vars.TRUSTED_BUILD_REF }}
+        run: |
+          set -eu
+          sha_pattern='^[0-9a-fA-F]{40}$'
+          if ! [[ "${REQUESTED_SHA:-}" =~ $sha_pattern ]]; then
+            echo 'trusted_commit must be a non-empty full 40-hex commit SHA' >&2
+            exit 1
+          fi
+          if ! [[ "${APPROVED_SHA:-}" =~ $sha_pattern ]]; then
+            echo 'production-build TRUSTED_BUILD_REF must be a non-empty full 40-hex commit SHA' >&2
+            exit 1
+          fi
+          if [[ "${REQUESTED_SHA,,}" != "${APPROVED_SHA,,}" ]]; then
+            echo 'requested commit does not match production-build TRUSTED_BUILD_REF' >&2
+            exit 1
+          fi
+          echo "TRUSTED_SHA=${REQUESTED_SHA,,}" >> "$GITHUB_ENV"
+      - name: Check out only the environment-approved immutable commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TRUSTED_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+      - name: Materialize the short-lived signing session
+        shell: bash
+        env:
+          SESSION_SECRET: ${{ secrets.IQ_GPG_SESSION_SECRET }}
+        run: |
+          set -eu
+          umask 077
+          test -n "$SESSION_SECRET"
+          printf '%s' "$SESSION_SECRET" > "$RUNNER_TEMP/iq-gpg-session"
+          unset SESSION_SECRET
+      - name: Build and stage the verified candidate
+        shell: bash
+        env:
+          EXPECTED_REF: ${{ inputs.trusted_commit }}
+          RC_CONFIG: ${{ vars.IQ_RC_CONFIG }}
+          WORK_DIR: ${{ vars.IQ_WORK_DIR }}
+          BACKUP_DIR: ${{ vars.IQ_BACKUP_DIR }}
+          CANDIDATE_DIR: ${{ vars.IQ_CANDIDATE_DIR }}
+          SIGNING_FPR: ${{ vars.IQ_SIGNING_FPR }}
+          MAX_ARTIFACT_GB: ${{ vars.IQ_MAX_ARTIFACT_GB }}
+        run: |
+          set -eu
+          ./release_candidate.py \
+            --expected-ref "$EXPECTED_REF" --config "$RC_CONFIG" \
+            --work-dir "$WORK_DIR" --backup-dir "$BACKUP_DIR" \
+            --candidate-dir "$CANDIDATE_DIR" \
+            --passphrase-file "$RUNNER_TEMP/iq-gpg-session" \
+            --signing-fingerprint "$SIGNING_FPR" \
+            --max-artifact-gb "${MAX_ARTIFACT_GB:-20}" \
+            | tee "$RUNNER_TEMP/release-result.jsonl"
+      - name: Remove the signing session
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/iq-gpg-session"
+      - name: Report retained audit location
+        if: always()
+        shell: bash
+        run: |
+          echo 'Build logs and result.json remain mode-protected under IQ_WORK_DIR/release-audit.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No recursive work directory, backup, secret, or provisioning credential upload is configured.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The allowlisted files are staged internally only; promotion is a separate owner action.' >> "$GITHUB_STEP_SUMMARY"

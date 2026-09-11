@@ -189,10 +189,39 @@ Rufus does not verify the image, so verify it on Windows first. The build writes
 a PowerShell script beside the ISO for exactly this:
 
 ```powershell
-.erify-iso.ps1 <the fingerprint you were given out of band>
-```
+.\verify-iso.ps1 <the fingerprint you were given out of band>
+erify-iso.ps1 <the fingerprint you were given out of band>
+# The administrator mounts the removable backup filesystem first. Merely
+# creating /mnt/image-key-backup is deliberately not sufficient.
+sudo mount LABEL=IMAGE-KEY-BACKUP /mnt/image-key-backup
+install -m 600 /dev/null /run/user/$UID/inqubestigation-gpg.pass
+# Write the passphrase into that runtime file without putting it in shell history.
+read -rsp 'Signing/backup passphrase: ' P; printf '%s' "$P" > /run/user/$UID/inqubestigation-gpg.pass; unset P; echo
+sudo -v
+./build_iso.py bootstrap --yes \
+  --uid "Kapo Cyber Image Signing <cyber@example.ch>" --expire 3y \
+  --passphrase-file /run/user/$UID/inqubestigation-gpg.pass \
+  --to /mnt/image-key-backup/inqubestigation
+For every repeat build, mount the same backup medium and use the same runtime
+secret file, then run the **same command**. The fingerprint already pinned in
+`iso-build.json` wins: bootstrap verifies and reuses that key even though
+`--uid` remains present, safely refreshes the encrypted backup, checks signing
+with an empty agent cache, and resumes only marks whose configuration and Git
+revision still match. `--yes` never creates a second identity. If the configured
+key is missing or selection is ambiguous, the command stops and tells you to
+restore it or pass its full fingerprint.
 
-It checks the SHA-256 with Windows' own tooling and the GPG signature via
+The runtime passphrase file must be owned by the build user and mode `0600` (a
+protected FIFO or inherited `/proc/self/fd/N` is also accepted). Delete it after
+the run. It is never copied into JSON, logs, artifacts, or the ISO. Run bootstrap
+as the ordinary build user, not via `sudo`; after `setup-host`, orchestration
+enters the new Docker group with `sg` while retaining that user's HOME and GPG
+keyring. For `--yes`, authenticate with `sudo -v` first; the script verifies
+non-interactive sudo readiness and does not edit sudo policy.
+
+./build_iso.py bootstrap
+non-interactive sudo readiness and does not edit sudo policy.
+
 Gpg4win, and exits non-zero on any mismatch. Without a fingerprint argument it
 prints the signer for you to compare by eye. If Gpg4win is not installed it says
 so and exits 2 rather than implying the image is trustworthy.
@@ -281,7 +310,7 @@ For an unattended run, `--yes` answers every prompt.
 ## 3. Create the signing key
 
 ```bash
-./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"
+| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
 ```
 
 That generates an rsa4096 signing key with a three-year expiry — deliberate: an
@@ -307,6 +336,7 @@ If your unit already has an image-signing key in this keyring, adopt it instead:
 > the fingerprint goes in `iso-build.json`. The private key stays in the build
 > host's keyring. The build script refuses to start if it finds a key block, and
 > validates the fingerprint format before anything else runs.
+| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
 > Details in [SIGNING.md](SIGNING.md).
 
 ---
@@ -475,17 +505,46 @@ Colleagues verify before installing — one command, shipped beside the image:
 ```
 
 It checks the checksum, imports the key, verifies the signature, and then prints
-the fingerprint it verified against so they can compare it with the one you gave
-them. By hand it is still:
-
-```bash
-sha256sum -c InQubestigationOS.iso.sha256
-gpg --import unit-signing-key.asc
-gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
+./build_iso.py --set install.unattended=true \
+  --set install.disk=/dev/disk/by-id/wwn-0x5002538d00000000
 ```
 
-> **The fingerprint must travel separately from the ISO.** A public key shipped
-> on the same USB stick as the image it signs proves nothing — anyone who can
+`wwn-0x5002538d00000000` is an example only. Record the actual stable identifier
+from the Qubes target machine and use that exact value for its image; never copy
+the example or derive the value from the build host.
+
+It is **off by default** on purpose. The disk value is a stable identity read
+from the laptop being installed (use the exact `/dev/disk/by-id/` or
+`/dev/disk/by-path/` link recorded for that machine), not `/dev/sda` or the
+builder VM's disk. At install time, before emitting any `clearpart`, `%pre`
+requires the identity to resolve uniquely to one whole disk and rejects missing,
+ambiguous, partition, and installation-media matches. Blank can never mean
+`clearpart --all`. A fleet whose disks have different identities needs a
+per-machine ISO/configuration; there is deliberately no "pick the only fixed
+disk" fallback.
+
+To transport provisioner settings, create a reviewed JSON file containing only
+non-secret overrides and set `provisioner_config=/path/to/golden-image.json`.
+The build rejects secret-looking populated fields and version mismatches, embeds
+the validated JSON beside `golden_image.py`, and the target loads that exact
+neighbor. Per-machine credentials are still generated only after installation.
+1. Boot the verified USB and deliberately select installation.
+2. Confirm that the stable disk identity shown for this machine is the intended
+   target; a mismatch stops before partitioning.
+3. Enroll the machine's unique LUKS passphrase when Anaconda asks. No shared
+   passphrase is embedded and encryption cannot be disabled in unattended mode.
+4. The installer completes and reboots. `install.auto_initial_setup` (on by
+   default) means the first-boot runner completes Qubes' own initial setup
+   non-interactively, and retries
+templates are already on disk, so installation and local provisioning do not
+need a repository download. This is **not** a claim that online acceptance has
+passed: first boot runs local/offline checks and records DNS resolution and Tor
+exit confirmation as `PENDING ONLINE`, never PASS. Run the full `--verify` after
+network enrollment; issuance remains blocked by real failures.
+
+   non-interactively, and retries every thirty minutes until the machine is
+   provisioned — so a laptop left alone overnight finishes by itself.
+phases and the offline-capable acceptance gate return success.
 > replace the image can replace the key beside it. Read the fingerprint out over
 > the phone, or publish it somewhere colleagues already trust. `FINGERPRINT.txt`
 > is formatted for exactly that, and `write-usb` reminds you to carry it

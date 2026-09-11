@@ -1,0 +1,12 @@
+self-hosted-runner:
+  labels:
+    - inqubestigation-trusted-build
+
+config-variables:
+  - TRUSTED_BUILD_REF
+  - IQ_RC_CONFIG
+  - IQ_WORK_DIR
+  - IQ_BACKUP_DIR
+  - IQ_CANDIDATE_DIR
+  - IQ_SIGNING_FPR
+  - IQ_MAX_ARTIFACT_GB

@@ -512,6 +512,14 @@ class Runner:
             self.run("qvm-prefs", vm, k, str(v))
 
 
+def physical_memory_gb(r: Runner) -> int:
+    """Physical Xen host memory, never dom0's deliberately capped memory."""
+    data = r.run("xl", "info", check=False, capture=True)
+    value = next(line.split(":", 1)[1].strip() for line in data.splitlines()
+                 if line.strip().startswith("total_memory"))
+    return int(value) // 1024
+
+
 # ===========================================================================
 #  Provisioner
 # ===========================================================================
@@ -679,10 +687,11 @@ class Provisioner:
         except OSError:
             pass
         try:
-            kb = int(next(line for line in Path("/proc/meminfo").read_text().splitlines()
-                          if line.startswith("MemTotal")).split()[1])
-            gb = kb // 1024 // 1024
-            o.info(f"system RAM: {gb}G")
+            # dom0 is deliberately memory-capped; /proc/meminfo describes that
+            # cap, not the physical laptop used to decide whether a local Wazuh
+            # indexer is viable. Xen's total_memory is physical host memory.
+            gb = physical_memory_gb(r)
+            o.info(f"physical host RAM reported by Xen: {gb}G")
             if self.c["wazuh"]["mode"] == "auto":
                 if gb >= 16:
                     self.c["wazuh"]["mode"] = "local"
@@ -703,7 +712,11 @@ class Provisioner:
                 o.warn("under 16G RAM with a local SIEM qube — consider "
                        "wazuh.mode='central', or 'auto' to decide per machine")
         except (OSError, StopIteration, ValueError):
-            pass
+            if self.c["wazuh"]["mode"] == "auto":
+                raise Fatal("wazuh.mode='auto' requires physical memory from "
+                            "'xl info'; set mode explicitly when Xen cannot report it")
+            o.warn("could not read physical memory from 'xl info'; explicit "
+                   f"wazuh.mode={self.c['wazuh']['mode']} is unchanged")
 
         # Pinned SIEM address collision
         wip = self.c["wazuh"]["ip"]
@@ -1657,7 +1670,7 @@ fi
             condition="/rw/config/golden-image-dpi.sh",
             body=f"""#!/bin/sh
 # Golden image — third-party signing key expiry watch.
-set -u
+set -uo pipefail
 now=$(date +%s)
 for kr in {shlex.quote(self.c['zeek']['keyring_path'])} \\
           {shlex.quote(self.c['kali']['keyring_path'])} \\
@@ -1824,7 +1837,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /rw/config/qubes-firewall.d/10-golden-dns
 ExecStartPost=/bin/sh -c 'nft list chain ip qubes dnat-dns | grep -q "dport 53" \\
-    || logger -t golden-image "dnat-dns does NOT carry the golden rule"'
+    || {{ logger -t golden-image "dnat-dns does NOT carry the golden rule"; exit 1; }}'
 
 [Install]
 WantedBy=multi-user.target
@@ -2483,8 +2496,9 @@ systemctl start {unit}.mount 2>/dev/null || true
 #
 # Which updater exists, and which flags it takes, varies across 4.3 point
 # releases — so ask, rather than assume, exactly as the firewall code asks
-# about 'qvm-firewall reset'.
-set -u
+# about 'qvm-firewall reset'. Pipe failures must reach systemd, not be hidden
+# by a successful logger process.
+set -uo pipefail
 if command -v qubes-vm-update >/dev/null; then
     opts=""
     qubes-vm-update --help 2>&1 | grep -q -- --show-output && \
@@ -2495,6 +2509,7 @@ elif command -v qubesctl >/dev/null; then
         2>&1 | logger -t golden-image
 else
     logger -t golden-image "no template updater found — update by hand"
+    exit 1
 fi
 if qubes-dom0-update --check-only >/dev/null 2>&1; then
     logger -t golden-image "dom0 updates are available — apply them by hand"
@@ -2529,18 +2544,18 @@ else
       echo "      Re-run: sudo {me.name} --verify"
       echo
     }} > /etc/motd.d/golden-image-selfcheck
+    exit 1
 fi
 """)
 
         self._dom0_unit(
             "golden-restore-test",
-            "Monthly restore verification of the newest backup set",
+            "Monthly backup archive integrity check (not a full restore)",
             "*-*-01 04:00",
             f"""#!/bin/bash
-# Golden image — a backup nobody has restored is a hope, not a backup.
-# GUIDE section 12 asked for this monthly, calendared, with a named owner.
-# This performs it: restore the newest set into a throwaway prefix, confirm
-# the qubes appear, then delete them.
+# This is an archive integrity check only. A demonstrated restore is an
+# operator-observed acceptance step into an isolated destination; --verify-only
+# must never be reported as that demonstration.
 set -u
 PROFILE=golden-image
 LOG=/var/log/golden-image-restore-test.log
@@ -2564,13 +2579,14 @@ echo "set: $SET"
 #   -d names the qube holding the backup; the positional is the path within it.
 if qvm-backup-restore --verify-only -d "$DEST_VM" \
        --passphrase-file /root/.backup-pass "$SET" vault; then
-    logger -t golden-image "restore test PASSED for $SET"
+    logger -t golden-image "backup archive integrity check PASSED for $SET; full restore remains pending"
     rm -f /etc/motd.d/golden-image-restore
 else
     logger -t golden-image "restore test FAILED for $SET — see $LOG"
     mkdir -p /etc/motd.d
     echo "  *** BACKUP RESTORE VERIFICATION FAILED — see $LOG ***" \
         > /etc/motd.d/golden-image-restore
+    exit 1
 fi
 """)
 
@@ -2602,6 +2618,7 @@ else
       echo "  See $LOG"
       echo
     }} > /etc/motd.d/golden-image-keys
+    exit 1
 fi
 """)
 
@@ -2939,47 +2956,50 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
 
         o.say("")
         o.info("7. DNS enforcement")
-        if r.vm_exists("personal"):
-            r.ensure_running("personal")
-            if not r.qtest("personal", "command -v dig >/dev/null"):
-                # dnsutils is in the office template's package list precisely so
-                # this cannot happen; if it is missing, the group proves nothing
-                # and saying so as a warning would let it pass.
-                self._t("fail", "dig is not installed in personal, so DNS "
-                                "enforcement cannot be tested at all — install "
-                                "dnsutils in " + self.t["personal"])
-            else:
-                # The old test read 'dig @8.8.8.8 exited 0' as 'the packet
-                # reached Google'. It does not: a WORKING intercept answers that
-                # query locally, so correct enforcement scored FAIL and a missing
-                # dig scored PASS. Assert capture directly instead — 192.0.2.1 is
-                # TEST-NET-1, guaranteed unrouted, so an answer from it can only
-                # have come from the local redirect.
-                captured = r.quiet(
-                    "qvm-run", "--no-gui", "personal",
-                    "timeout 8 dig +short +time=3 +tries=1 @192.0.2.1 example.com")
-                self._t("pass" if captured else "fail",
-                        "every port-53 query is captured, whatever resolver the "
-                        "client asks for" if captured else
-                        "a query to an unrouted resolver was not intercepted — "
-                        "a client with a hardcoded resolver escapes the enforced path")
-                answered = r.quiet(
-                    "qvm-run", "--no-gui", "personal",
-                    "timeout 8 dig +short +time=3 +tries=1 @8.8.8.8 example.com")
-                self._t("pass" if answered else "warn",
-                        "8.8.8.8 is answered by the enforced resolver, not by Google"
-                        if answered else
-                        "queries addressed to 8.8.8.8 get no answer at all — "
-                        "check unbound in " + q["firewall"])
-            # A fail, not a warn: warnings never block, and this is the only
-            # end-to-end check that the enforced DNS path works at all. A
-            # workstation that resolves nothing used to pass phase 12.
-            resolves = r.quiet("qvm-run", "--no-gui", "personal",
-                               "timeout 8 getent hosts example.com")
-            self._t("pass" if resolves else "fail",
-                    "name resolution works via the enforced path" if resolves
-                    else f"personal cannot resolve anything — check unbound in "
-                         f"{q['firewall']}")
+        if getattr(self.args, "offline_checks", False):
+            self._t("warn", "PENDING ONLINE: DNS resolution and interception require network")
+        else:
+            if r.vm_exists("personal"):
+                r.ensure_running("personal")
+                if not r.qtest("personal", "command -v dig >/dev/null"):
+                    # dnsutils is in the office template's package list precisely so
+                    # this cannot happen; if it is missing, the group proves nothing
+                    # and saying so as a warning would let it pass.
+                    self._t("fail", "dig is not installed in personal, so DNS "
+                                    "enforcement cannot be tested at all — install "
+                                    "dnsutils in " + self.t["personal"])
+                else:
+                    # The old test read 'dig @8.8.8.8 exited 0' as 'the packet
+                    # reached Google'. It does not: a WORKING intercept answers that
+                    # query locally, so correct enforcement scored FAIL and a missing
+                    # dig scored PASS. Assert capture directly instead — 192.0.2.1 is
+                    # TEST-NET-1, guaranteed unrouted, so an answer from it can only
+                    # have come from the local redirect.
+                    captured = r.quiet(
+                        "qvm-run", "--no-gui", "personal",
+                        "timeout 8 dig +short +time=3 +tries=1 @192.0.2.1 example.com")
+                    self._t("pass" if captured else "fail",
+                            "every port-53 query is captured, whatever resolver the "
+                            "client asks for" if captured else
+                            "a query to an unrouted resolver was not intercepted — "
+                            "a client with a hardcoded resolver escapes the enforced path")
+                    answered = r.quiet(
+                        "qvm-run", "--no-gui", "personal",
+                        "timeout 8 dig +short +time=3 +tries=1 @8.8.8.8 example.com")
+                    self._t("pass" if answered else "warn",
+                            "8.8.8.8 is answered by the enforced resolver, not by Google"
+                            if answered else
+                            "queries addressed to 8.8.8.8 get no answer at all — "
+                            "check unbound in " + q["firewall"])
+                # A fail, not a warn: warnings never block, and this is the only
+                # end-to-end check that the enforced DNS path works at all. A
+                # workstation that resolves nothing used to pass phase 12.
+                resolves = r.quiet("qvm-run", "--no-gui", "personal",
+                                   "timeout 8 getent hosts example.com")
+                self._t("pass" if resolves else "fail",
+                        "name resolution works via the enforced path" if resolves
+                        else f"personal cannot resolve anything — check unbound in "
+                             f"{q['firewall']}")
 
         o.say("")
         o.info("8. inspection services")
@@ -3017,11 +3037,17 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                     else f"{q['kali_tor']} routes via '{nv}' — the Tor branch is bypassed")
             # This was "manual: open Tor Browser and look". The Tor Project
             # publishes a machine-readable endpoint for exactly this question.
-            r.ensure_running(q["kali_tor"])
-            out = r.run("qvm-run", "--no-gui", "--pass-io", q["kali_tor"],
-                        "timeout 45 curl -s https://check.torproject.org/api/ip",
-                        check=False, capture=True)
-            if '"IsTor":true' in out.replace(" ", ""):
+            if getattr(self.args, "offline_checks", False):
+                self._t("warn", "PENDING ONLINE: Tor exit confirmation requires network")
+                out = ""
+            else:
+                r.ensure_running(q["kali_tor"])
+                out = r.run("qvm-run", "--no-gui", "--pass-io", q["kali_tor"],
+                            "timeout 45 curl -s https://check.torproject.org/api/ip",
+                            check=False, capture=True)
+            if getattr(self.args, "offline_checks", False):
+                pass
+            elif '"IsTor":true' in out.replace(" ", ""):
                 self._t("pass", "check.torproject.org confirms traffic exits over Tor")
             elif '"IsTor":false' in out.replace(" ", ""):
                 self._t("fail", f"{q['kali_tor']} reaches the internet but NOT over "
@@ -3739,6 +3765,18 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                          "--value", check=False, capture=True).strip()
             state = f"{Out.G}enabled{Out.RST}" if on else f"{Out.R}NOT ENABLED{Out.RST}"
             print(f"    {unit:32s} {state}" + (f"   next {when}" if on and when else ""))
+        print(f"\n{Out.B}  Last maintenance results{Out.RST}")
+        for service in ("golden-backup.service", "golden-template-update.service",
+                        "golden-selfcheck.service", "golden-restore-test.service",
+                        "golden-key-refresh.service"):
+            result = r.run("systemctl", "show", service,
+                           "-p", "Result", "-p", "ExecMainStatus", "--value",
+                           check=False, capture=True).splitlines()
+            summary = "/".join(result) if result else "unknown"
+            bad = result and (result[0] not in ("success", "")
+                              or any(v not in ("0", "") for v in result[1:]))
+            color = Out.R if bad else Out.G
+            print(f"    {service:32s} {color}{summary}{Out.RST}")
 
         print(f"\n{Out.B}  Recent{Out.RST}")
         for label, path in (("self-check", "/var/log/golden-image-selfcheck.log"),
@@ -4056,6 +4094,8 @@ def main() -> int:
                      help="redo everything from phase N (resume after a failure)")
     sel.add_argument("--verify", action="store_true",
                      help="run the acceptance tests only; exits non-zero if any fail")
+    p.add_argument("--offline-checks", action="store_true",
+                   help="skip network-dependent acceptance probes and report them pending")
     p.add_argument("--force", action="store_true",
                    help="skip the Qubes release check and other confirmations")
     p.add_argument("--write-config", action="store_true",

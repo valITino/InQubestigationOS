@@ -30,13 +30,21 @@ jobs:
           sudo add-apt-repository --yes universe
           sudo apt-get update
       - name: Compile both scripts
-        run: python3 -m py_compile golden_image.py build_iso.py
+        run: python3 -m py_compile golden_image.py build_iso.py release_candidate.py acceptance_runner.py
       - name: Lint Python
         run: ruff check .
       - name: Scan Python for high-severity security defects
-        run: python3 -m bandit -q -lll -r build_iso.py golden_image.py tests
+        run: python3 -m bandit -q -lll -r build_iso.py golden_image.py release_candidate.py acceptance_runner.py tests
       - name: Run the harness
         run: ./tests/run_tests.py
+      - name: Test unattended build-host orchestration
+        run: ./tests/orchestration_checks.py
+      - name: Test installation and first-boot path
+        run: ./tests/install_path_checks.py
+      - name: Test release-candidate policy gates
+        run: ./tests/release_checks.py
+      - name: Test acceptance evidence and maintenance gates
+        run: ./tests/acceptance_checks.py
       # Also run standalone so a failure names itself in the job summary.
       - name: The build-host support holds up
         if: always()
@@ -71,18 +79,6 @@ jobs:
         with:
           python-version: "3.13"
       - name: Compare pinned keys and versions against upstream
-        # --update on the scheduled run so the baseline moves forward with the
-        # world; the exit code still reflects the findings, so a rotated key or
-        # a dom0 security bulletin fails the job either way.
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            ./build_iso.py check-upstream --update
-          else
-            ./build_iso.py check-upstream
-          fi
-      - name: Upload the refreshed baseline
-        if: github.event_name == 'schedule'
-        uses: actions/upload-artifact@v7
-        with:
-          name: supply-chain-lock
-          path: supply-chain.lock.json
+        # Detection never accepts drift. An owner runs --update on a review
+        # branch only after independently validating every changed fingerprint.
+        run: ./build_iso.py check-upstream

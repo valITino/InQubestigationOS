@@ -44,12 +44,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 import sys
 from datetime import datetime
@@ -138,11 +140,17 @@ DEFAULT_CONFIG: dict = {
         # luks2 is what Anaconda defaults to on current releases; set it
         # explicitly so a future default change does not alter your images.
         "luks_version": "luks2",
-        # Wipe and use the whole disk. Blank leaves partitioning to the operator.
+        # Required for unattended destructive installation. Use a stable target
+        # identity such as /dev/disk/by-id/wwn-...; it is resolved and required
+        # to match exactly one disk by Anaconda on the target machine.
         "disk": "",
+        "required_template": "debian-13-xfce",
         # Complete Qubes' own initial setup non-interactively at first boot.
         "auto_initial_setup": True,
     },
+    # Optional non-secret golden_image.py configuration to embed. Blank uses
+    # the provisioner's embedded defaults. Secrets are rejected.
+    "provisioner_config": "",
 
     # GPG fingerprint (40 hex chars) of the unit key that signs the ISO.
     # THIS IS A FINGERPRINT, NOT A KEY. The private key stays in the build
@@ -347,7 +355,21 @@ class Ctx:
                     "     Signing needs the private key present locally. Either\n"
                     "     import it here, or build unsigned and sign on the machine\n"
                     "     that holds the key.")
-            self.ok(f"signing key present and usable: {clean}")
+            # Listing a protected key does not prove an unattended process can
+            # unlock it.  Sign a tiny runtime-only payload now, before clones,
+            # downloads, template builds, or ISO composition consume hours.
+            with tempfile.TemporaryDirectory(prefix="iq-sign-check-") as td:
+                payload = Path(td) / "challenge"
+                signature = Path(td) / "challenge.asc"
+                payload.write_text("InQubestigationOS signing readiness\n")
+                argv = ["gpg", *gpg_secret_options(self.args), "--local-user", clean,
+                        "--detach-sign", "--output", str(signature), str(payload)]
+                if not self.quiet(*argv):
+                    raise Fatal(
+                        f"signing key {clean} is present but cannot sign unattended.\n"
+                        "     Prime the agent interactively, or provide a protected "
+                        "--passphrase-file readable by this build user.")
+            self.ok(f"signing key present and unattended signing check passed: {clean}")
 
     def export_pubkey(self) -> None:
         """Ship the public key beside the ISO so colleagues can verify."""
@@ -367,13 +389,51 @@ class Ctx:
         else:
             self.warn("could not export the public key")
 
+    def state_digest(self, key: str) -> str:
+        """Bind completion to configuration and source revision.
+
+        Deliberately hashes the complete effective configuration.  Rebuilding
+        unnecessarily is safer than silently reusing an artifact made with a
+        changed signing key, release, component, or template definition.
+        """
+        try:
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+                capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            revision = "unknown"
+        blob = json.dumps({"key": key, "config": self.c, "revision": revision},
+                          sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode()).hexdigest()
+
     def done(self, key) -> bool:
-        return self.state.exists() and key in self.state.read_text().split()
+        if not self.state.exists():
+            return False
+        expected = self.state_digest(key)
+        for line in self.state.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue                 # legacy marks are intentionally stale
+            if record == {"step": key, "inputs": expected}:
+                return True
+        return False
 
     def mark(self, key):
         if not self.args.dry_run:
-            with self.state.open("a") as f:
-                f.write(key + "\n")
+            records = []
+            if self.state.exists():
+                for line in self.state.read_text().splitlines():
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("step") != key:
+                        records.append(record)
+            records.append({"step": key, "inputs": self.state_digest(key)})
+            tmp = self.state.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
+            os.replace(tmp, self.state)
 
 
 # ===========================================================================
@@ -659,6 +719,9 @@ def setup_builder(x: Ctx):
 #  in sequence is what nobody should have to remember.
 # ---------------------------------------------------------------------------
 def bootstrap(x: Ctx, args) -> int:
+    if os.geteuid() == 0:
+        raise Fatal("bootstrap must run as a non-root build user. It uses sudo only "
+                    "for setup-host changes and will not build with root's keyring.")
     steps: list[tuple[str, str, list[str]]] = [
         ("setup-host", "install and configure the build host", ["setup-host"]),
         ("gen-key", "create or adopt the signing key", ["gen-key"]),
@@ -666,14 +729,28 @@ def bootstrap(x: Ctx, args) -> int:
          ["backup-key"]),
         ("doctor", "confirm the host is ready", ["doctor"]),
         ("check-upstream", "confirm the pinned keys and versions are current",
-         ["check-upstream", "--update"]),
+         ["check-upstream"]),
         ("plan", "print the whole build plan", ["--dry-run", "all"]),
         ("build", "build the templates and the ISO", ["all"]),
     ]
-    if getattr(args, "uid", None):
-        steps[1] = ("gen-key", steps[1][1], ["gen-key", "--uid", args.uid])
-    if getattr(args, "to", None):
-        steps[2] = ("backup-key", steps[2][1], ["backup-key", "--to", args.to])
+    key_args: list[str] = []
+    for option, value in (("--uid", args.uid), ("--use-key", args.use_key),
+                          ("--expire", args.expire)):
+        if value is not None:
+            key_args += [option, value]
+    if args.no_passphrase:
+        key_args.append("--no-passphrase")
+    if args.passphrase_file:
+        key_args += ["--passphrase-file", args.passphrase_file]
+    steps[1] = ("gen-key", steps[1][1], ["gen-key", *key_args])
+    backup_args: list[str] = []
+    if args.to:
+        backup_args += ["--to", args.to]
+    if args.use_key:
+        backup_args += ["--use-key", args.use_key]
+    if args.passphrase_file:
+        backup_args += ["--passphrase-file", args.passphrase_file]
+    steps[2] = ("backup-key", steps[2][1], ["backup-key", *backup_args])
 
     print(f"\n{B}{C}══ bootstrap{RST}")
     print("\n  This runs, stopping at the first failure:\n")
@@ -697,7 +774,23 @@ def bootstrap(x: Ctx, args) -> int:
     passthrough = ["--yes"] if getattr(args, "assume_yes", False) else []
     for i, (name, _why, argv) in enumerate(steps, start=1):
         print(f"\n{B}{C}══ bootstrap {i}/{len(steps)}: {name}{RST}")
-        rc = subprocess.run(me + argv + passthrough).returncode
+        child_args = [*argv, *passthrough]
+        if args.passphrase_file and name in ("doctor", "plan", "build"):
+            child_args += ["--passphrase-file", args.passphrase_file]
+        child = me + child_args
+        # usermod cannot alter the supplementary groups of this already-running
+        # process.  Enter only the docker group for subsequent children; sg
+        # retains the unprivileged user's HOME/GNUPGHOME and therefore their
+        # signing keyring. Never elevate the whole build.
+        if i > 1 and x.c["container_engine"] == "docker" \
+                and not x.quiet("docker", "ps"):
+            if shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps"):
+                child = ["sg", "docker", "-c", shlex.join(child)]
+            else:
+                raise Fatal("Docker group membership is not active and cannot be "
+                            "entered with sg. Log in again as the original build "
+                            "user; do not run bootstrap as root.")
+        rc = subprocess.run(child).returncode
         if rc != 0:
             raise Fatal(f"bootstrap stopped at step {i} ({name}), exit {rc}.\n"
                         f"     Fix the cause and run bootstrap again — completed "
@@ -1212,8 +1305,22 @@ def publish_component(x: Ctx, comp: Path) -> None:
         return
     if not x.quiet("gpg", "--list-secret-keys", fpr):
         raise Fatal(f"no SECRET key for {fpr} — cannot sign the component tag")
-    x.run("git", "-C", str(comp), "-c", f"user.signingkey={fpr}",
-          "tag", "-s", "-m", f"investigator templates {datetime.now():%F %T}", tag)
+    pf = protected_secret_file(x.args)
+    wrapper = None
+    if pf:
+        wrapper = x.work / ".gpg-loopback"
+        wrapper.write_text("#!/bin/sh\nexec gpg --batch --yes --pinentry-mode loopback "
+                           f"--passphrase-file {shlex.quote(str(pf))} \"$@\"\n")
+        wrapper.chmod(0o700)
+    try:
+        argv = ["git", "-C", str(comp), "-c", f"user.signingkey={fpr}"]
+        if wrapper:
+            argv += ["-c", f"gpg.program={wrapper}"]
+        x.run(*argv, "tag", "-s", "-m",
+              f"investigator templates {datetime.now():%F %T}", tag)
+    finally:
+        if wrapper:
+            wrapper.unlink(missing_ok=True)
     x.run("git", "-C", str(comp), "remote", "remove", "origin", check=False)
     x.run("git", "-C", str(comp), "remote", "add", "origin", remote)
     x.run("git", "-C", str(comp), "push", "--force", "origin", "HEAD:main",
@@ -1389,6 +1496,43 @@ def write_builder_iso_config(x: Ctx, base_ks: str, iso_tpls: list[str], kickstar
     merge_builder_config(x, updates, "iso block")
 
 
+def provisioner_config_bytes(x: Ctx, payload: Path) -> bytes:
+    """Validate and serialize the non-secret target configuration."""
+    source = x.c.get("provisioner_config") or ""
+    if source:
+        path = Path(source)
+        try:
+            cfg = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise Fatal(f"cannot read provisioner_config {path}: {exc}") from exc
+        if not isinstance(cfg, dict):
+            raise Fatal("provisioner_config must contain one JSON object")
+    else:
+        # An empty object deliberately selects golden_image.py's own defaults.
+        cfg = {}
+    forbidden = re.compile(r"(password|passphrase|secret|token|private.?key)", re.I)
+
+    def walk(node, prefix=""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                name = f"{prefix}.{key}" if prefix else key
+                if forbidden.search(key) and value not in ("", None, False, {}):
+                    raise Fatal(f"provisioner_config contains forbidden secret field {name}")
+                walk(value, name)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, prefix)
+
+    walk(cfg)
+    # Keep the transported config and provisioner implementation on the same
+    # schema/version. A mismatch must be resolved at build time, not on dom0.
+    match = re.search(rb'"image_version"\s*:\s*"([^"]+)"', payload.read_bytes())
+    embedded_version = match.group(1).decode() if match else ""
+    if cfg.get("image_version", embedded_version) != embedded_version:
+        raise Fatal("provisioner_config image_version does not match golden_image.py")
+    return (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode()
+
+
 def write_kickstart(x: Ctx, base_ks: str, payload: Path,
                     extra_packages: list[str]) -> str:
     """Write investigator.ks and return the path to put in builder.yml.
@@ -1412,6 +1556,8 @@ def write_kickstart(x: Ctx, base_ks: str, payload: Path,
         raise Fatal(f"base kickstart {base_ks} is not in {conf}")
     b64 = base64.b64encode(payload.read_bytes()).decode()
     b64 = "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))
+    cfg64 = base64.b64encode(provisioner_config_bytes(x, payload)).decode()
+    cfg64 = "\n".join(cfg64[i:i + 76] for i in range(0, len(cfg64), 76))
 
     pkgs = ""
     if extra_packages:
@@ -1455,6 +1601,12 @@ PAYLOAD_B64_EOF
 base64 -d /usr/local/sbin/golden_image.py.b64 > /usr/local/sbin/golden_image.py
 rm -f /usr/local/sbin/golden_image.py.b64
 chmod 755 /usr/local/sbin/golden_image.py
+cat > /usr/local/sbin/golden-image.json.b64 <<'CONFIG_B64_EOF'
+{cfg64}
+CONFIG_B64_EOF
+base64 -d /usr/local/sbin/golden-image.json.b64 > /usr/local/sbin/golden-image.json
+rm -f /usr/local/sbin/golden-image.json.b64
+chmod 644 /usr/local/sbin/golden-image.json
 
 cat > /usr/local/sbin/golden-image-provision <<'WRAP_EOF'
 #!/bin/bash
@@ -1473,7 +1625,6 @@ ConditionPathExists=!/var/lib/golden-image/provisioned
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
 ExecStart=/usr/local/sbin/golden-image-firstboot
 TimeoutStartSec=0
 
@@ -1490,7 +1641,8 @@ ConditionPathExists=!/var/lib/golden-image/provisioned
 
 [Timer]
 OnBootSec=10min
-OnUnitActiveSec=30min
+OnUnitInactiveSec=30min
+Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -1507,17 +1659,28 @@ mkdir -p /var/lib/golden-image
 
 STATUS=/var/lib/golden-image/firstboot-status
 note() {{ echo "$(date '+%F %T') $*" >> "$STATUS"; logger -t golden-image "$*"; }}
+ready() {{
+    qvm-check --quiet sys-net 2>/dev/null &&
+    qvm-check --quiet sys-firewall 2>/dev/null &&
+    qvm-check --quiet {x.c['install']['required_template']} 2>/dev/null
+}}
+
+exec 9>/run/golden-image-firstboot.lock
+if ! flock -n 9; then
+    note "attempt already running; deferred"
+    exit 75
+fi
 
 note "first-boot runner started"
 
 for i in $(seq 1 20); do
-    if qvm-check --quiet sys-net 2>/dev/null && qvm-check --quiet sys-firewall 2>/dev/null; then
+    if ready; then
         break
     fi
     sleep 30
 done
 
-if ! qvm-check --quiet sys-net 2>/dev/null; then
+if ! ready; then
     if [ "{auto_setup}" = "yes" ]; then
         # Nobody is here to click through the wizard on an unattended install.
         note "initial setup not done after 10 min; running it non-interactively"
@@ -1530,27 +1693,36 @@ if ! qvm-check --quiet sys-net 2>/dev/null; then
     fi
 fi
 
-if ! qvm-check --quiet sys-net 2>/dev/null; then
-    note "initial setup incomplete; not provisioning"
+if ! ready; then
+    note "deferred: initial setup prerequisites missing (sys-net, sys-firewall, {x.c['install']['required_template']})"
     mkdir -p /etc/motd.d
     echo "Golden image provisioning deferred. Run: sudo golden-image-provision" \\
         > /etc/motd.d/golden-image
     # Not a one-shot give-up: try again on the next boot, and on a timer, so a
     # machine that was simply left at the wizard overnight still provisions.
-    exit 0
+    exit 75
 fi
 
 note "starting provisioning"
-/usr/local/sbin/golden-image-provision >> /var/log/golden-image-firstboot.log 2>&1
+/usr/local/sbin/golden-image-provision --offline-checks >> /var/log/golden-image-firstboot.log 2>&1
 rc=$?
 if [ $rc -eq 0 ]; then
-    touch "$MARKER"
-    note "provisioned"
-    rm -f /etc/motd.d/golden-image
+    /usr/local/sbin/golden-image-provision --verify --offline-checks \
+        >> /var/log/golden-image-firstboot.log 2>&1
+    verify_rc=$?
+    if [ $verify_rc -eq 0 ]; then
+        touch "$MARKER"
+        note "complete: provisioning and acceptance checks succeeded"
+        rm -f /etc/motd.d/golden-image
+        systemctl disable golden-image-firstboot.timer >/dev/null 2>&1 || true
+        exit 0
+    fi
+    note "failed: acceptance checks rc=$verify_rc; retry will resume"
+    exit $verify_rc
 else
-    note "provisioning ran and failed rc=$rc; resume: sudo golden-image-provision"
+    note "failed: provisioning rc=$rc; retry will resume"
+    exit $rc
 fi
-exit 0
 FB_EOF
 chmod 755 /usr/local/sbin/golden-image-firstboot
 
@@ -1576,15 +1748,38 @@ MOTD_EOF
     ks.chmod(0o644)
     x.ok(f"wrote {ks}")
     x.info(f"%include {base_ks}  (resolved from {conf})")
+    validate_install_contract(x, ks, conf / base_ks)
     if extra_packages:
         x.info(f"%packages adds: {', '.join('qubes-template-'+p for p in extra_packages)}")
         validate_kickstart(x, ks, extra_packages)
     x.info(f"auto-provision on first boot: {x.c['auto_provision']}")
-    x.info("the runner records what it did in /var/lib/golden-image/firstboot-status, "
-           "and acceptance group 13 reads it — no hardware check needed")
+    x.info("the runner records deferred, failed and complete attempts in "
+           "/var/lib/golden-image/firstboot-status; a real boot remains a "
+           "hardware validation requirement")
     x.warn("the ISO embeds the provisioning script. It contains NO secrets: credentials")
     x.warn("  are generated on the target machine, never baked into the image.")
     return rel
+
+
+def validate_install_contract(x: Ctx, generated: Path, stock: Path) -> None:
+    """Check the final two-part kickstart contract, not only our fragment."""
+    text = stock.read_text(errors="replace") + "\n" + generated.read_text(errors="replace")
+    required = {
+        "language": r"(?m)^lang\s+\S+",
+        "keyboard": r"(?m)^keyboard\s+",
+        "timezone": r"(?m)^timezone\s+",
+        "user creation": r"(?m)^user\s+--name=",
+        "encrypted partitioning": r"autopart\s+--encrypted",
+        "installation completion/reboot": r"(?m)^reboot(?:\s|$)",
+    }
+    missing = [name for name, pattern in required.items() if not re.search(pattern, text)]
+    if missing:
+        raise Fatal("final composed kickstart is missing: " + ", ".join(missing))
+    if x.c["install"]["unattended"] and not x.c["install"]["auto_initial_setup"]:
+        raise Fatal("unattended installation requires install.auto_initial_setup=true, "
+                    "or Qubes initial setup remains an undocumented GUI dependency")
+    x.ok("final composed kickstart covers user, locale, keyboard, timezone, "
+         "encrypted storage, completion/reboot and Qubes initial setup")
 
 
 def build_installer_directives(x: Ctx) -> str:
@@ -1598,25 +1793,45 @@ def build_installer_directives(x: Ctx) -> str:
     inst = x.c["install"]
     if not inst["unattended"]:
         return ""
+    target = str(inst.get("disk", "")).strip()
+    if not target:
+        raise Fatal("install.unattended requires install.disk with a stable target "
+                    "identity; refusing to generate unrestricted clearpart --all")
+    if not (target.startswith("/dev/disk/by-id/")
+            or target.startswith("/dev/disk/by-path/")):
+        raise Fatal("install.disk must be /dev/disk/by-id/... or /dev/disk/by-path/... "
+                    "so the target is identified on the installation machine")
+    if not inst["encrypt_disk"]:
+        raise Fatal("unattended destructive installation requires disk encryption")
     lines = [
         "# --- unattended install (iso-build.json: install.unattended) --------",
         f"lang {inst['lang']}",
         f"keyboard --vckeymap={inst['keyboard']} --xlayouts='{inst['keyboard']}'",
         f"timezone {inst['timezone']} --utc",
+        "firstboot --disable",
+        "reboot",
     ]
-    if inst["encrypt_disk"]:
-        disk = f" --drives={inst['disk']}" if inst["disk"] else ""
-        if inst["disk"]:
-            lines.append(f"ignoredisk --only-use={inst['disk']}")
-            lines.append(f"clearpart --all --initlabel{disk}")
-        else:
-            lines.append("clearpart --all --initlabel")
-        # No --passphrase= here, on purpose: Anaconda then prompts, and full-disk
-        # encryption on an investigator laptop is not a thing to bake a shared
-        # secret into.
-        lines.append(f"autopart --encrypted --luks-version={inst['luks_version']}")
-        lines.append("# Anaconda will PROMPT for the LUKS passphrase. That is")
-        lines.append("# deliberate — see iso-build.json: install.encrypt_disk.")
+    # Resolve on the target in Anaconda's runtime. The build host's disks are
+    # irrelevant. Exactly one whole-disk symlink must match and it must not be
+    # the installation media; no partitioning directive exists until this gate
+    # succeeds.
+    lines += [
+        "%pre --interpreter=/bin/bash --erroronfail",
+        "set -eu",
+        f"TARGET_ID={shlex.quote(target)}",
+        "matches=$(readlink -f -- \"$TARGET_ID\" 2>/dev/null || true)",
+        "[ -b \"$matches\" ] || { echo \"install target not found: $TARGET_ID\" >&2; exit 1; }",
+        "[ \"$(lsblk -ndo TYPE \"$matches\")\" = disk ] || { echo 'target is not a whole disk' >&2; exit 1; }",
+        "count=$(find -L /dev/disk/by-id /dev/disk/by-path -samefile \"$matches\" 2>/dev/null | grep -Fx \"$TARGET_ID\" | wc -l)",
+        "[ \"$count\" -eq 1 ] || { echo 'install target identity is ambiguous' >&2; exit 1; }",
+        "src=$(findmnt -nro SOURCE /run/install/repo 2>/dev/null || true)",
+        "case \"$src\" in \"$matches\"|\"$matches\"[0-9]*|\"$matches\"p[0-9]*) echo 'target is installation media' >&2; exit 1;; esac",
+        "disk=$(basename \"$matches\")",
+        "printf 'ignoredisk --only-use=%s\\nclearpart --all --initlabel --drives=%s\\nautopart --encrypted --luks-version=%s\\n' \"$disk\" \"$disk\" " + shlex.quote(inst["luks_version"]) + " > /tmp/investigator-storage.ks",
+        "%end",
+        "%include /tmp/investigator-storage.ks",
+        "# Anaconda prompts for the unique per-machine LUKS passphrase.",
+    ]
     x.info(f"unattended install directives: {inst['lang']}, {inst['keyboard']}, "
            f"{inst['timezone']}"
            + (", full-disk encryption (passphrase prompted)"
@@ -1825,7 +2040,7 @@ def build_iso(x: Ctx, payload: Path):
         sig.unlink(missing_ok=True)
         x.info("signing the image (gpg hashes the whole file — expect minutes)")
         try:
-            x.run("gpg", "--batch", "--yes", "--local-user", x.c["iso_sign_key"],
+            x.run("gpg", *gpg_secret_options(x.args), "--local-user", x.c["iso_sign_key"],
                   "--detach-sign", "--armor", "--output", str(sig), str(target),
                   live=True)
             x.ok(f"signed: {sig.name}")
@@ -1868,15 +2083,28 @@ def build_iso(x: Ctx, payload: Path):
         write_fingerprint_sheet(x, x.c["iso_sign_key"])
 
     size_gb = target.stat().st_size / (1024 ** 3)
+    def commit_id(path: Path) -> str:
+        out = x.run("git", "rev-parse", "HEAD", cwd=path, check=False, capture=True)
+        return out.strip().splitlines()[0] if out.strip() else "unknown"
+
+    repo_commit = commit_id(Path(__file__).resolve().parent)
+    builder_commit = commit_id(x.builder)
+    config_digest = hashlib.sha256(json.dumps(
+        x.c, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     (x.out_dir / "BUILD-RECORD.txt").write_text(f"""\
 {x.c['iso_name']}
 built:            {datetime.now():%Y-%m-%d %H:%M:%S}
 host:             {os.uname().nodename}
+repository commit:{repo_commit}
+builder commit:   {builder_commit}
+config sha256:    {config_digest}
 qubes release:    {x.c['qubes_release']}
 base kickstart:   {base_ks}
 comps:            {x.c['comps_file']}
 tier:             {x.c['tier']}
 templates:        {' '.join(iso_tpls)}
+component remote: {x.c['component_remote'] or 'local generated component'}
+component signer: {x.c['component_sign_key'] or 'none (local component)'}
 auto-provision:   {x.c['auto_provision']}
 size:             {size_gb:.1f} GB
 sha256:           {digest}
@@ -2075,6 +2303,46 @@ def in_wsl() -> str:
 
 def _sudo(argv: list[str]) -> list[str]:
     return argv if os.geteuid() == 0 else ["sudo", *argv]
+
+
+def protected_secret_file(args) -> Path | None:
+    """Return a validated runtime secret file, never its contents.
+
+    Named pipes and /proc/self/fd/N are accepted for secret managers. Ordinary
+    files must belong to the invoking build identity and be inaccessible to
+    group/other users. This validation is repeated immediately before every
+    secret-key operation, so losing descriptor/file access during a resumed
+    orchestration fails closed.
+    """
+    raw = getattr(args, "passphrase_file", None)
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        st = path.stat()
+    except OSError as exc:
+        raise Fatal(f"cannot access --passphrase-file {path}: {exc}") from exc
+    owner = int(os.environ.get("SUDO_UID", os.getuid()))
+    if st.st_uid != owner:
+        raise Fatal(f"--passphrase-file {path} must be owned by build UID {owner}")
+    if st.st_mode & 0o077:
+        raise Fatal(f"--passphrase-file {path} permissions are too open; use chmod 600")
+    if not (path.is_file() or str(path).startswith("/proc/self/fd/")
+            or __import__("stat").S_ISFIFO(st.st_mode)):
+        raise Fatal("--passphrase-file must be a regular file, protected FIFO, or "
+                    "/proc/self/fd descriptor")
+    return path
+
+
+def gpg_secret_options(args, *, yes: bool = True) -> list[str]:
+    """GPG options for an unattended operation involving private material."""
+    pf = protected_secret_file(args)
+    opts = ["--batch"]
+    if yes:
+        opts.append("--yes")
+    if pf:
+        opts += ["--pinentry-mode", "loopback", "--passphrase-file", str(pf)]
+    return opts
 
 
 def _free_gb(path: Path) -> int | None:
@@ -2739,6 +3007,15 @@ def install_host_packages(x: Ctx, fam: str, ce: str) -> None:
 
 def setup_host(x: Ctx) -> int:
     x.phase("setup-host", "install and configure the build host")
+    if os.environ.get("SUDO_USER"):
+        raise Fatal("run setup-host/bootstrap as the original non-root build user, "
+                    "not through sudo. The script elevates only individual host "
+                    "changes so HOME, GNUPGHOME, and the signing keyring are preserved.")
+    if os.geteuid() != 0 and getattr(x.args, "assume_yes", False):
+        if not x.quiet("sudo", "-n", "true"):
+            raise Fatal("unattended setup requires sudo readiness. Authenticate once "
+                        "with 'sudo -v' (or use an approved credential helper), then "
+                        "retry --yes; sudo policy will not be modified.")
     d = host_distro()
     fam = d.family
     if fam == "unknown":
@@ -2767,7 +3044,8 @@ def setup_host(x: Ctx) -> int:
     if ce == "docker":
         plan.append(_sudo(["systemctl", "enable", "--now", "docker"]))
         user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
-        groups = subprocess.run(["id", "-nG"], capture_output=True, text=True).stdout.split()
+        groups = subprocess.run(["id", "-nG", user], capture_output=True,
+                                text=True).stdout.split()
         if user and "docker" not in groups:
             plan.append(_sudo(["usermod", "-aG", "docker", user]))
 
@@ -2890,6 +3168,19 @@ def gen_key(x: Ctx) -> int:
     have = secret_key_fingerprints()
 
     sel = getattr(x.args, "use_key", None)
+    configured = (x.c.get("iso_sign_key") or "").replace(" ", "").upper()
+    if configured:
+        if not re.fullmatch(r"[0-9A-F]{40}", configured):
+            raise Fatal("configured iso_sign_key is not a valid full fingerprint")
+        if sel and sel != "auto" and sel.replace(" ", "").upper() != configured:
+            raise Fatal(f"--use-key selects {sel}, but iso-build.json is pinned to "
+                        f"{configured}. Change configuration explicitly before key rotation.")
+        if not x.quiet("gpg", "--list-secret-keys", configured):
+            raise Fatal(f"configured signing key {configured} is not available in this "
+                        "build user's keyring. Restore/import that key; ordinary retry "
+                        "will not generate a replacement identity.")
+        x.info("reusing iso_sign_key already pinned in iso-build.json")
+        return _adopt_key(x, configured)
     if sel:
         if sel == "auto":
             if not have:
@@ -2923,11 +3214,15 @@ def gen_key(x: Ctx) -> int:
                     '     or adopt a key already in this keyring:\n'
                     '     ./build_iso.py gen-key --use-key auto')
 
-    for fpr, existing in have:
-        if uid.lower() in existing.lower():
-            x.warn(f"a secret key for this identity already exists: {fpr}")
-            if not confirmed(x, "Create a SECOND key anyway?"):
-                return _adopt_key(x, fpr)
+    matches = [(f, existing) for f, existing in have
+               if uid.casefold() == existing.casefold()]
+    if len({f for f, _ in matches}) == 1:
+        fpr = matches[0][0]
+        x.info(f"reusing the existing key for this exact identity: {fpr}")
+        return _adopt_key(x, fpr)
+    if matches:
+        raise Fatal("more than one secret key matches --uid; pass --use-key with "
+                    "the intended full fingerprint. --yes never rotates identities.")
 
     expire = getattr(x.args, "expire", None) or "3y"
     nopass = getattr(x.args, "no_passphrase", False)
@@ -2947,10 +3242,9 @@ def gen_key(x: Ctx) -> int:
         raise Fatal("aborted")
 
     before = {f for f, _ in secret_key_fingerprints()}
-    pf = getattr(x.args, "passphrase_file", None)
+    pf = protected_secret_file(x.args)
     if pf and not nopass:
-        x.run("gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
-              "--passphrase-file", str(pf), "--quick-generate-key", uid,
+        x.run("gpg", *gpg_secret_options(x.args), "--quick-generate-key", uid,
               "rsa4096", "sign", expire, live=True)
     elif nopass:
         x.run("gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
@@ -3051,16 +3345,32 @@ def backup_key(x: Ctx) -> int:
     if not x.quiet("gpg", "--list-secret-keys", fpr):
         raise Fatal(f"no SECRET key for {fpr} in this keyring")
     dest = Path(getattr(x.args, "to", None) or (x.out_dir / "key-backup"))
+    if not getattr(x.args, "to", None):
+        raise Fatal("key backups must be outside distributable output. Pass --to "
+                    "on a separately mounted backup medium.")
     if x.args.dry_run:
         x.info(f"[dry-run] export {fpr} (secret key, revocation certificate, "
                f"public key) to {dest}")
         return 0
+    # A pre-created /mnt/backup directory looks exactly like mounted media when
+    # the disk is absent. Resolve the nearest existing ancestor and require a
+    # real mount other than the root filesystem before writing any key bytes.
+    ancestor = dest.resolve()
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    mount = ancestor
+    while mount != mount.parent and not os.path.ismount(mount):
+        mount = mount.parent
+    if mount == Path("/"):
+        raise Fatal(f"backup destination {dest} is not on a separately mounted "
+                    "medium. Mount the intended backup disk and retry.")
     dest.mkdir(parents=True, exist_ok=True)
     dest.chmod(0o700)
     old_umask = os.umask(0o077)
     try:
         sec = dest / f"{fpr}-secret.asc"
-        if not getattr(x.args, "passphrase_file", None):
+        pf = protected_secret_file(x.args)
+        if not pf:
             if not sys.stdin.isatty():
                 raise Fatal("backing up a key needs a terminal for the "
                             "passphrase prompts, or --passphrase-file <path> "
@@ -3070,21 +3380,19 @@ def backup_key(x: Ctx) -> int:
                    "are needed to restore.")
         # Encrypted at rest with a passphrase, not a bare export: this file is
         # about to be carried somewhere.
-        rc = subprocess.run(
-            ["gpg", "--export-secret-keys", "--armor", "--output", str(sec), fpr]
-        ).returncode
+        sec.unlink(missing_ok=True)
+        rc = subprocess.run(["gpg", *gpg_secret_options(x.args),
+                             "--export-secret-keys", "--armor", "--output",
+                             str(sec), fpr], stdin=subprocess.DEVNULL).returncode
         if rc != 0 or not sec.exists():
             raise Fatal(f"gpg could not export the secret key (exit {rc})")
         sec.chmod(0o600)
         enc = dest / f"{fpr}-secret.asc.gpg"
         enc.unlink(missing_ok=True)
-        pf = getattr(x.args, "passphrase_file", None)
         argv = ["gpg", "--symmetric", "--cipher-algo", "AES256",
                 "--output", str(enc)]
         if pf:
-            # For a unit that scripts this into its own key-management process.
-            argv[1:1] = ["--batch", "--yes", "--pinentry-mode", "loopback",
-                         "--passphrase-file", str(pf)]
+            argv[1:1] = gpg_secret_options(x.args)
         rc = subprocess.run(argv + [str(sec)]).returncode
         if rc != 0 or not enc.exists():
             sec.unlink(missing_ok=True)
@@ -3784,7 +4092,7 @@ def sign_iso(x: Ctx) -> int:
     sig = iso.parent / f"{iso.name}.asc"
     sig.unlink(missing_ok=True)
     x.info("signing (gpg hashes the whole image — expect minutes)")
-    x.run("gpg", "--batch", "--yes", "--local-user", fpr, "--detach-sign",
+    x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr, "--detach-sign",
           "--armor", "--output", str(sig), str(iso), live=True)
     x.ok(f"signed: {sig.name}")
     # Everything that has to travel with, or beside, the signature.
@@ -3966,7 +4274,7 @@ def write_usb(x: Ctx) -> int:
                         f"not the one that was built. Do not distribute it.")
         x.ok("checksum matches the build record")
     else:
-        x.warn("no .sha256 beside the image — cannot verify it before writing")
+        raise Fatal("no .sha256 beside the image — refusing destructive write")
 
     asc = x.out_dir / f"{x.c['iso_name']}.asc"
     if asc.is_file():
@@ -3994,7 +4302,10 @@ def write_usb(x: Ctx) -> int:
                         f"key {want}.\n     Do not write it to media.")
         x.ok(f"signature verifies, signed by {signer}")
     else:
-        x.warn("image is UNSIGNED — colleagues will have nothing to verify against")
+        raise Fatal("no detached signature beside the image — refusing destructive write")
+    if not (x.c.get("iso_sign_key") or "").strip():
+        raise Fatal("iso_sign_key is not configured, so the expected signer cannot "
+                    "be authenticated before writing")
 
     # 2. Pick a device, and refuse anything that is not removable.
     devs = removable_devices()

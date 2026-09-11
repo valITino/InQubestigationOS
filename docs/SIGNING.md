@@ -62,6 +62,14 @@ Already have a unit key in this keyring? Adopt it instead of making another:
     ./build_iso.py gen-key --use-key auto          # if there is exactly one
     ./build_iso.py gen-key --use-key <fingerprint> # otherwise
 
+For unattended protected-key operations, pass a build-user-owned, mode-0600
+runtime file (or protected FIFO/inherited `/proc/self/fd/N`) with
+`--passphrase-file`. The same option covers generation, secret export and
+backup encryption, component-tag signing, the readiness probe, and final ISO
+signing. The secret is supplied to GPG through that file, never as a literal
+argument or stored configuration. A configured `iso_sign_key` is always reused;
+ordinary retries and `--yes` cannot rotate it.
+
 `./build_iso.py doctor` then confirms the secret key is present and warns if it
 expires within 90 days, before a multi-hour build rather than after it.
 

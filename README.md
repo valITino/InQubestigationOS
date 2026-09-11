@@ -52,7 +52,9 @@ templates, and Whonix.
 # On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~250 GB
 # free — nothing pre-installed
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
-./build_iso.py bootstrap          # host, key, key backup, checks, plan, build
+# See GUIDE: bootstrap requires a mounted external --to destination; protected
+# unattended keys use a mode-0600 runtime --passphrase-file.
+./build_iso.py bootstrap --to /mnt/image-key-backup/inqubestigation
 ./build_iso.py write-usb --wait   # plug the stick in when it asks
 ```
 
@@ -65,6 +67,8 @@ Boot the USB and install. First boot provisions itself; there is nothing to do
 by hand, and the recurring maintenance installs itself as timers.
 
 Full walkthrough: **[docs/GUIDE.md](docs/GUIDE.md)**.
+Trusted release-candidate runner setup: **[docs/RELEASE.md](docs/RELEASE.md)**.
+Spare-machine acceptance and pending report: **[docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)**.
 
 ## Repository layout
 
