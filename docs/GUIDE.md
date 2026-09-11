@@ -191,8 +191,6 @@ a PowerShell script beside the ISO for exactly this:
 ```powershell
 .\verify-iso.ps1 <the fingerprint you were given out of band>
 erify-iso.ps1 <the fingerprint you were given out of band>
-```
-
 # The administrator mounts the removable backup filesystem first. Merely
 # creating /mnt/image-key-backup is deliberately not sufficient.
 sudo mount LABEL=IMAGE-KEY-BACKUP /mnt/image-key-backup
@@ -219,6 +217,9 @@ the run. It is never copied into JSON, logs, artifacts, or the ISO. Run bootstra
 as the ordinary build user, not via `sudo`; after `setup-host`, orchestration
 enters the new Docker group with `sg` while retaining that user's HOME and GPG
 keyring. For `--yes`, authenticate with `sudo -v` first; the script verifies
+non-interactive sudo readiness and does not edit sudo policy.
+
+./build_iso.py bootstrap
 non-interactive sudo readiness and does not edit sudo policy.
 
 Gpg4win, and exits non-zero on any mismatch. Without a fingerprint argument it
@@ -309,7 +310,7 @@ For an unattended run, `--yes` answers every prompt.
 ## 3. Create the signing key
 
 ```bash
-./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"
+| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
 ```
 
 That generates an rsa4096 signing key with a three-year expiry — deliberate: an
@@ -541,9 +542,8 @@ passed: first boot runs local/offline checks and records DNS resolution and Tor
 exit confirmation as `PENDING ONLINE`, never PASS. Run the full `--verify` after
 network enrollment; issuance remains blocked by real failures.
 
-Attempts are serialized. The status log distinguishes `deferred` prerequisites,
-`failed` provisioning/checks and `complete`; failures retain their exit code and
-the inactive timer retries. The completion marker is created only after all
+   non-interactively, and retries every thirty minutes until the machine is
+   provisioned — so a laptop left alone overnight finishes by itself.
 phases and the offline-capable acceptance gate return success.
 > replace the image can replace the key beside it. Read the fingerprint out over
 > the phone, or publish it somewhere colleagues already trust. `FINGERPRINT.txt`
