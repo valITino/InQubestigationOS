@@ -73,10 +73,13 @@ def main():
         x.c["install"]["disk"] = "/dev/sda"
         fatal(lambda: bi.build_installer_directives(x), "by-id")
 
-        # The composed validator catches a stock kickstart that forgot the user.
+        # Account enrollment no longer depends on the selected upstream file:
+        # the generated target kickstart creates it locked and first boot asks
+        # for its unique secret on the physical laptop.
         stock.write_text("lang en_US.UTF-8\n")
-        fatal(lambda: bi.validate_install_contract(x, conf / Path(rel).name, stock),
-              "user creation")
+        bi.validate_install_contract(x, conf / Path(rel).name, stock)
+        assert "user --name=investigator --groups=wheel --lock" in text
+        assert "systemd-ask-password" in text and "| chpasswd" in text
 
         # write-usb refuses before device discovery if integrity metadata is absent.
         iso = x.out_dir / x.c["iso_name"]

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Non-secret bootstrap onboarding, destination validation, status and export.
-
-This module intentionally supports one transport: an already guest-visible
-mounted filesystem.  It never guesses a hypervisor, mounts an arbitrary block
-device, or mistakes a directory on ``/`` for host storage.
-"""
+"""Guided bootstrap, safe mount preparation, truthful status and export."""
 from __future__ import annotations
 
 import fcntl
@@ -13,6 +8,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import getpass
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +37,8 @@ class BootstrapWorkflow:
         self.lock_path = ctx.work / ".bootstrap.lock"
         self.lock_file = None
         self.completed: list[str] = []
+        self.mounted: list[Path] = []
+        self.secret_files: list[Path] = []
 
     @property
     def backup_path(self) -> Path | None:
@@ -55,6 +55,144 @@ class BootstrapWorkflow:
             return None
         rows = json.loads(p.stdout).get("filesystems", [])
         return rows[0] if len(rows) == 1 else None
+
+    @staticmethod
+    def discover_block_filesystems() -> list[dict]:
+        """Return only existing filesystems; never propose blank disks."""
+        p = subprocess.run(["lsblk", "--json", "--paths", "--bytes",
+                            "--output", "NAME,TYPE,SIZE,FSTYPE,UUID,LABEL,MODEL,MOUNTPOINTS,RM"],
+                           capture_output=True, text=True)
+        if p.returncode:
+            return []
+        result = []
+        def walk(rows):
+            for row in rows:
+                if row.get("fstype") and row.get("type") in ("part", "crypt", "lvm"):
+                    result.append(row)
+                walk(row.get("children") or [])
+        try:
+            walk(json.loads(p.stdout).get("blockdevices", []))
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return result
+
+    def _run_privileged(self, argv: list[str]) -> None:
+        command = argv if os.geteuid() == 0 else ["sudo", *argv]
+        rc = subprocess.run(command).returncode
+        if rc:
+            raise ValueError(f"authorized command failed ({rc}): {' '.join(argv)}")
+
+    def prepare_mount(self, role: str) -> tuple[Path, dict]:
+        """Mount an explicitly selected, preformatted block/share resource."""
+        path = Path(self.cfg[f"{role}_path"])
+        source = self.cfg[f"{role}_source"]
+        fstype = self.cfg[f"{role}_fstype"]
+        existing = self._mount(path) if path.exists() else None
+        if existing and existing.get("target") != "/":
+            return self._validate(role, minimum_mb=0)
+        if not source or not fstype:
+            raise ValueError(f"{role}: no approved mount identity")
+        if fstype not in {"ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "exfat",
+                          "ntfs3", "virtiofs", "9p", "cifs", "nfs", "nfs4"}:
+            raise ValueError(f"{role}: unsupported mount filesystem {fstype}")
+        # Credentials must be supplied by the provider/kernel mechanism; never
+        # place them in configuration or argv.
+        options = "nodev,nosuid"
+        if fstype in {"virtiofs", "9p"}:
+            options += ",noexec"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=0o700, exist_ok=True)
+        self.stage(role, "preparing", f"mounting approved {source} at {path}")
+        self._run_privileged(["mount", "-t", fstype, "-o", options, source, str(path)])
+        self.mounted.append(path)
+        try:
+            return self._validate(role, minimum_mb=0)
+        except Exception:
+            self._run_privileged(["umount", str(path)])
+            self.mounted.remove(path)
+            raise
+
+    def _ask(self, heading: str, explanation: str, default: str = "") -> str:
+        print(f"\n[{heading}] {explanation}")
+        suffix = f" [{default}]" if default else ""
+        answer = input(f">{suffix}: ").strip()
+        return answer or default
+
+    def _secret(self, label: str) -> Path:
+        first = getpass.getpass(f"{label} (hidden; held only for this run): ")
+        second = getpass.getpass(f"Confirm {label}: ")
+        if not first or first != second:
+            raise ValueError(f"{label}: values were empty or did not match")
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+        fd, name = tempfile.mkstemp(prefix="inqubestigation-", dir=runtime)
+        path = Path(name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(first)
+        self.secret_files.append(path)
+        return path
+
+    def guided_setup(self, args) -> None:
+        """Collect and persist non-secret choices; secrets remain run-scoped."""
+        if not sys.stdin.isatty():
+            return
+        print("\nGUIDED SETUP — build VM")
+        print("Measured resources are shown first. Mounting changes no filesystem; "
+              "formatting and target-disk selection are never inferred or approved by --yes.")
+        devices = self.discover_block_filesystems()
+        for i, d in enumerate(devices, 1):
+            print(f"  {i}. {d.get('name')}  {d.get('label') or '(no label)'}  "
+                  f"{d.get('fstype')}  {int(d.get('size') or 0)//(1024**3)} GiB  "
+                  f"mounted: {', '.join(d.get('mountpoints') or []) or 'no'}")
+        changed = False
+        for role, kind in (("backup", "physical-device"), ("export", "host-share")):
+            if self.cfg.get(f"{role}_source"):
+                continue
+            print(f"\n{role.title()} storage is reusable, non-secret, and stored in iso-build.json.")
+            choice = self._ask(role, "Select a detected preformatted filesystem number, "
+                               "or type 'share' for an already exposed host share")
+            if choice.isdigit() and 1 <= int(choice) <= len(devices):
+                d = devices[int(choice)-1]
+                stable = f"/dev/disk/by-uuid/{d['uuid']}" if d.get("uuid") else d["name"]
+                self.cfg[f"{role}_source"] = stable
+                self.cfg[f"{role}_fstype"] = d["fstype"]
+                self.cfg[f"{role}_kind"] = "physical-device" if role == "backup" else kind
+            elif choice == "share":
+                self.cfg[f"{role}_source"] = self._ask(role, "Provider mount source/tag "
+                                                        "(not a password or host path)")
+                self.cfg[f"{role}_fstype"] = self._ask(role, "Supported type: virtiofs, 9p, cifs, nfs4")
+                if role == "backup":
+                    self.cfg["backup_kind"] = "host-share"
+            else:
+                raise ValueError(f"{role}: no unambiguous resource selected")
+            self.cfg[f"{role}_path"] = self._ask(role, "Guest mountpoint (created automatically)",
+                                                   f"/mnt/inqubestigation-{role}")
+            changed = True
+        if not self.x.c.get("iso_sign_key") and not (args.uid or args.use_key):
+            keys = __import__("build_iso").secret_key_fingerprints()
+            if len(keys) == 1:
+                args.use_key = keys[0][0]
+                print(f"Using the one existing signing key: {keys[0][0]} ({keys[0][1]})")
+            else:
+                args.uid = self._ask("Signing identity", "Public name/email for a new signing key. "
+                                     "The private key remains in this user's GnuPG home")
+        if not args.passphrase_file and not args.no_passphrase:
+            args.passphrase_file = str(self._secret("signing-key passphrase"))
+        if changed:
+            from build_iso import CONF_PATH
+            CONF_PATH.write_text(json.dumps(self.x.c, indent=2, sort_keys=True) + "\n")
+            os.chmod(CONF_PATH, 0o600)
+
+    def cleanup(self) -> None:
+        for path in self.secret_files:
+            path.unlink(missing_ok=True)
+        # Preserve mounts during a resumable workflow. They are unmounted only
+        # after completion, and only if this run created them.
+        for path in reversed(self.mounted):
+            try:
+                self._run_privileged(["umount", str(path)])
+            except ValueError:
+                self.stage("cleanup", "failed", f"could not unmount workflow mount {path}")
 
     def _validate(self, role: str, *, minimum_mb: int) -> tuple[Path, dict]:
         path = Path(self.cfg.get(f"{role}_path", ""))
@@ -88,6 +226,7 @@ class BootstrapWorkflow:
         if args.to and not self.cfg.get("backup_path"):
             raise ValueError("--to supplies only a path and cannot establish media identity; "
                              "configure bootstrap.backup_path/source/fstype/kind")
+        self.guided_setup(args)
         missing = []
         if not self.x.c.get("iso_sign_key") and not (args.uid or args.use_key):
             missing.append("signing identity: pass --uid/--use-key or configure iso_sign_key")
@@ -104,6 +243,7 @@ class BootstrapWorkflow:
             if role == "export" and self.cfg.get("build_only"):
                 continue
             try:
+                self.prepare_mount(role)
                 self._validate(role, minimum_mb=int(minimum))
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 missing.append(str(exc))
@@ -169,7 +309,7 @@ class BootstrapWorkflow:
         if self.cfg.get("build_only"):
             self.stage("export", "blocked", "explicit build-only mode")
             return
-        destination, identity = self._validate("export", minimum_mb=int(self.cfg["min_export_mb"]))
+        destination, identity = self._validate("export", minimum_mb=0)
         names = list(EXPORT_ALLOWLIST)
         names[0] = self.x.c["iso_name"]
         names[1] = self.x.c["iso_name"] + ".sha256"
@@ -177,6 +317,10 @@ class BootstrapWorkflow:
         missing = [name for name in names if not (self.x.out_dir / name).is_file()]
         if missing:
             raise ValueError(f"export allowlist incomplete: {missing}")
+        total = sum((self.x.out_dir / name).stat().st_size for name in names)
+        if shutil.disk_usage(destination).free < total:
+            raise ValueError(f"export needs {total} bytes but the destination has insufficient space")
+        self._verify_release(self.x.out_dir, names)
         release = f"release-{self.x.state_digest('build')[:12]}"
         final = destination / release
         staging = destination / (release + f".incomplete-{self.run_id}")
@@ -210,7 +354,26 @@ class BootstrapWorkflow:
                                 "verified": True, "artifacts": artifacts},
                      "runtime_secret": {"persisted": False, "value_reported": False}}
         self.inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
-        self.stage("export", "complete", f"readback verified at {final}")
+        self._verify_release(final, names)
+        self.stage("export", "complete", f"checksum, trusted signature and readback verified at {final}")
+
+    def _verify_release(self, directory: Path, names: list[str]) -> None:
+        iso, checksum, signature = (directory / names[i] for i in range(3))
+        fields = checksum.read_text().split()
+        if not fields or fields[0].lower() != self._hash(iso):
+            raise ValueError("ISO checksum authentication failed")
+        expected = self.x.c["iso_sign_key"].replace(" ", "").upper()
+        p = subprocess.run(["gpg", "--batch", "--status-fd", "1", "--verify",
+                            str(signature), str(iso)], capture_output=True, text=True)
+        valid = []
+        for line in p.stdout.splitlines():
+            parts = line.split()
+            if line.startswith("[GNUPG:] VALIDSIG "):
+                valid.extend([parts[2].upper(), parts[-1].upper()])
+        if p.returncode or expected not in valid:
+            raise ValueError(f"ISO signature is not authenticated by configured identity {expected}")
 
     def finish(self) -> None:
-        self._write_status("complete", "bootstrap", "build and required export verified")
+        detail = ("build complete; export not requested" if self.cfg.get("build_only") else
+                  "build complete; exported bytes and trusted signature verified")
+        self._write_status("complete", "bootstrap", detail)
