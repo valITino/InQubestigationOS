@@ -1,5 +1,7 @@
 # Trusted Tier-2 release-candidate builds
 
+`build_iso.py bootstrap` performs staged, allowlisted, destination-readback-verified host export. `release_candidate.py` remains the stricter trusted-runner gate. See [BOOTSTRAP.md](BOOTSTRAP.md).
+
 The normal `checks` workflow is intentionally untrusted: it runs for pull
 requests on GitHub-hosted runners and has no production signing key. It never
 targets the `inqubestigation-trusted-build` label. A full build is opt-in through

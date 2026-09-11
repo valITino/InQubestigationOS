@@ -1,5 +1,7 @@
 # ISO signing — what to send me, and what never to send
 
+Bootstrap requires an approved mounted backup identity and protected runtime passphrase source before expensive work. Private backup and revocation material are excluded from exports; see [BOOTSTRAP.md](BOOTSTRAP.md).
+
 ## Send only the fingerprint
 
 A GPG **fingerprint** is public. It is safe to paste into a chat, commit to the

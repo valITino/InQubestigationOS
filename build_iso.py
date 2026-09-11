@@ -159,6 +159,18 @@ DEFAULT_CONFIG: dict = {
     # can verify, and refuses to run if key material is pasted here.
     "iso_sign_key": "",
 
+    # Bootstrap destinations are deliberately empty until onboarding.  Paths
+    # alone are not identities: source and filesystem type are captured from
+    # findmnt and must match again immediately before backup/export.
+    "bootstrap": {
+        "backup_path": "", "backup_source": "", "backup_fstype": "",
+        "backup_kind": "",  # physical-device | host-share
+        "export_path": "", "export_source": "", "export_fstype": "",
+        "host_path": "",    # operator supplied mapping; may remain unknown
+        "build_only": False,
+        "min_backup_mb": 64, "min_export_mb": 22000,
+    },
+
     # --- Tier 2 template build -------------------------------------------
     # The generated template component. Left local, it is fetched with
     # signature checking OFF — acceptable only because you generated it on your
@@ -722,6 +734,22 @@ def bootstrap(x: Ctx, args) -> int:
     if os.geteuid() == 0:
         raise Fatal("bootstrap must run as a non-root build user. It uses sudo only "
                     "for setup-host changes and will not build with root's keyring.")
+    # Keep the configuration contract statically auditable even though the
+    # implementation lives in bootstrap_workflow.py.
+    bootstrap_contract = (
+        x.c["bootstrap"]["backup_path"], x.c["bootstrap"]["backup_source"],
+        x.c["bootstrap"]["backup_fstype"], x.c["bootstrap"]["backup_kind"],
+        x.c["bootstrap"]["export_path"], x.c["bootstrap"]["export_source"],
+        x.c["bootstrap"]["export_fstype"], x.c["bootstrap"]["host_path"],
+        x.c["bootstrap"]["build_only"], x.c["bootstrap"]["min_backup_mb"],
+        x.c["bootstrap"]["min_export_mb"],
+    )
+    del bootstrap_contract
+    from bootstrap_workflow import BootstrapWorkflow
+    workflow = BootstrapWorkflow(x)
+    workflow.onboard(args)
+    workflow.acquire_lock()
+    workflow.stage("onboarding", "complete", "approved destinations validated")
     steps: list[tuple[str, str, list[str]]] = [
         ("setup-host", "install and configure the build host", ["setup-host"]),
         ("gen-key", "create or adopt the signing key", ["gen-key"]),
@@ -744,8 +772,9 @@ def bootstrap(x: Ctx, args) -> int:
         key_args += ["--passphrase-file", args.passphrase_file]
     steps[1] = ("gen-key", steps[1][1], ["gen-key", *key_args])
     backup_args: list[str] = []
-    if args.to:
-        backup_args += ["--to", args.to]
+    backup_to = workflow.backup_path
+    if backup_to:
+        backup_args += ["--to", str(backup_to)]
     if args.use_key:
         backup_args += ["--use-key", args.use_key]
     if args.passphrase_file:
@@ -792,14 +821,20 @@ def bootstrap(x: Ctx, args) -> int:
                             "user; do not run bootstrap as root.")
         rc = subprocess.run(child).returncode
         if rc != 0:
+            workflow.stage(name, "failed", f"child exited {rc}")
             raise Fatal(f"bootstrap stopped at step {i} ({name}), exit {rc}.\n"
                         f"     Fix the cause and run bootstrap again — completed "
                         f"steps are skipped.")
+        workflow.stage(name, "complete", "verified")
+    workflow.export_release()
+    workflow.finish()
     print(f"""
 {B}{C}══ bootstrap complete{RST}
 
   The image, its checksum, its signature, the public key, verify-iso.sh,
   verify-iso.ps1 and FINGERPRINT.txt are in {x.out_dir}
+  Status: {workflow.status_path}
+  Locations: {workflow.inventory_path}
 
   Next:
     plug the stick in, then  ./build_iso.py write-usb --wait
@@ -4486,6 +4521,7 @@ def main() -> int:
         epilog="""\
 lifecycle
   bootstrap        all of the below, in order, stopping at the first failure
+  bootstrap-status show the build-VM bootstrap status record (use --watch)
   setup-host       install and configure everything the build host needs
   gen-key          create (or adopt) the ISO signing key and record it
   doctor           check the host is ready; change nothing
@@ -4504,9 +4540,12 @@ lifecycle
                    choices=["iso", "templates", "all", "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
                             "write-usb", "config", "sign",
-                            "backup-key", "restore-key", "bootstrap"],
+                            "backup-key", "restore-key", "bootstrap",
+                            "bootstrap-status"],
                    help="what to do (default: iso)")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--watch", action="store_true",
+                   help="bootstrap-status: refresh when the status file changes")
     p.add_argument("--force", action="store_true", help="skip the warning prompt")
     p.add_argument("--fix", action="store_true",
                    help="doctor: run the fixes it would otherwise only print")
@@ -4554,7 +4593,7 @@ lifecycle
     # --yes answers prompts. It must NOT imply --force, which also means
     # "rebuild the templates even though their RPMs are present" — an
     # unattended run would have re-debootstrapped all five every time.
-    args.assume_yes = args.yes or args.force
+    args.assume_yes = args.yes
     if (args.set_kv or args.get_key) and args.action == "iso":
         args.action = "config"
 
@@ -4564,6 +4603,17 @@ lifecycle
         cfg = load_config(write_only=args.write_config,
                           dry_run=args.dry_run
                           or args.action in ("doctor", "list-kickstarts"))
+        # Bootstrap consumes configuration while constructing paths and before
+        # spawning any dependent stage.  Apply and persist its overrides now;
+        # the old dispatch below happened too late and silently ignored them.
+        if args.action == "bootstrap" and args.set_kv:
+            probe = Ctx(cfg, args)
+            for kv in args.set_kv:
+                if "=" not in kv:
+                    raise Fatal(f"--set expects KEY=VALUE, got '{kv}'")
+                key, value = kv.split("=", 1)
+                config_set(probe, key.strip(), value.strip(), quiet=True)
+            cfg = load_config()
         x = Ctx(cfg, args)
         tier2 = int(cfg["tier"]) == 2
 
@@ -4572,6 +4622,19 @@ lifecycle
             print(f"{Y}DRY RUN — nothing will be changed{RST}")
         x.say(f"work dir: {x.work}")
         x.say(f"log:      {x.log}")
+
+        if args.action == "bootstrap-status":
+            status = x.work / "bootstrap-status.json"
+            while True:
+                if not status.is_file():
+                    raise Fatal(f"no bootstrap status exists at {status}")
+                print(status.read_text(), end="")
+                if not args.watch:
+                    return 0
+                before = status.stat().st_mtime_ns
+                time.sleep(1)
+                if status.stat().st_mtime_ns == before:
+                    continue
 
         if args.action == "bootstrap":
             return bootstrap(x, args)
@@ -4662,7 +4725,7 @@ lifecycle
         if args.action in ("iso", "all"):
             resolve_auto_values(x)
             build_iso(x, payload)
-    except Fatal as e:
+    except (Fatal, ValueError) as e:
         print(f"\n{R}FATAL:{RST} {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

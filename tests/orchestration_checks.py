@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("build_iso", ROOT / "build_iso.py")
 bi = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bi)
@@ -87,6 +89,7 @@ def main():
         a = args(action="bootstrap", uid="Unit", use_key=fp, expire="2y",
                  passphrase_file=str(secret), to="/media/backup")
         x = ctx(td, a)
+        x.c["bootstrap"]["backup_path"] = "/media/backup"
         calls = []
 
         def child(argv, **_kw):
@@ -96,6 +99,9 @@ def main():
         with mock.patch("os.geteuid", return_value=1000), \
                 mock.patch.object(bi, "confirmed", return_value=True), \
                 mock.patch.object(x, "quiet", return_value=True), \
+                mock.patch("bootstrap_workflow.BootstrapWorkflow.onboard"), \
+                mock.patch("bootstrap_workflow.BootstrapWorkflow.acquire_lock"), \
+                mock.patch("bootstrap_workflow.BootstrapWorkflow.stage"), \
                 mock.patch.object(bi.subprocess, "run", side_effect=child):
             expect_fatal(lambda: bi.bootstrap(x, a), "doctor")
         flat = [item for command in calls for item in command]
@@ -112,7 +118,28 @@ def main():
         x.c["tier"] = 1
         assert not x.done("templates")
 
-    print("  14/14 unattended orchestration checks pass")
+        # Bootstrap applies --set before Ctx derives work/output paths. Mock
+        # only the expensive dispatcher: relying on the caller being root made
+        # this regression test pass locally but fail on non-root CI runners.
+        config = Path(td) / "override-config.json"
+        chosen = Path(td) / "chosen work"
+        observed = {}
+
+        def dispatch(effective, _args):
+            observed["work"] = effective.work
+            observed["configured"] = effective.c["work_dir"]
+            return 0
+
+        argv = ["build_iso.py", "bootstrap", "--set", f"work_dir={chosen}",
+                "--yes"]
+        with mock.patch.object(bi, "CONF_PATH", config), \
+                mock.patch.object(bi, "bootstrap", side_effect=dispatch), \
+                mock.patch.object(sys, "argv", argv):
+            assert bi.main() == 0
+        assert observed == {"work": chosen, "configured": str(chosen)}
+        assert config.is_file() and str(chosen) in config.read_text()
+
+    print("  16/16 unattended orchestration checks pass")
     return 0
 
 

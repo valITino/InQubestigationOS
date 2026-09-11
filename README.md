@@ -1,5 +1,7 @@
 # InQubestigationOS
 
+> **Primary build entry point:** use `./build_iso.py bootstrap`. It performs mandatory upfront destination/security review and verified host-accessible export. See [the bootstrap operator contract](docs/BOOTSTRAP.md); paths and hypervisor details are never guessed.
+
 A hardened Qubes OS build for cybercrime investigation workstations. Every
 clearnet connection is forced through a proxy, an inline IPS and a DPI recorder
 before it reaches the firewall; Tor traffic takes a separate, uninspected road;

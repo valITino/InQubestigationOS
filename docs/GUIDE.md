@@ -1,5 +1,7 @@
 # InQubestigationOS — the complete guide
 
+The current build quick start is the single `./build_iso.py bootstrap` workflow, not a manual mount/build/copy checklist. Complete the measured fields and read [BOOTSTRAP.md](BOOTSTRAP.md).
+
 From an empty build host to an issued investigator laptop. Follow it in order.
 
 **Contents**

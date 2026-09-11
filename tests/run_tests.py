@@ -129,7 +129,7 @@ def main() -> int:
     # golden_image.py writes its config beside itself, so run from a copy.
     sandbox = work / "repo"
     sandbox.mkdir()
-    for f in ("golden_image.py", "build_iso.py"):
+    for f in ("golden_image.py", "build_iso.py", "bootstrap_workflow.py"):
         shutil.copy2(ROOT / f, sandbox / f)
     gi = sandbox / "golden_image.py"
     bi = sandbox / "build_iso.py"
