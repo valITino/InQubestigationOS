@@ -66,13 +66,26 @@ class BootstrapWorkflow:
             return []
         result = []
         def walk(rows):
+            if not isinstance(rows, list):
+                raise TypeError("block device collection is not a list")
             for row in rows:
+                if not isinstance(row, dict):
+                    raise TypeError("block device entry is not an object")
+                mountpoints = row.get("mountpoints")
+                if mountpoints is None:
+                    row["mountpoints"] = []
+                elif not isinstance(mountpoints, list) or any(
+                        value is not None and not isinstance(value, str)
+                        for value in mountpoints):
+                    raise TypeError("mountpoints is not a string/null array")
+                else:
+                    row["mountpoints"] = [value for value in mountpoints if value]
                 if row.get("fstype") and row.get("type") in ("part", "crypt", "lvm"):
                     result.append(row)
                 walk(row.get("children") or [])
         try:
             walk(json.loads(p.stdout).get("blockdevices", []))
-        except (TypeError, json.JSONDecodeError):
+        except (TypeError, json.JSONDecodeError, AttributeError):
             return []
         return result
 
@@ -85,11 +98,17 @@ class BootstrapWorkflow:
     def prepare_mount(self, role: str) -> tuple[Path, dict]:
         """Mount an explicitly selected, preformatted block/share resource."""
         path = Path(self.cfg[f"{role}_path"])
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"{role}: mountpoint must be an absolute normalized path")
         source = self.cfg[f"{role}_source"]
         fstype = self.cfg[f"{role}_fstype"]
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent.exists()):
+            raise ValueError(f"{role}: mountpoint or parent is an unsafe symlink")
         existing = self._mount(path) if path.exists() else None
-        if existing and existing.get("target") != "/":
+        if existing and existing.get("target") == str(path):
             return self._validate(role, minimum_mb=0)
+        if path.exists() and (not path.is_dir() or any(path.iterdir())):
+            raise ValueError(f"{role}: unmounted mountpoint is not an empty directory")
         if not source or not fstype:
             raise ValueError(f"{role}: no approved mount identity")
         if fstype not in {"ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "exfat",
@@ -100,9 +119,10 @@ class BootstrapWorkflow:
         options = "nodev,nosuid"
         if fstype in {"virtiofs", "9p"}:
             options += ",noexec"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.mkdir(mode=0o700, exist_ok=True)
         self.stage(role, "preparing", f"mounting approved {source} at {path}")
+        # Creation beneath /mnt is intentionally privileged.  install(1) is
+        # argv-only and does not traverse a caller-provided shell expression.
+        self._run_privileged(["install", "-d", "-m", "0700", "--", str(path)])
         self._run_privileged(["mount", "-t", fstype, "-o", options, source, str(path)])
         self.mounted.append(path)
         try:
@@ -134,7 +154,7 @@ class BootstrapWorkflow:
 
     def guided_setup(self, args) -> None:
         """Collect and persist non-secret choices; secrets remain run-scoped."""
-        if not sys.stdin.isatty():
+        if getattr(args, "non_interactive", False) or not sys.stdin.isatty():
             return
         print("\nGUIDED SETUP — build VM")
         print("Measured resources are shown first. Mounting changes no filesystem; "
@@ -143,7 +163,7 @@ class BootstrapWorkflow:
         for i, d in enumerate(devices, 1):
             print(f"  {i}. {d.get('name')}  {d.get('label') or '(no label)'}  "
                   f"{d.get('fstype')}  {int(d.get('size') or 0)//(1024**3)} GiB  "
-                  f"mounted: {', '.join(d.get('mountpoints') or []) or 'no'}")
+                  f"mounted: {', '.join(d.get('mountpoints', [])) or 'unmounted'}")
         changed = False
         for role, kind in (("backup", "physical-device"), ("export", "host-share")):
             if self.cfg.get(f"{role}_source"):
@@ -208,7 +228,20 @@ class BootstrapWorkflow:
             raise ValueError(f"{role}: {path} is not on a separate mounted filesystem")
         if not expected_source or not expected_type:
             raise ValueError(f"{role}: approved mount source and filesystem type are missing")
-        if mount.get("source") != expected_source or mount.get("fstype") != expected_type:
+        actual_source = mount.get("source")
+        same_source = actual_source == expected_source
+        # Block aliases (/dev/disk/by-uuid, by-id, mapper and /dev nodes) are
+        # equivalent only when the kernel reports the same device number.
+        if expected_type not in {"virtiofs", "9p", "cifs", "nfs", "nfs4"}:
+            try:
+                expected_stat = os.stat(os.path.realpath(expected_source))
+                actual_stat = os.stat(os.path.realpath(str(actual_source)))
+                same_source = (expected_stat.st_rdev != 0 and
+                               expected_stat.st_rdev == actual_stat.st_rdev)
+            except (OSError, TypeError):
+                # An unresolved configured identity is not silently trusted.
+                same_source = False
+        if not same_source or mount.get("fstype") != expected_type:
             raise ValueError(f"{role}: mount identity changed (expected {expected_source} "
                              f"{expected_type}; found {mount.get('source')} {mount.get('fstype')})")
         opts = set(mount.get("options", "").split(","))
@@ -277,6 +310,33 @@ class BootstrapWorkflow:
         except BlockingIOError as exc:
             raise ValueError(f"another bootstrap owns {self.lock_path}") from exc
 
+    def initialize_inventory(self) -> None:
+        """Publish planned locations immediately; never imply verification."""
+        def item(machine, path, purpose, sensitivity, retention):
+            return {"machine": machine, "path": str(Path(path).expanduser().absolute()) if path else None,
+                    "purpose": purpose, "sensitivity": sensitivity, "state": "planned",
+                    "verified": False, "retention": retention}
+        inventory = {"schema": self.VERSION, "run_id": self.run_id,
+                     "effective_config": item("build-vm", "iso-build.json", "validated settings",
+                                              "restricted", "retained"),
+                     "work": item("build-vm", self.x.work, "build/cache/Docker working tree",
+                                  "restricted", "retained for resume"),
+                     "log": item("build-vm", self.x.log, "operation log", "restricted", "retained"),
+                     "gnupg": item("build-vm", os.environ.get("GNUPGHOME", Path.home()/".gnupg"),
+                                   "signing keyring", "secret", "retained"),
+                     "backup": item("build-vm", self.cfg.get("backup_path"), "encrypted key backup",
+                                    "secret-encrypted", "versioned"),
+                     "export": item("build-vm", self.cfg.get("export_path"), "authenticated release",
+                                    "public", "preserve verified releases"),
+                     "native_host_export": {"machine": "physical-host",
+                         "path": self.cfg.get("host_path") or None, "purpose": "release mapping",
+                         "sensitivity": "public", "state": "operator-attested" if self.cfg.get("host_path") else "unknown",
+                         "verified": False, "retention": "host policy"}}
+        tmp = self.inventory_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.inventory_path)
+
     def _write_status(self, state: str, stage: str, detail: str = "") -> None:
         now = datetime.now(timezone.utc)
         record = {"schema": self.VERSION, "run_id": self.run_id,
@@ -337,7 +397,12 @@ class BootstrapWorkflow:
                 if self._hash(source) != self._hash(target):
                     raise ValueError(f"destination readback mismatch: {name}")
                 self._validate("export", minimum_mb=0)  # detect share disappearance
+            # Authenticate bytes at the destination before publishing the
+            # release name.  A failed signature leaves only `.incomplete-*`.
+            self._verify_release(staging, names)
+            self._validate("export", minimum_mb=0)
             os.replace(staging, final)
+        self._verify_release(final, names)
         artifacts = {name: {"bytes": (final / name).stat().st_size,
                             "sha256": self._hash(final / name)} for name in names}
         inventory = {"schema": self.VERSION, "repository": str(Path(__file__).parent),
@@ -353,8 +418,10 @@ class BootstrapWorkflow:
                                 "host_mapping_source": "operator-configured" if self.cfg.get("host_path") else "unknown",
                                 "verified": True, "artifacts": artifacts},
                      "runtime_secret": {"persisted": False, "value_reported": False}}
-        self.inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
-        self._verify_release(final, names)
+        tmp = self.inventory_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.inventory_path)
         self.stage("export", "complete", f"checksum, trusted signature and readback verified at {final}")
 
     def _verify_release(self, directory: Path, names: list[str]) -> None:

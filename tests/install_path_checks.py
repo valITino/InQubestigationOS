@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import tempfile
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -80,6 +82,34 @@ def main():
         bi.validate_install_contract(x, conf / Path(rel).name, stock)
         assert "user --name=investigator --groups=wheel --lock" in text
         assert "systemd-ask-password" in text and "| chpasswd" in text
+        assert text.index("flock -n 9") < text.index("systemd-ask-password")
+        assert "if ! printf '%s:%s" in text and '"$ACCOUNT" "$PW1" | chpasswd; then' in text
+
+        # Execute the account-enrollment portion of the actual generated
+        # first-boot script. A failing chpasswd must return deferred and must
+        # never publish account-enrolled.
+        generated = text.split("cat > /usr/local/sbin/golden-image-firstboot <<'FB_EOF'\n", 1)[1]
+        generated = generated.split("\nnote \"first-boot runner started\"", 1)[0] + "\nexit 0\n"
+        state = root / "target-state"
+        run = root / "run"
+        stubs = root / "stubs"
+        state.mkdir()
+        run.mkdir()
+        stubs.mkdir()
+        generated = generated.replace("/var/lib/golden-image", str(state)).replace(
+            "/run/golden-image-firstboot.lock", str(run / "lock"))
+        for name, body in {
+                "getent": "exit 0", "passwd": "echo 'investigator L 0 0 99999 7 -1'",
+                "systemd-ask-password": "echo correct-horse", "chpasswd": "exit 42",
+                "logger": "exit 0"}.items():
+            stub = stubs / name
+            stub.write_text("#!/bin/sh\n" + body + "\n")
+            stub.chmod(0o755)
+        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
+        failed = subprocess.run(["bash"], input=generated, text=True,
+                                capture_output=True, env=env)
+        assert failed.returncode == 75
+        assert not (state / "account-enrolled").exists()
 
         # write-usb refuses before device discovery if integrity metadata is absent.
         iso = x.out_dir / x.c["iso_name"]
