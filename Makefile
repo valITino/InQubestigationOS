@@ -82,6 +82,7 @@ usb:  ## verify the ISO and write it to a removable device (DEVICE=/dev/sdX)
 check:  ## run the whole test suite (no Qubes machine needed)
 	./tests/run_tests.py
 	./tests/orchestration_checks.py
+	./tests/bootstrap_workflow_checks.py
 	./tests/install_path_checks.py
 	./tests/release_checks.py
 	./tests/acceptance_checks.py
@@ -92,7 +93,7 @@ lint:  ## lint all Python code (requires requirements-dev.txt)
 
 .PHONY: security
 security:  ## scan Python for high-severity security defects
-	python3 -m bandit -q -lll -r build_iso.py golden_image.py release_candidate.py acceptance_runner.py tests
+	python3 -m bandit -q -lll -r build_iso.py bootstrap_workflow.py golden_image.py release_candidate.py acceptance_runner.py tests
 
 .PHONY: check-docs
 check-docs:  ## check the documentation still matches the code
@@ -136,11 +137,12 @@ backup-media:  ## (on the laptop) partition, format and label the backup disk
 
 .PHONY: ci
 ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
-	python3 -m py_compile golden_image.py build_iso.py release_candidate.py acceptance_runner.py
+	python3 -m py_compile golden_image.py build_iso.py bootstrap_workflow.py release_candidate.py acceptance_runner.py
 	ruff check .
-	python3 -m bandit -q -lll -r build_iso.py golden_image.py release_candidate.py acceptance_runner.py tests
+	python3 -m bandit -q -lll -r build_iso.py bootstrap_workflow.py golden_image.py release_candidate.py acceptance_runner.py tests
 	./tests/run_tests.py
 	./tests/orchestration_checks.py
+	./tests/bootstrap_workflow_checks.py
 	./tests/install_path_checks.py
 	./tests/release_checks.py
 	./tests/acceptance_checks.py

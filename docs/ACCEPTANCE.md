@@ -1,5 +1,7 @@
 # Hardware acceptance of a release candidate
 
+ISO build/export do not imply installation, provisioning, online acceptance, or issuance. Those remain separate installed-laptop facts; see [BOOTSTRAP.md](BOOTSTRAP.md).
+
 `acceptance_runner.py` knows where it is. `--collect` refuses to run unless
 `/etc/qubes-release` and `qvm-ls` identify dom0. Build-host checks remain on the
 build host; every command below that uses `golden-image-provision` runs only in

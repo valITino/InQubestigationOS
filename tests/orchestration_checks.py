@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("build_iso", ROOT / "build_iso.py")
 bi = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bi)
@@ -87,6 +92,7 @@ def main():
         a = args(action="bootstrap", uid="Unit", use_key=fp, expire="2y",
                  passphrase_file=str(secret), to="/media/backup")
         x = ctx(td, a)
+        x.c["bootstrap"]["backup_path"] = "/media/backup"
         calls = []
 
         def child(argv, **_kw):
@@ -96,6 +102,9 @@ def main():
         with mock.patch("os.geteuid", return_value=1000), \
                 mock.patch.object(bi, "confirmed", return_value=True), \
                 mock.patch.object(x, "quiet", return_value=True), \
+                mock.patch("bootstrap_workflow.BootstrapWorkflow.onboard"), \
+                mock.patch("bootstrap_workflow.BootstrapWorkflow.acquire_lock"), \
+                mock.patch("bootstrap_workflow.BootstrapWorkflow.stage"), \
                 mock.patch.object(bi.subprocess, "run", side_effect=child):
             expect_fatal(lambda: bi.bootstrap(x, a), "doctor")
         flat = [item for command in calls for item in command]
@@ -112,7 +121,22 @@ def main():
         x.c["tier"] = 1
         assert not x.done("templates")
 
-    print("  14/14 unattended orchestration checks pass")
+        # Bootstrap applies --set before Ctx derives work/output paths and
+        # persists it even when the later root safety gate blocks this test.
+        sandbox = Path(td) / "override"
+        sandbox.mkdir()
+        shutil.copy2(ROOT / "build_iso.py", sandbox / "build_iso.py")
+        shutil.copy2(ROOT / "bootstrap_workflow.py", sandbox / "bootstrap_workflow.py")
+        chosen = Path(td) / "chosen work"
+        result = subprocess.run([
+            sys.executable, str(sandbox / "build_iso.py"), "bootstrap",
+            "--set", f"work_dir={chosen}", "--yes"], cwd=sandbox,
+            capture_output=True, text=True)
+        assert result.returncode == 1 and "non-root build user" in result.stderr
+        saved = json.loads((sandbox / "iso-build.json").read_text())
+        assert saved["work_dir"] == str(chosen)
+
+    print("  16/16 unattended orchestration checks pass")
     return 0
 
 
