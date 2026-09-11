@@ -154,7 +154,15 @@ class BootstrapWorkflow:
 
     def guided_setup(self, args) -> None:
         """Collect and persist non-secret choices; secrets remain run-scoped."""
-        if getattr(args, "non_interactive", False) or not sys.stdin.isatty():
+        profile_complete = (all(self.cfg.get(k) for k in
+                            ("backup_path", "backup_source", "backup_fstype",
+                             "backup_kind")) and
+                            (self.cfg.get("build_only") or all(self.cfg.get(k) for k in
+                             ("export_path", "export_source", "export_fstype", "export_kind"))) and
+                            (self.x.c.get("iso_sign_key") or args.uid or args.use_key))
+        if profile_complete or getattr(args, "non_interactive", False):
+            return
+        if not sys.stdin.isatty():
             return
         print("\nGUIDED SETUP — build VM")
         print("Measured resources are shown first. Mounting changes no filesystem; "
@@ -169,25 +177,50 @@ class BootstrapWorkflow:
             if self.cfg.get(f"{role}_source"):
                 continue
             print(f"\n{role.title()} storage is reusable, non-secret, and stored in iso-build.json.")
-            choice = self._ask(role, "Select a detected preformatted filesystem number, "
-                               "or type 'share' for an already exposed host share")
+            if role == "export":
+                choice = self._ask(role, "Type 'share' for an authenticated physical-host "
+                                   "share, or 'build-only' to defer distribution")
+                if choice == "build-only":
+                    self.cfg["build_only"] = True
+                    changed = True
+                    continue
+            else:
+                choice = self._ask(role, "Select a detected preformatted filesystem number, "
+                                   "or type 'share' for an already exposed host share")
             if choice.isdigit() and 1 <= int(choice) <= len(devices):
                 d = devices[int(choice)-1]
                 stable = f"/dev/disk/by-uuid/{d['uuid']}" if d.get("uuid") else d["name"]
                 self.cfg[f"{role}_source"] = stable
                 self.cfg[f"{role}_fstype"] = d["fstype"]
-                self.cfg[f"{role}_kind"] = "physical-device" if role == "backup" else kind
+                self.cfg["backup_kind"] = "physical-device"
             elif choice == "share":
                 self.cfg[f"{role}_source"] = self._ask(role, "Provider mount source/tag "
                                                         "(not a password or host path)")
                 self.cfg[f"{role}_fstype"] = self._ask(role, "Supported type: virtiofs, 9p, cifs, nfs4")
                 if role == "backup":
                     self.cfg["backup_kind"] = "host-share"
+                else:
+                    self.cfg["export_kind"] = "host-share"
             else:
                 raise ValueError(f"{role}: no unambiguous resource selected")
             self.cfg[f"{role}_path"] = self._ask(role, "Guest mountpoint (created automatically)",
                                                    f"/mnt/inqubestigation-{role}")
             changed = True
+        install = self.x.c["install"]
+        mode = self._ask("Installation mode", "Choose 'manual' for target-side Anaconda "
+                         "choices or 'unattended' for an exact destructive target binding",
+                         "unattended" if install.get("unattended") else "manual")
+        if mode not in ("manual", "unattended"):
+            raise ValueError("installation mode must be manual or unattended")
+        install["unattended"] = mode == "unattended"
+        install["disk"] = (self._ask("Target binding", "Stable /dev/disk/by-id identity "
+                            "obtained and approved on the investigator laptop; not a build-VM disk")
+                           if install["unattended"] else "")
+        for key, title in (("username", "Target username"), ("lang", "Language"),
+                           ("keyboard", "Keyboard"), ("timezone", "Timezone")):
+            install[key] = self._ask(title, "Non-secret reusable installer setting; stored in iso-build.json",
+                                     install[key])
+        changed = True
         if not self.x.c.get("iso_sign_key") and not (args.uid or args.use_key):
             keys = __import__("build_iso").secret_key_fingerprints()
             if len(keys) == 1:
@@ -199,9 +232,41 @@ class BootstrapWorkflow:
         if not args.passphrase_file and not args.no_passphrase:
             args.passphrase_file = str(self._secret("signing-key passphrase"))
         if changed:
-            from build_iso import CONF_PATH
-            CONF_PATH.write_text(json.dumps(self.x.c, indent=2, sort_keys=True) + "\n")
-            os.chmod(CONF_PATH, 0o600)
+            from build_iso import CONF_PATH, validate_config
+            validate_config(self.x.c)
+            tmp = CONF_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.x.c, indent=2, sort_keys=True) + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, CONF_PATH)
+
+    def prepare_dependencies(self, args) -> None:
+        """Prepare discovery/transport tools before discovery or mounting."""
+        authorized = bool(self.cfg.get("dependencies_authorized"))
+        if not authorized:
+            if getattr(args, "non_interactive", False) or not sys.stdin.isatty():
+                raise ValueError("host dependency installation is not authorized; run bootstrap "
+                                 "interactively once or set bootstrap.dependencies_authorized=true")
+            print("\n[Host preparation] Discovery, filesystem, container, and installer "
+                  "validation tools must be prepared before storage is inspected or mounted. "
+                  "This uses the supported package manager with narrow sudo commands; no sudo "
+                  "credential is stored.")
+            answer = input("Authorize host prerequisite preparation? [y/N]: ").strip().lower()
+            if answer not in ("y", "yes"):
+                raise ValueError("host prerequisite preparation was not authorized")
+            self.cfg["dependencies_authorized"] = True
+            from build_iso import CONF_PATH, validate_config
+            validate_config(self.x.c)
+            tmp = CONF_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.x.c, indent=2, sort_keys=True) + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, CONF_PATH)
+        self.stage("setup-host", "running", "preparing helpers before discovery and mounts")
+        child = [sys.executable, str(Path(__file__).resolve().parent / "build_iso.py"),
+                 "setup-host", "--yes"]
+        rc = subprocess.run(child).returncode
+        if rc:
+            raise ValueError(f"setup-host prerequisite preparation failed (child exited {rc})")
+        self.stage("setup-host", "complete", "discovery and transport helpers prepared")
 
     def cleanup(self) -> None:
         for path in self.secret_files:
@@ -218,7 +283,7 @@ class BootstrapWorkflow:
         path = Path(self.cfg.get(f"{role}_path", ""))
         expected_source = self.cfg.get(f"{role}_source", "")
         expected_type = self.cfg.get(f"{role}_fstype", "")
-        kind = self.cfg.get(f"{role}_kind", "") if role == "backup" else "host-share"
+        kind = self.cfg.get(f"{role}_kind", "")
         if not str(path) or str(path) == ".":
             raise ValueError(f"{role}: guest-visible path is not configured")
         if not path.is_dir():
@@ -252,6 +317,9 @@ class BootstrapWorkflow:
         if role == "backup" and kind not in ("physical-device", "host-share"):
             raise ValueError("backup: kind must establish physical-device or host-share; "
                              "unknown/guest virtual storage is not an approved backup")
+        if role == "export" and (kind != "host-share" or expected_type not in
+                                  {"virtiofs", "9p", "cifs", "nfs", "nfs4"}):
+            raise ValueError("export: authenticated physical-host share transport is required")
         return path, mount
 
     def onboard(self, args) -> None:
@@ -267,7 +335,8 @@ class BootstrapWorkflow:
             missing.append("runtime signing/backup authorization: --passphrase-file is required")
         else:
             try:
-                from build_iso import protected_secret_file
+                from build_iso import protected_secret_file, validate_config
+                validate_config(self.x.c)
                 protected_secret_file(args)
             except Exception as exc:
                 missing.append(f"runtime secret source: {exc}")
@@ -317,7 +386,7 @@ class BootstrapWorkflow:
                     "purpose": purpose, "sensitivity": sensitivity, "state": "planned",
                     "verified": False, "retention": retention}
         inventory = {"schema": self.VERSION, "run_id": self.run_id,
-                     "effective_config": item("build-vm", "iso-build.json", "validated settings",
+                     "effective_config": item("build-vm", __import__("build_iso").CONF_PATH, "validated settings",
                                               "restricted", "retained"),
                      "work": item("build-vm", self.x.work, "build/cache/Docker working tree",
                                   "restricted", "retained for resume"),

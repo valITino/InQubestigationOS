@@ -11,6 +11,7 @@ from unittest import mock
 
 import sys
 import os
+import subprocess
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bootstrap_workflow as bw
 
@@ -24,12 +25,14 @@ class Context:
         self.out_dir.mkdir(exist_ok=True)
         self.log.touch()
         self.c = {"iso_name": "image with space.iso", "iso_sign_key": "A" * 40,
-                  "install": {"unattended": False, "disk": ""},
+                  "install": {"unattended": False, "disk": "", "username": "investigator"},
                   "bootstrap": {"backup_path": str(root / "backup"),
+                                "dependencies_authorized": True,
                                 "backup_source": "/dev/disk/by-uuid/BACKUP",
                                 "backup_fstype": "ext4", "backup_kind": "physical-device",
                                 "export_path": str(root / "host share"),
                                 "export_source": "hostshare", "export_fstype": "virtiofs",
+                                "export_kind": "host-share",
                                 "host_path": "", "build_only": False,
                                 "min_backup_mb": 1, "min_export_mb": 1}}
 
@@ -147,6 +150,37 @@ def main() -> int:
         # The generic yes flag is absent from this API: no operation can format,
         # repartition, erase, or silently approve a device.
         assert not any(word in Path(bw.__file__).read_text() for word in ("mkfs", "wipefs"))
+
+        # Save and reload every supported destination classification through
+        # the real CLI/config loader in a child process.  Guest block storage
+        # is valid for backup, never for physical-host distribution.
+        import build_iso as bi
+        for backup_kind, backup_fstype in (("physical-device", "ext4"),
+                                            ("host-share", "virtiofs")):
+            candidate = json.loads(json.dumps(bi.DEFAULT_CONFIG))
+            candidate["bootstrap"].update({
+                "dependencies_authorized": True,
+                "backup_path": "/mnt/backup", "backup_source": "backup-source",
+                "backup_fstype": backup_fstype, "backup_kind": backup_kind,
+                "export_path": "/mnt/export", "export_source": "hostshare",
+                "export_fstype": "virtiofs", "export_kind": "host-share"})
+            profile = root / f"{backup_kind}.json"
+            profile.write_text(json.dumps(candidate))
+            reloaded = subprocess.run(
+                [sys.executable, str(Path(bi.__file__)), "config", "--get",
+                 "bootstrap.export_kind"], text=True, capture_output=True,
+                env={**os.environ, "INQUBESTIGATION_CONFIG": str(profile)})
+            assert reloaded.returncode == 0, reloaded.stderr
+            assert "host-share" in reloaded.stdout
+        invalid = json.loads(json.dumps(candidate))
+        invalid["bootstrap"].update(export_kind="physical-device", export_fstype="ext4")
+        profile = root / "invalid-export.json"
+        profile.write_text(json.dumps(invalid))
+        rejected = subprocess.run(
+            [sys.executable, str(Path(bi.__file__)), "config"], text=True,
+            capture_output=True, env={**os.environ, "INQUBESTIGATION_CONFIG": str(profile)})
+        assert rejected.returncode == 1
+        assert "cannot be classified as physical-host distribution" in rejected.stderr
     print("  12/12 bootstrap workflow checks pass")
     return 0
 
