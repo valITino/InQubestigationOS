@@ -753,107 +753,111 @@ def bootstrap(x: Ctx, args) -> int:
     if args.dry_run:
         print("[bootstrap:planned] guided discovery, mount preparation, key backup, build and authenticated export")
         return 0
+    # Lock contention is deliberately handled before this invocation writes
+    # status or inventory belonging to the active owner.
+    workflow.acquire_lock()
+    workflow.initialize_inventory()
     try:
-        workflow.acquire_lock()
         workflow.stage("onboarding", "running", "discovering resources and collecting approval")
         workflow.onboard(args)
     except Exception as exc:
         workflow.stage("onboarding", "failed", str(exc))
         workflow.cleanup()
         raise
-    workflow.stage("onboarding", "complete", "approved destinations validated")
-    steps: list[tuple[str, str, list[str]]] = [
-        ("setup-host", "install and configure the build host", ["setup-host"]),
-        ("gen-key", "create or adopt the signing key", ["gen-key"]),
-        ("backup-key", "back up the signing key before anything can lose it",
-         ["backup-key"]),
-        ("doctor", "confirm the host is ready", ["doctor"]),
-        ("check-upstream", "confirm the pinned keys and versions are current",
-         ["check-upstream"]),
-        ("plan", "print the whole build plan", ["--dry-run", "all"]),
-        ("build", "build the templates and the ISO", ["all"]),
-    ]
-    key_args: list[str] = []
-    for option, value in (("--uid", args.uid), ("--use-key", args.use_key),
-                          ("--expire", args.expire)):
-        if value is not None:
-            key_args += [option, value]
-    if args.no_passphrase:
-        key_args.append("--no-passphrase")
-    if args.passphrase_file:
-        key_args += ["--passphrase-file", args.passphrase_file]
-    steps[1] = ("gen-key", steps[1][1], ["gen-key", *key_args])
-    backup_args: list[str] = []
-    backup_to = workflow.backup_path
-    if backup_to:
-        backup_args += ["--to", str(backup_to)]
-    if args.use_key:
-        backup_args += ["--use-key", args.use_key]
-    if args.passphrase_file:
-        backup_args += ["--passphrase-file", args.passphrase_file]
-    steps[2] = ("backup-key", steps[2][1], ["backup-key", *backup_args])
-
-    print(f"\n{B}{C}══ bootstrap{RST}")
-    print("\n  This runs, stopping at the first failure:\n")
-    for i, (name, why, argv) in enumerate(steps, start=1):
-        print(f"    {i}. {name:15s} {why}")
-    print("""
-  Each is resumable and each is idempotent, so if one fails you can fix the
-  cause and run bootstrap again — the completed ones are skipped.
-
-  Not included, because they need you: writing the USB (plug the stick in, then
-  ./build_iso.py write-usb --wait), and reading the fingerprint out over a
-  channel independent of the image.
-""")
-    if args.dry_run:
-        x.info("[dry-run] nothing executed")
-        return 0
-    if not confirmed(x, "Start?"):
-        raise Fatal("aborted")
-
-    me = [sys.executable, str(Path(__file__).resolve())]
-    passthrough = ["--yes"] if getattr(args, "assume_yes", False) else []
-    for i, (name, _why, argv) in enumerate(steps, start=1):
-        print(f"\n{B}{C}══ bootstrap {i}/{len(steps)}: {name}{RST}")
-        child_args = [*argv, *passthrough]
-        if args.passphrase_file and name in ("doctor", "plan", "build"):
-            child_args += ["--passphrase-file", args.passphrase_file]
-        child = me + child_args
-        # usermod cannot alter the supplementary groups of this already-running
-        # process.  Enter only the docker group for subsequent children; sg
-        # retains the unprivileged user's HOME/GNUPGHOME and therefore their
-        # signing keyring. Never elevate the whole build.
-        if i > 1 and x.c["container_engine"] == "docker" \
-                and not x.quiet("docker", "ps"):
-            if shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps"):
-                child = ["sg", "docker", "-c", shlex.join(child)]
-            else:
-                raise Fatal("Docker group membership is not active and cannot be "
-                            "entered with sg. Log in again as the original build "
-                            "user; do not run bootstrap as root.")
-        workflow.stage(name, "running", f"stage {i}/{len(steps)} started")
-        rc = subprocess.run(child).returncode
-        if rc != 0:
-            workflow.stage(name, "failed", f"child exited {rc}")
-            raise Fatal(f"bootstrap stopped at step {i} ({name}), exit {rc}.\n"
-                        f"     Fix the cause and run bootstrap again — completed "
-                        f"steps are skipped.")
-        workflow.stage(name, "complete", "child completed; stage-specific checks passed")
-        if name == "gen-key":
-            # The child persisted its fingerprint. Never retain the empty
-            # parent copy and accidentally generate/re-export another key.
-            x.c = load_config()
-            workflow.cfg = x.c["bootstrap"]
     try:
-        workflow.stage("export", "running", "authenticating source release")
-        workflow.export_release()
-        workflow.finish()
-    except KeyboardInterrupt:
-        workflow.stage("export", "interrupted", "operator interrupted export; incomplete publication is retained")
-        raise
-    except Exception as exc:
-        workflow.stage("export", "failed", str(exc))
-        raise
+        workflow.stage("onboarding", "complete", "approved destinations validated")
+        steps: list[tuple[str, str, list[str]]] = [
+            ("setup-host", "install and configure the build host", ["setup-host"]),
+            ("gen-key", "create or adopt the signing key", ["gen-key"]),
+            ("backup-key", "back up the signing key before anything can lose it",
+             ["backup-key"]),
+            ("doctor", "confirm the host is ready", ["doctor"]),
+            ("check-upstream", "confirm the pinned keys and versions are current",
+             ["check-upstream"]),
+            ("plan", "print the whole build plan", ["--dry-run", "all"]),
+            ("build", "build the templates and the ISO", ["all"]),
+        ]
+        key_args: list[str] = []
+        for option, value in (("--uid", args.uid), ("--use-key", args.use_key),
+                              ("--expire", args.expire)):
+            if value is not None:
+                key_args += [option, value]
+        if args.no_passphrase:
+            key_args.append("--no-passphrase")
+        if args.passphrase_file:
+            key_args += ["--passphrase-file", args.passphrase_file]
+        steps[1] = ("gen-key", steps[1][1], ["gen-key", *key_args])
+        backup_args: list[str] = []
+        backup_to = workflow.backup_path
+        if backup_to:
+            backup_args += ["--to", str(backup_to)]
+        if args.use_key:
+            backup_args += ["--use-key", args.use_key]
+        if args.passphrase_file:
+            backup_args += ["--passphrase-file", args.passphrase_file]
+        steps[2] = ("backup-key", steps[2][1], ["backup-key", *backup_args])
+
+        print(f"\n{B}{C}══ bootstrap{RST}")
+        print("\n  This runs, stopping at the first failure:\n")
+        for i, (name, why, argv) in enumerate(steps, start=1):
+            print(f"    {i}. {name:15s} {why}")
+        print("""
+      Each is resumable and each is idempotent, so if one fails you can fix the
+      cause and run bootstrap again — the completed ones are skipped.
+
+      Not included, because they need you: writing the USB (plug the stick in, then
+      ./build_iso.py write-usb --wait), and reading the fingerprint out over a
+      channel independent of the image.
+    """)
+        if args.dry_run:
+            x.info("[dry-run] nothing executed")
+            return 0
+        if not confirmed(x, "Start?"):
+            raise Fatal("aborted")
+
+        me = [sys.executable, str(Path(__file__).resolve())]
+        passthrough = ["--yes"] if getattr(args, "assume_yes", False) else []
+        for i, (name, _why, argv) in enumerate(steps, start=1):
+            print(f"\n{B}{C}══ bootstrap {i}/{len(steps)}: {name}{RST}")
+            child_args = [*argv, *passthrough]
+            if args.passphrase_file and name in ("doctor", "plan", "build"):
+                child_args += ["--passphrase-file", args.passphrase_file]
+            child = me + child_args
+            # usermod cannot alter the supplementary groups of this already-running
+            # process.  Enter only the docker group for subsequent children; sg
+            # retains the unprivileged user's HOME/GNUPGHOME and therefore their
+            # signing keyring. Never elevate the whole build.
+            if i > 1 and x.c["container_engine"] == "docker" \
+                    and not x.quiet("docker", "ps"):
+                if shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps"):
+                    child = ["sg", "docker", "-c", shlex.join(child)]
+                else:
+                    raise Fatal("Docker group membership is not active and cannot be "
+                                "entered with sg. Log in again as the original build "
+                                "user; do not run bootstrap as root.")
+            workflow.stage(name, "running", f"stage {i}/{len(steps)} started")
+            rc = subprocess.run(child).returncode
+            if rc != 0:
+                workflow.stage(name, "failed", f"child exited {rc}")
+                raise Fatal(f"bootstrap stopped at step {i} ({name}), exit {rc}.\n"
+                            f"     Fix the cause and run bootstrap again — completed "
+                            f"steps are skipped.")
+            workflow.stage(name, "complete", "child completed; stage-specific checks passed")
+            if name == "gen-key":
+                # The child persisted its fingerprint. Never retain the empty
+                # parent copy and accidentally generate/re-export another key.
+                x.c = load_config()
+                workflow.cfg = x.c["bootstrap"]
+        try:
+            workflow.stage("export", "running", "authenticating source release")
+            workflow.export_release()
+            workflow.finish()
+        except KeyboardInterrupt:
+            workflow.stage("export", "interrupted", "operator interrupted export; incomplete publication is retained")
+            raise
+        except Exception as exc:
+            workflow.stage("export", "failed", str(exc))
+            raise
     finally:
         workflow.cleanup()
     print(f"""
@@ -1723,34 +1727,55 @@ mkdir -p /var/lib/golden-image
 # Account enrollment belongs to this physical laptop, not the build VM. Ask on
 # the local console before lengthy provisioning and stream the value directly
 # to chpasswd; it is never written to disk, argv, the ISO, or the journal.
-ACCOUNT_MARKER=/var/lib/golden-image/account-enrolled
-if [ ! -e "$ACCOUNT_MARKER" ]; then
-    PW1=$(systemd-ask-password --timeout=0 "Create login password for {x.c['install']['username']}") || exit 75
-    PW2=$(systemd-ask-password --timeout=0 "Confirm login password") || exit 75
-    if [ -z "$PW1" ] || [ "$PW1" != "$PW2" ]; then
-        unset PW1 PW2
-        logger -t golden-image "waiting-for-input: account passwords did not match"
-        exit 75
-    fi
-    printf '%s:%s\n' {shlex.quote(x.c['install']['username'])} "$PW1" | chpasswd
-    unset PW1 PW2
-    touch "$ACCOUNT_MARKER"
-    logger -t golden-image "complete: target-local investigator account enrolled"
-fi
-
 STATUS=/var/lib/golden-image/firstboot-status
 note() {{ echo "$(date '+%F %T') $*" >> "$STATUS"; logger -t golden-image "$*"; }}
+
+# Serialize before prompts or account mutation. systemd password agents expose
+# this target-local request on the boot console; no credential enters the ISO.
+exec 9>/run/golden-image-firstboot.lock
+if ! flock -n 9; then
+    note "account-enrollment: another attempt is running; deferred"
+    exit 75
+fi
+ACCOUNT={shlex.quote(x.c['install']['username'])}
+ACCOUNT_MARKER=/var/lib/golden-image/account-enrolled
+if ! getent passwd "$ACCOUNT" >/dev/null; then
+    note "account-enrollment: intended account is missing; deferred"
+    exit 75
+fi
+# A usable existing password is authoritative even if an old marker vanished.
+if [ ! -e "$ACCOUNT_MARKER" ] && passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
+    tmp=$(mktemp /var/lib/golden-image/.account-enrolled.XXXXXX)
+    chmod 0600 "$tmp" && mv -f "$tmp" "$ACCOUNT_MARKER"
+    note "account-enrollment: existing account password retained"
+elif [ ! -e "$ACCOUNT_MARKER" ]; then
+    note "waiting-for-input: account enrollment requires two hidden console entries"
+    PW1=$(systemd-ask-password --timeout=0 "Create login password for $ACCOUNT (not disk unlock)") || exit 75
+    PW2=$(systemd-ask-password --timeout=0 "Confirm login password for $ACCOUNT") || exit 75
+    if [ -z "$PW1" ] || [ "$PW1" != "$PW2" ]; then
+        unset PW1 PW2
+        note "waiting-for-input: account passwords did not match"
+        exit 75
+    fi
+    if ! printf '%s:%s\n' "$ACCOUNT" "$PW1" | chpasswd; then
+        unset PW1 PW2
+        note "account-enrollment: password setting failed; retry is safe"
+        exit 75
+    fi
+    unset PW1 PW2
+    if ! passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
+        note "account-enrollment: password state verification failed"
+        exit 75
+    fi
+    tmp=$(mktemp /var/lib/golden-image/.account-enrolled.XXXXXX)
+    chmod 0600 "$tmp" && mv -f "$tmp" "$ACCOUNT_MARKER"
+    note "complete: target-local investigator account enrolled"
+fi
 ready() {{
     qvm-check --quiet sys-net 2>/dev/null &&
     qvm-check --quiet sys-firewall 2>/dev/null &&
     qvm-check --quiet {x.c['install']['required_template']} 2>/dev/null
 }}
-
-exec 9>/run/golden-image-firstboot.lock
-if ! flock -n 9; then
-    note "attempt already running; deferred"
-    exit 75
-fi
 
 note "first-boot runner started"
 

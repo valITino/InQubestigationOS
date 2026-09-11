@@ -54,9 +54,9 @@ templates, and Whonix.
 # On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~250 GB
 # free — nothing pre-installed
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
-# See GUIDE: bootstrap requires a mounted external --to destination; protected
-# unattended keys use a mode-0600 runtime --passphrase-file.
-./build_iso.py bootstrap --to /mnt/image-key-backup/inqubestigation
+# The wizard discovers approved preformatted storage, creates safe mountpoints,
+# mounts it, and collects the signing authorization with hidden input.
+./build_iso.py bootstrap
 ./build_iso.py write-usb --wait   # plug the stick in when it asks
 ```
 

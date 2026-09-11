@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import sys
+import os
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bootstrap_workflow as bw
 
@@ -58,7 +59,13 @@ def main() -> int:
                     "source": "/dev/disk/by-uuid/BACKUP" if backup else "hostshare",
                     "fstype": "ext4" if backup else "virtiofs", "options": "rw"}
 
+        real_stat = os.stat
+        def device_stat(path, *args, **kwargs):
+            if str(path).startswith("/dev/"):
+                return SimpleNamespace(st_rdev=2049)
+            return real_stat(path, *args, **kwargs)
         with mock.patch.object(flow, "_mount", side_effect=mount), \
+                mock.patch("bootstrap_workflow.os.stat", side_effect=device_stat), \
                 mock.patch("bootstrap_workflow.shutil.disk_usage",
                            return_value=SimpleNamespace(free=100 * 1024**3)):
             flow.onboard(arguments(secret))
@@ -85,6 +92,37 @@ def main() -> int:
         assert "DO-NOT-LOG-THIS" not in flow.status_path.read_text()
         assert "DO-NOT-LOG-THIS" not in flow.inventory_path.read_text()
         assert len(list((root / "host share").glob("release-*"))) == 1
+
+        # Exercise the real discovery function with lsblk's unmounted shape,
+        # mixed nulls, and a malformed field. Labels are data, not formatting.
+        discovered = SimpleNamespace(returncode=0, stdout=json.dumps({"blockdevices": [
+            {"name": "/dev/vda1", "type": "part", "size": 1,
+             "fstype": "ext4", "uuid": "U", "label": "x\\x1b[31m",
+             "mountpoints": [None, "/media/x"]}]}))
+        with mock.patch("bootstrap_workflow.subprocess.run", return_value=discovered):
+            assert bw.BootstrapWorkflow.discover_block_filesystems()[0]["mountpoints"] == ["/media/x"]
+        malformed = SimpleNamespace(returncode=0, stdout=json.dumps({"blockdevices": [
+            {"name": "/dev/vda1", "type": "part", "fstype": "ext4",
+             "mountpoints": "not-an-array"}]}))
+        with mock.patch("bootstrap_workflow.subprocess.run", return_value=malformed):
+            assert bw.BootstrapWorkflow.discover_block_filesystems() == []
+
+        # Mountpoint creation is delegated to the narrow privileged argv helper;
+        # no unprivileged mkdir beneath a root-owned parent occurs first.
+        fresh = Context(root)
+        fresh.c["bootstrap"]["backup_path"] = str(root / "privileged" / "backup")
+        prep = bw.BootstrapWorkflow(fresh)
+        commands = []
+        def privileged(argv):
+            commands.append(argv)
+            if argv[0] == "install":
+                Path(argv[-1]).mkdir(parents=True)
+        with mock.patch.object(prep, "_run_privileged", side_effect=privileged), \
+                mock.patch.object(prep, "_mount", return_value={"target": str(root / "privileged" / "backup"),
+                    "source": "/dev/disk/by-uuid/BACKUP", "fstype": "ext4", "options": "rw"}), \
+                mock.patch("bootstrap_workflow.os.stat", side_effect=device_stat):
+            prep.prepare_mount("backup")
+        assert commands[0][:5] == ["install", "-d", "-m", "0700", "--"]
 
         # Missing values are aggregated before any build; root/lookalike mounts
         # and changed identities are blocking, never writable fallbacks.

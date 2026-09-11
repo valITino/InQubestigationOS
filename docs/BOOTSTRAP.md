@@ -8,6 +8,23 @@ allowlisted release on host-accessible storage. A failed required export is a
 failed bootstrap; valid guest output is retained. `bootstrap.build_only=true`
 is explicitly reported as build-only, never exported.
 
+## Implemented regression repairs
+
+| Defect | Implemented behavior | Automated evidence |
+|---|---|---|
+| `lsblk` returned `mountpoints: [null]` | Discovery validates the JSON object/list shapes, removes null entries, and prints `unmounted`; malformed facts are rejected. | `python tests/bootstrap_workflow_checks.py` exercises the production discovery function. |
+| `/mnt` mountpoint was created as the build user | An absolute, non-symlink, empty destination is created with the narrowly scoped privileged `install -d -m 0700 -- PATH` argv before mounting; the mounted filesystem is then checked for build-user write/search access. | The bootstrap workflow check records the real privileged boundary and ordering. |
+| Device aliases were compared as spelling | Block sources must resolve to the same nonzero kernel device identity; unresolved or replaced sources fail. Network transports retain protocol/source identity checks and are not treated as block devices. | Bootstrap identity tests use distinct spellings with a measured device identity and reject unavailable identity. |
+| Enrollment marked success after `chpasswd` failed | First boot locks before prompting, checks account/password state, explicitly gates the pipeline, verifies the resulting non-secret password state, and atomically publishes the marker. | `python tests/install_path_checks.py` executes the generated script with a failing `chpasswd` stub and observes exit 75 with no marker. |
+| Inventory appeared only after export | A mode-0600 planned inventory is atomically initialized immediately after lock acquisition. Export remains unverified until destination readback and signature authentication complete. | Bootstrap workflow and orchestration checks cover early state and publication ordering. |
+| Secrets survived pre-export child failures | Workflow cleanup now encloses every child stage as well as export; only run-owned secret files and mounts are cleaned. Lock contention writes neither status nor inventory. | Orchestration and bootstrap workflow checks cover failure and ownership boundaries. |
+
+The portable suite validates code and generated-script behavior. It does **not**
+claim a full ISO build, Qubes boot, real removable-media separation, host-share
+durability, or physical-laptop acceptance. Those environment-specific gates
+remain recorded separately in `docs/ACCEPTANCE.md`; a guest-visible capacity or
+removable bit is never reported as proof of an independent physical backup.
+
 ## Guided first run and supported storage
 
 With a terminal and no prepared profile, bootstrap enumerates preformatted
