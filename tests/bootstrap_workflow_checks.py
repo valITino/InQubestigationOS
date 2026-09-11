@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -66,7 +67,14 @@ def main() -> int:
             for name in bw.EXPORT_ALLOWLIST:
                 mapped = name.replace("InQubestigationOS.iso", "image with space.iso")
                 (x.out_dir / mapped).write_bytes((mapped + "\n").encode())
-            flow.export_release()
+            iso = x.out_dir / "image with space.iso"
+            (x.out_dir / "image with space.iso.sha256").write_text(
+                hashlib.sha256(iso.read_bytes()).hexdigest() + "  image with space.iso\n")
+            valid = SimpleNamespace(returncode=0,
+                                    stdout="[GNUPG:] VALIDSIG " + "A" * 40 + " 0 0 0 0 0 0 0 0 " + "A" * 40,
+                                    stderr="")
+            with mock.patch("bootstrap_workflow.subprocess.run", return_value=valid):
+                flow.export_release()
             flow.finish()
 
         status = json.loads(flow.status_path.read_text())
@@ -85,14 +93,16 @@ def main() -> int:
         broken.c["bootstrap"]["backup_source"] = "expected"
         check = bw.BootstrapWorkflow(broken)
         with mock.patch.object(check, "_mount", return_value={
-                "target": "/", "source": "/dev/root", "fstype": "ext4", "options": "rw"}):
+                "target": "/", "source": "/dev/root", "fstype": "ext4", "options": "rw"}), \
+                mock.patch.object(check, "_run_privileged",
+                                  side_effect=ValueError("mount authorization unavailable")):
             try:
                 check.onboard(SimpleNamespace(to=None, uid=None, use_key=None,
                                               passphrase_file=None))
             except ValueError as exc:
                 message = str(exc)
                 assert "signing identity" in message and "runtime signing" in message
-                assert "not on a separate mounted filesystem" in message
+                assert "mount authorization unavailable" in message
             else:
                 raise AssertionError("incomplete onboarding was accepted")
 

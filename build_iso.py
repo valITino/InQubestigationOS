@@ -144,6 +144,9 @@ DEFAULT_CONFIG: dict = {
         # identity such as /dev/disk/by-id/wwn-...; it is resolved and required
         # to match exactly one disk by Anaconda on the target machine.
         "disk": "",
+        # The account is created locked by Anaconda. Its unique login secret is
+        # enrolled from the target console on first boot and is never in ISO.
+        "username": "investigator",
         "required_template": "debian-13-xfce",
         # Complete Qubes' own initial setup non-interactively at first boot.
         "auto_initial_setup": True,
@@ -747,8 +750,17 @@ def bootstrap(x: Ctx, args) -> int:
     del bootstrap_contract
     from bootstrap_workflow import BootstrapWorkflow
     workflow = BootstrapWorkflow(x)
-    workflow.onboard(args)
-    workflow.acquire_lock()
+    if args.dry_run:
+        print("[bootstrap:planned] guided discovery, mount preparation, key backup, build and authenticated export")
+        return 0
+    try:
+        workflow.acquire_lock()
+        workflow.stage("onboarding", "running", "discovering resources and collecting approval")
+        workflow.onboard(args)
+    except Exception as exc:
+        workflow.stage("onboarding", "failed", str(exc))
+        workflow.cleanup()
+        raise
     workflow.stage("onboarding", "complete", "approved destinations validated")
     steps: list[tuple[str, str, list[str]]] = [
         ("setup-host", "install and configure the build host", ["setup-host"]),
@@ -819,15 +831,31 @@ def bootstrap(x: Ctx, args) -> int:
                 raise Fatal("Docker group membership is not active and cannot be "
                             "entered with sg. Log in again as the original build "
                             "user; do not run bootstrap as root.")
+        workflow.stage(name, "running", f"stage {i}/{len(steps)} started")
         rc = subprocess.run(child).returncode
         if rc != 0:
             workflow.stage(name, "failed", f"child exited {rc}")
             raise Fatal(f"bootstrap stopped at step {i} ({name}), exit {rc}.\n"
                         f"     Fix the cause and run bootstrap again — completed "
                         f"steps are skipped.")
-        workflow.stage(name, "complete", "verified")
-    workflow.export_release()
-    workflow.finish()
+        workflow.stage(name, "complete", "child completed; stage-specific checks passed")
+        if name == "gen-key":
+            # The child persisted its fingerprint. Never retain the empty
+            # parent copy and accidentally generate/re-export another key.
+            x.c = load_config()
+            workflow.cfg = x.c["bootstrap"]
+    try:
+        workflow.stage("export", "running", "authenticating source release")
+        workflow.export_release()
+        workflow.finish()
+    except KeyboardInterrupt:
+        workflow.stage("export", "interrupted", "operator interrupted export; incomplete publication is retained")
+        raise
+    except Exception as exc:
+        workflow.stage("export", "failed", str(exc))
+        raise
+    finally:
+        workflow.cleanup()
     print(f"""
 {B}{C}══ bootstrap complete{RST}
 
@@ -1692,6 +1720,24 @@ MARKER=/var/lib/golden-image/provisioned
 mkdir -p /var/lib/golden-image
 [ -e "$MARKER" ] && exit 0
 
+# Account enrollment belongs to this physical laptop, not the build VM. Ask on
+# the local console before lengthy provisioning and stream the value directly
+# to chpasswd; it is never written to disk, argv, the ISO, or the journal.
+ACCOUNT_MARKER=/var/lib/golden-image/account-enrolled
+if [ ! -e "$ACCOUNT_MARKER" ]; then
+    PW1=$(systemd-ask-password --timeout=0 "Create login password for {x.c['install']['username']}") || exit 75
+    PW2=$(systemd-ask-password --timeout=0 "Confirm login password") || exit 75
+    if [ -z "$PW1" ] || [ "$PW1" != "$PW2" ]; then
+        unset PW1 PW2
+        logger -t golden-image "waiting-for-input: account passwords did not match"
+        exit 75
+    fi
+    printf '%s:%s\n' {shlex.quote(x.c['install']['username'])} "$PW1" | chpasswd
+    unset PW1 PW2
+    touch "$ACCOUNT_MARKER"
+    logger -t golden-image "complete: target-local investigator account enrolled"
+fi
+
 STATUS=/var/lib/golden-image/firstboot-status
 note() {{ echo "$(date '+%F %T') $*" >> "$STATUS"; logger -t golden-image "$*"; }}
 ready() {{
@@ -1838,12 +1884,15 @@ def build_installer_directives(x: Ctx) -> str:
                     "so the target is identified on the installation machine")
     if not inst["encrypt_disk"]:
         raise Fatal("unattended destructive installation requires disk encryption")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", str(inst.get("username", ""))):
+        raise Fatal("install.username must be a Linux account name (lowercase, max 32 characters)")
     lines = [
         "# --- unattended install (iso-build.json: install.unattended) --------",
         f"lang {inst['lang']}",
         f"keyboard --vckeymap={inst['keyboard']} --xlayouts='{inst['keyboard']}'",
         f"timezone {inst['timezone']} --utc",
         "firstboot --disable",
+        f"user --name={inst['username']} --groups=wheel --lock",
         "reboot",
     ]
     # Resolve on the target in Anaconda's runtime. The build host's disks are
@@ -2429,7 +2478,7 @@ def fix_argv(fix_line: str) -> list[str]:
 # ---------------------------------------------------------------------------
 #  doctor — read-only readiness report
 # ---------------------------------------------------------------------------
-def doctor(x: Ctx) -> int:
+def doctor(x: Ctx, *, signing: bool = True) -> int:
     x.phase("doctor", "is this build host ready?")
     # Before anything measures work_dir or reports where it will be.
     resolve_work_dir(x, fatal=False)
@@ -2542,7 +2591,10 @@ def doctor(x: Ctx) -> int:
         pass
 
     fp = (x.c.get("iso_sign_key") or "").strip()
-    if not fp:
+    if not signing:
+        c.append(Check("ISO signing readiness", WARN,
+                       "deferred until bootstrap creates or adopts the approved key"))
+    elif not fp:
         c.append(Check("ISO signing key configured", FAIL, "iso_sign_key is empty",
                        './build_iso.py gen-key --uid "Your Unit <you@example.org>"'
                        "   (or --use-key auto)"))
@@ -3106,7 +3158,7 @@ def setup_host(x: Ctx) -> int:
 
     if not plan:
         x.ok("nothing to do — the host is already set up")
-        return doctor(x)
+        return doctor(x, signing=False)
 
     print("\n  This will run:")
     for cmd in plan:
@@ -3167,7 +3219,7 @@ def setup_host(x: Ctx) -> int:
                    "./build_iso.py doctor")
 
     print()
-    return doctor(x)
+    return doctor(x, signing=False)
 
 
 def setup_qube_bind_dirs(x: Ctx) -> None:
@@ -3570,7 +3622,7 @@ def config_set(x: Ctx, dotted: str, raw: str, quiet: bool = False) -> int:
     if CONF_PATH.exists():
         try:
             stored = json.loads(CONF_PATH.read_text())
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, ValueError) as e:
             raise Fatal(f"{CONF_PATH.name} is not valid JSON: {e}")
     node = stored
     parts = dotted.split(".")
@@ -4449,9 +4501,8 @@ def write_usb(x: Ctx) -> int:
         proc.stdout.close()
         proc.wait()
         if remaining > 0:
-            x.warn("could not read the device back even with sudo — verify the "
-                   "stick by hand before distributing it")
-            return 0
+            raise Fatal("could not read the device back even with sudo; USB "
+                        "verification failed and the media must not be distributed")
     if h.hexdigest() == want_digest(x):
         x.ok("readback matches the image byte for byte")
     else:
@@ -4496,7 +4547,22 @@ def load_config(write_only=False, dry_run=False) -> dict:
                   file=sys.stderr)
             sys.exit(1)
         try:
-            return deep_merge(DEFAULT_CONFIG, json.loads(CONF_PATH.read_text()))
+            supplied = json.loads(CONF_PATH.read_text())
+            def validate(reference, value, prefix=""):
+                if not isinstance(value, dict):
+                    raise ValueError(f"{prefix or 'configuration'} must be an object")
+                unknown = set(value) - set(reference)
+                if unknown:
+                    raise ValueError(f"unknown configuration keys: {', '.join(sorted(prefix+k for k in unknown))}")
+                for key, item in value.items():
+                    expected = reference[key]
+                    name = f"{prefix}{key}"
+                    if isinstance(expected, dict):
+                        validate(expected, item, name + ".")
+                    elif not isinstance(item, type(expected)):
+                        raise ValueError(f"{name} must be {type(expected).__name__}")
+            validate(DEFAULT_CONFIG, supplied)
+            return deep_merge(DEFAULT_CONFIG, supplied)
         except json.JSONDecodeError as e:
             print(f"{R}FATAL:{RST} {CONF_PATH.name} is not valid JSON: {e}",
                   file=sys.stderr)

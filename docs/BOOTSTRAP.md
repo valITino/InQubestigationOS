@@ -8,17 +8,24 @@ allowlisted release on host-accessible storage. A failed required export is a
 failed bootstrap; valid guest output is retained. `bootstrap.build_only=true`
 is explicitly reported as build-only, never exported.
 
-## Supported storage contract
+## Guided first run and supported storage
 
-The implemented backend is an **already guest-visible mounted filesystem**.
-Configure its measured `findmnt` source and type. Bootstrap does not invent a
-share, host address, or configure a hypervisor. Mounted virtiofs, 9p, vboxsf or
-SSHFS can satisfy the filesystem contract, but this is not a claim that every
-platform was tested. `bootstrap.host_path` is an optional operator-supplied
-mapping; otherwise the physical-host path is reported as unknown. A host folder
-is outside the VM, not offline/removable media. Use `backup_kind=physical-device`
-only when attachment is independently established, or `host-share` when policy
-allows it. Root-filesystem directories and unknown backing are rejected.
+With a terminal and no prepared profile, bootstrap enumerates preformatted
+filesystems using structured `lsblk` output, offers measured identities, creates
+safe mountpoints, mounts approved resources through narrowly scoped sudo, and
+revalidates `findmnt` identity before sensitive use. It never formats media. It
+offers the one existing GnuPG identity or asks for a public UID, and collects
+its passphrase with hidden input into an owner-only run-scoped file which it
+removes. The first run therefore requires no hand-written JSON, manual mount,
+manually created passphrase file, or pre-existing key.
+
+Real block filesystems (ext2/3/4, XFS, Btrfs, FAT/exFAT, NTFS3) and exposed host
+transports (virtiofs, 9p, CIFS, NFS) are implemented adapters. Network-share
+authentication stays with the OS/provider; secrets are never accepted in JSON
+or mount argv. An unexposed share still requires an authorized platform helper;
+no unauthenticated host control service is shipped. `bootstrap.host_path` is an
+optional attested native mapping; otherwise it is unknown. Root/bind/guest-only
+lookalikes and changed sources are rejected.
 
 Example initial configuration (replace every measured value; none are defaults):
 
@@ -45,7 +52,7 @@ authorization:
 ./build_iso.py bootstrap-status --watch
 ```
 
-The passphrase file must be owned by the build identity and mode `0600`. Its
+For non-interactive automation, the passphrase file must be owned by the build identity and mode `0600`. Its
 value is not stored in configuration, status, inventory, logs, bundle, or ISO.
 Signing-key and backup-encryption passphrases remain distinct concepts; the
 workflow does not introduce unrelated password reuse.
@@ -64,9 +71,11 @@ workflow does not introduce unrelated password reuse.
 
 The upstream Anaconda path is interactive unless `install.unattended=true`.
 Unattended mode requires an exact stable disk identity and deliberately enrolls
-encryption on that laptop. This project does not inject a reusable local-account
-password/hash into a distributable ISO, so account enrollment remains a target
-action. No prompt-free physical installation or boot is claimed or tested.
+encryption on that laptop. The kickstart creates `install.username` locked. On the physical laptop, the
+visible first-boot continuation uses `systemd-ask-password` twice and streams
+the unique value to `chpasswd` before provisioning. No password or hash crosses
+the build host or enters the ISO. No prompt-free physical installation or boot
+is claimed or tested.
 
 ## Status, locations, and recovery
 
@@ -84,3 +93,22 @@ bootstrap. Input-bound markers avoid unnecessary template/ISO builds, while
 destination identities are revalidated at use. Mock tests cover these contracts.
 Live mounts, hypervisor setup, real GPG, full ISO build, USB writing, physical
 installation/boot, and enterprise enrollment remain environment-specific tests.
+
+## Implementation and test matrix
+
+Implementation was audited from revision `f448228231d268495e3dfc0153fa97d19cf9d72f`.
+
+| Outcome | Implementation | Regression evidence |
+|---|---|---|
+| guided discovery, persistence, hidden secret, repeat reuse | `BootstrapWorkflow.guided_setup` | bootstrap workflow and CLI harnesses |
+| real block/share mounting and substitution checks | `discover_block_filesystems`, `prepare_mount`, `_validate` | deterministic mount contracts |
+| key ordering and stale-state repair | reload after `gen-key`; early doctor defers signing | orchestration/bootstrap checks |
+| authenticated export | exact-size gate, allowlist, checksum, pinned signer/subkey, readback, atomic rename | bootstrap/release checks |
+| target account enrollment | locked kickstart user and target-console enrollment | installation-path checks |
+| visible truthful state | atomic running/preparing/failed status and text summary | bootstrap checks |
+
+CI runs compile, Ruff, high-severity Bandit, portable harnesses, host/package,
+configuration, and documentation checks. Full ISO building and boot, physical
+isolation, an unexposed host-share helper, privileged removable-media tests, USB
+flash, and physical-laptop acceptance require their named environments and are
+**not tested** by portable CI.

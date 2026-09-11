@@ -30,15 +30,17 @@ jobs:
           sudo add-apt-repository --yes universe
           sudo apt-get update
       - name: Compile both scripts
-        run: python3 -m py_compile golden_image.py build_iso.py release_candidate.py acceptance_runner.py
+        run: python3 -m py_compile golden_image.py build_iso.py bootstrap_workflow.py release_candidate.py acceptance_runner.py
       - name: Lint Python
         run: ruff check .
       - name: Scan Python for high-severity security defects
-        run: python3 -m bandit -q -lll -r build_iso.py golden_image.py release_candidate.py acceptance_runner.py tests
+        run: python3 -m bandit -q -lll -r build_iso.py bootstrap_workflow.py golden_image.py release_candidate.py acceptance_runner.py tests
       - name: Run the harness
         run: ./tests/run_tests.py
       - name: Test unattended build-host orchestration
         run: ./tests/orchestration_checks.py
+      - name: Test guided bootstrap, mounts, state, and authenticated export
+        run: ./tests/bootstrap_workflow_checks.py
       - name: Test installation and first-boot path
         run: ./tests/install_path_checks.py
       - name: Test release-candidate policy gates
