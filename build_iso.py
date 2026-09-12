@@ -168,6 +168,7 @@ DEFAULT_CONFIG: dict = {
     # findmnt and must match again immediately before backup/export.
     "bootstrap": {
         "dependencies_authorized": False,
+        "profile_version": 0,
         "backup_path": "", "backup_source": "", "backup_fstype": "",
         "backup_kind": "",  # physical-device | host-share
         "export_path": "", "export_source": "", "export_fstype": "",
@@ -748,6 +749,7 @@ def bootstrap(x: Ctx, args) -> int:
     # implementation lives in bootstrap_workflow.py.
     bootstrap_contract = (
         x.c["bootstrap"]["dependencies_authorized"],
+        x.c["bootstrap"]["profile_version"],
         x.c["bootstrap"]["backup_path"], x.c["bootstrap"]["backup_source"],
         x.c["bootstrap"]["backup_fstype"], x.c["bootstrap"]["backup_kind"],
         x.c["bootstrap"]["export_path"], x.c["bootstrap"]["export_source"],
@@ -765,16 +767,11 @@ def bootstrap(x: Ctx, args) -> int:
     # Lock contention is deliberately handled before this invocation writes
     # status or inventory belonging to the active owner.
     workflow.acquire_lock()
-    workflow.initialize_inventory()
     try:
+        workflow.initialize_inventory()
         workflow.prepare_dependencies(args)
         workflow.stage("onboarding", "running", "discovering resources and collecting approval")
         workflow.onboard(args)
-    except Exception as exc:
-        workflow.stage("onboarding", "failed", str(exc))
-        workflow.cleanup()
-        raise
-    try:
         workflow.stage("onboarding", "complete", "approved destinations validated")
         steps: list[tuple[str, str, list[str]]] = [
             ("gen-key", "create or adopt the signing key", ["gen-key"]),
@@ -797,13 +794,13 @@ def bootstrap(x: Ctx, args) -> int:
             key_args += ["--passphrase-file", args.passphrase_file]
         steps[0] = ("gen-key", steps[0][1], ["gen-key", *key_args])
         backup_args: list[str] = []
-        backup_to = workflow.backup_path
+        backup_to = workflow.data_paths.get("backup", workflow.backup_path)
         if backup_to:
             backup_args += ["--to", str(backup_to)]
         if args.use_key:
             backup_args += ["--use-key", args.use_key]
-        if args.passphrase_file:
-            backup_args += ["--passphrase-file", args.passphrase_file]
+        if getattr(args, "backup_passphrase_file", None):
+            backup_args += ["--passphrase-file", args.backup_passphrase_file]
         steps[1] = ("backup-key", steps[1][1], ["backup-key", *backup_args])
 
         print(f"\n{B}{C}══ bootstrap{RST}")
@@ -857,18 +854,20 @@ def bootstrap(x: Ctx, args) -> int:
                 # parent copy and accidentally generate/re-export another key.
                 x.c = load_config()
                 workflow.cfg = x.c["bootstrap"]
-        try:
-            workflow.stage("export", "running", "authenticating source release")
-            workflow.export_release()
-            workflow.finish()
-        except KeyboardInterrupt:
-            workflow.stage("export", "interrupted", "operator interrupted export; incomplete publication is retained")
-            raise
-        except Exception as exc:
-            workflow.stage("export", "failed", str(exc))
-            raise
+        workflow.stage("export", "running", "authenticating source release")
+        workflow.export_release()
+    except KeyboardInterrupt:
+        workflow.stage(workflow.current_stage, "interrupted", "operator interrupted; run-owned resources are being cleaned up")
+        raise
+    except Exception as exc:
+        workflow.stage(workflow.current_stage, "failed", str(exc))
+        raise
     finally:
-        workflow.cleanup()
+        cleanup_errors = workflow.cleanup()
+    if cleanup_errors:
+        workflow.stage("cleanup", "failed", "; ".join(cleanup_errors))
+        raise Fatal("bootstrap work completed but required cleanup failed: " + "; ".join(cleanup_errors))
+    workflow.finish()
     print(f"""
 {B}{C}══ bootstrap complete{RST}
 
@@ -2512,7 +2511,7 @@ def fix_argv(fix_line: str) -> list[str]:
 # ---------------------------------------------------------------------------
 #  doctor — read-only readiness report
 # ---------------------------------------------------------------------------
-def doctor(x: Ctx, *, signing: bool = True) -> int:
+def doctor(x: Ctx, *, signing: bool = True, docker_via_sg: bool = False) -> int:
     x.phase("doctor", "is this build host ready?")
     # Before anything measures work_dir or reports where it will be.
     resolve_work_dir(x, fatal=False)
@@ -2582,7 +2581,9 @@ def doctor(x: Ctx, *, signing: bool = True) -> int:
         c.append(Check(f"{ce} installed", FAIL, fix="./build_iso.py setup-host"))
     else:
         c.append(Check(f"{ce} installed", OK))
-        if x.quiet(ce, "ps"):
+        docker_ready = (x.quiet("sg", "docker", "-c", "docker ps")
+                        if ce == "docker" and docker_via_sg else x.quiet(ce, "ps"))
+        if docker_ready:
             c.append(Check(f"{ce} usable without sudo", OK))
         else:
             in_group = ce in subprocess.run(["id", "-nG"], capture_output=True,
@@ -3253,7 +3254,8 @@ def setup_host(x: Ctx) -> int:
                    "./build_iso.py doctor")
 
     print()
-    return doctor(x, signing=False)
+    return doctor(x, signing=False, docker_via_sg=(ce == "docker" and
+                  not x.quiet("docker", "ps") and bool(shutil.which("sg"))))
 
 
 def setup_qube_bind_dirs(x: Ctx) -> None:
@@ -4715,6 +4717,10 @@ lifecycle
     b.add_argument("--passphrase-file", metavar="PATH",
                    help="encrypt/decrypt the backup with this passphrase instead "
                         "of prompting (for a scripted key-management process)")
+    b.add_argument("--backup-passphrase-file", metavar="PATH",
+                   help="bootstrap: separate protected backup-encryption secret provider")
+    p.add_argument("--review-profile", action="store_true",
+                   help="bootstrap: review/edit reusable choices without deleting outputs or keys")
     p.add_argument("--iso", metavar="PATH",
                    help="sign: the image to sign (default: the built one)")
     c = p.add_argument_group("check-upstream")

@@ -40,9 +40,11 @@ class Context:
         return "b" * 64
 
 
-def arguments(secret: Path):
+def arguments(secret: Path, backup_secret: Path | None = None):
     return SimpleNamespace(to=None, uid=None, use_key="A" * 40,
-                           passphrase_file=str(secret))
+                           passphrase_file=str(secret), no_passphrase=False,
+                           non_interactive=True, review_profile=False,
+                           backup_passphrase_file=str(backup_secret or secret))
 
 
 def main() -> int:
@@ -53,6 +55,12 @@ def main() -> int:
         secret = root / "runtime-secret"
         secret.write_text("DO-NOT-LOG-THIS")
         secret.chmod(0o600)
+        backup_secret = root / "backup-runtime-secret"
+        backup_secret.write_text("A-DIFFERENT-SECRET")
+        backup_secret.chmod(0o600)
+        for mountpoint, role in ((root / "backup", "backup"),
+                                 (root / "host share", "export")):
+            (mountpoint / ".inqubestigation" / role).mkdir(parents=True)
         x = Context(root)
         flow = bw.BootstrapWorkflow(x)
 
@@ -71,8 +79,9 @@ def main() -> int:
                 mock.patch("bootstrap_workflow.os.stat", side_effect=device_stat), \
                 mock.patch("bootstrap_workflow.shutil.disk_usage",
                            return_value=SimpleNamespace(free=100 * 1024**3)):
-            flow.onboard(arguments(secret))
+            flow.onboard(arguments(secret, backup_secret))
             flow.acquire_lock()
+            flow.initialize_inventory()
             flow.stage("onboarding", "complete", "ready")
             for name in bw.EXPORT_ALLOWLIST:
                 mapped = name.replace("InQubestigationOS.iso", "image with space.iso")
@@ -91,10 +100,46 @@ def main() -> int:
         inventory = json.loads(flow.inventory_path.read_text())
         assert status["state"] == "complete"
         assert inventory["export"]["verified"] is True
-        assert inventory["export"]["host_path"] is None
+        assert inventory["native_host_export"]["path"] is None
         assert "DO-NOT-LOG-THIS" not in flow.status_path.read_text()
         assert "DO-NOT-LOG-THIS" not in flow.inventory_path.read_text()
-        assert len(list((root / "host share").glob("release-*"))) == 1
+        assert len(list((root / "host share" / ".inqubestigation" / "export").glob("release-*"))) == 1
+
+        # A saved deployment profile suppresses only reusable questions. Every
+        # run still acquires two independent authorizations and reuses the
+        # configured signing fingerprint.
+        saved = Context(root)
+        saved.c["bootstrap"]["profile_version"] = bw.BootstrapWorkflow.VERSION
+        retry = bw.BootstrapWorkflow(saved)
+        retry_args = SimpleNamespace(to=None, uid=None, use_key=None,
+                                     passphrase_file=None,
+                                     backup_passphrase_file=None,
+                                     no_passphrase=False, non_interactive=False,
+                                     review_profile=False)
+        prompts = []
+        providers = iter((secret, backup_secret))
+        with mock.patch("bootstrap_workflow.sys.stdin.isatty", return_value=True), \
+                mock.patch.object(retry, "_ask", side_effect=AssertionError("saved choices re-asked")), \
+                mock.patch.object(retry, "_secret", side_effect=lambda label: (
+                    prompts.append(label), next(providers))[1]), \
+                mock.patch.object(retry, "_mount", side_effect=mount), \
+                mock.patch("bootstrap_workflow.os.stat", side_effect=device_stat), \
+                mock.patch("bootstrap_workflow.shutil.disk_usage",
+                           return_value=SimpleNamespace(free=100 * 1024**3)):
+            retry.onboard(retry_args)
+        assert prompts == ["signing-key authorization", "backup-encryption authorization"]
+        assert saved.c["iso_sign_key"] == "A" * 40
+
+        missing_provider = arguments(secret, backup_secret)
+        missing_provider.passphrase_file = None
+        missing_provider.backup_passphrase_file = None
+        with mock.patch.object(retry, "prepare_mount", return_value=(root, {})):
+            try:
+                retry.onboard(missing_provider)
+            except ValueError as exc:
+                assert "provider is missing in non-interactive mode" in str(exc)
+            else:
+                raise AssertionError("non-interactive run prompted or accepted no providers")
 
         # Exercise the real discovery function with lsblk's unmounted shape,
         # mixed nulls, and a malformed field. Labels are data, not formatting.
@@ -139,11 +184,13 @@ def main() -> int:
                                   side_effect=ValueError("mount authorization unavailable")):
             try:
                 check.onboard(SimpleNamespace(to=None, uid=None, use_key=None,
-                                              passphrase_file=None))
+                                              passphrase_file=None, backup_passphrase_file=None,
+                                              no_passphrase=False, non_interactive=True,
+                                              review_profile=False))
             except ValueError as exc:
                 message = str(exc)
                 assert "signing identity" in message and "runtime signing" in message
-                assert "mount authorization unavailable" in message
+                assert "unmounted mountpoint is not an empty directory" in message
             else:
                 raise AssertionError("incomplete onboarding was accepted")
 
@@ -181,7 +228,7 @@ def main() -> int:
             capture_output=True, env={**os.environ, "INQUBESTIGATION_CONFIG": str(profile)})
         assert rejected.returncode == 1
         assert "cannot be classified as physical-host distribution" in rejected.stderr
-    print("  12/12 bootstrap workflow checks pass")
+    print("  15/15 bootstrap workflow checks pass")
     return 0
 
 

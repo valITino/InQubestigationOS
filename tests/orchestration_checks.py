@@ -19,6 +19,7 @@ spec.loader.exec_module(bi)
 def args(**kw):
     base = dict(action="gen-key", dry_run=False, uid=None, use_key=None,
                 expire="3y", no_passphrase=False, passphrase_file=None,
+                backup_passphrase_file=None, non_interactive=False, review_profile=False,
                 assume_yes=True, yes=True, force=False, to=None)
     base.update(kw)
     return SimpleNamespace(**base)
@@ -87,7 +88,8 @@ def main():
         secret.write_text("x")
         secret.chmod(0o600)
         a = args(action="bootstrap", uid="Unit", use_key=fp, expire="2y",
-                 passphrase_file=str(secret), to="/media/backup")
+                 passphrase_file=str(secret), backup_passphrase_file=str(secret),
+                 to="/media/backup")
         x = ctx(td, a)
         x.c["bootstrap"]["backup_path"] = "/media/backup"
         x.c["bootstrap"]["dependencies_authorized"] = True

@@ -39,6 +39,8 @@ class BootstrapWorkflow:
         self.completed: list[str] = []
         self.mounted: list[Path] = []
         self.secret_files: list[Path] = []
+        self.data_paths: dict[str, Path] = {}
+        self.current_stage = "starting"
 
     @property
     def backup_path(self) -> Path | None:
@@ -95,6 +97,15 @@ class BootstrapWorkflow:
         if rc:
             raise ValueError(f"authorized command failed ({rc}): {' '.join(argv)}")
 
+    def _privileged_directory_empty(self, path: Path) -> bool:
+        command = ["find", str(path), "-mindepth", "1", "-maxdepth", "1", "-print", "-quit"]
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        probe = subprocess.run(command, capture_output=True, text=True)
+        if probe.returncode:
+            raise ValueError(f"cannot safely inspect workflow mountpoint {path}")
+        return not probe.stdout
+
     def prepare_mount(self, role: str) -> tuple[Path, dict]:
         """Mount an explicitly selected, preformatted block/share resource."""
         path = Path(self.cfg[f"{role}_path"])
@@ -106,9 +117,24 @@ class BootstrapWorkflow:
             raise ValueError(f"{role}: mountpoint or parent is an unsafe symlink")
         existing = self._mount(path) if path.exists() else None
         if existing and existing.get("target") == str(path):
-            return self._validate(role, minimum_mb=0)
-        if path.exists() and (not path.is_dir() or any(path.iterdir())):
-            raise ValueError(f"{role}: unmounted mountpoint is not an empty directory")
+            return self._validate(role, minimum_mb=0, prepare_data=True)
+        if path.exists():
+            if not path.is_dir():
+                raise ValueError(f"{role}: unmounted mountpoint is not an empty directory")
+            try:
+                occupied = any(path.iterdir())
+            except PermissionError:
+                # install(1) creates these restricted directories. Inspect a
+                # retry through the same narrow privilege boundary rather than
+                # assuming the old process can enumerate it.
+                st = path.stat()
+                owned_mountpoint = (st.st_uid == 0 and st.st_mode & 0o777 == 0o700
+                                    and path.name == f"inqubestigation-{role}")
+                if not owned_mountpoint:
+                    raise ValueError(f"{role}: cannot safely inspect unmounted mountpoint")
+                occupied = not self._privileged_directory_empty(path)
+            if occupied:
+                raise ValueError(f"{role}: unmounted mountpoint is not an empty directory")
         if not source or not fstype:
             raise ValueError(f"{role}: no approved mount identity")
         if fstype not in {"ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "exfat",
@@ -119,6 +145,8 @@ class BootstrapWorkflow:
         options = "nodev,nosuid"
         if fstype in {"virtiofs", "9p"}:
             options += ",noexec"
+        if fstype in {"vfat", "exfat", "ntfs3"}:
+            options += f",uid={os.getuid()},gid={os.getgid()},umask=0077"
         self.stage(role, "preparing", f"mounting approved {source} at {path}")
         # Creation beneath /mnt is intentionally privileged.  install(1) is
         # argv-only and does not traverse a caller-provided shell expression.
@@ -126,7 +154,7 @@ class BootstrapWorkflow:
         self._run_privileged(["mount", "-t", fstype, "-o", options, source, str(path)])
         self.mounted.append(path)
         try:
-            return self._validate(role, minimum_mb=0)
+            return self._validate(role, minimum_mb=0, prepare_data=True)
         except Exception:
             self._run_privileged(["umount", str(path)])
             self.mounted.remove(path)
@@ -154,13 +182,14 @@ class BootstrapWorkflow:
 
     def guided_setup(self, args) -> None:
         """Collect and persist non-secret choices; secrets remain run-scoped."""
-        profile_complete = (all(self.cfg.get(k) for k in
+        profile_complete = (self.cfg.get("profile_version") == self.VERSION and
+                            all(self.cfg.get(k) for k in
                             ("backup_path", "backup_source", "backup_fstype",
                              "backup_kind")) and
                             (self.cfg.get("build_only") or all(self.cfg.get(k) for k in
                              ("export_path", "export_source", "export_fstype", "export_kind"))) and
                             (self.x.c.get("iso_sign_key") or args.uid or args.use_key))
-        if profile_complete or getattr(args, "non_interactive", False):
+        if (profile_complete and not getattr(args, "review_profile", False)) or getattr(args, "non_interactive", False):
             return
         if not sys.stdin.isatty():
             return
@@ -188,6 +217,9 @@ class BootstrapWorkflow:
                 choice = self._ask(role, "Select a detected preformatted filesystem number, "
                                    "or type 'share' for an already exposed host share")
             if choice.isdigit() and 1 <= int(choice) <= len(devices):
+                if role == "export":
+                    raise ValueError("export: a guest block device cannot establish an "
+                                     "authenticated physical-host publication")
                 d = devices[int(choice)-1]
                 stable = f"/dev/disk/by-uuid/{d['uuid']}" if d.get("uuid") else d["name"]
                 self.cfg[f"{role}_source"] = stable
@@ -221,6 +253,7 @@ class BootstrapWorkflow:
             install[key] = self._ask(title, "Non-secret reusable installer setting; stored in iso-build.json",
                                      install[key])
         changed = True
+        self.cfg["profile_version"] = self.VERSION
         if not self.x.c.get("iso_sign_key") and not (args.uid or args.use_key):
             keys = __import__("build_iso").secret_key_fingerprints()
             if len(keys) == 1:
@@ -229,8 +262,6 @@ class BootstrapWorkflow:
             else:
                 args.uid = self._ask("Signing identity", "Public name/email for a new signing key. "
                                      "The private key remains in this user's GnuPG home")
-        if not args.passphrase_file and not args.no_passphrase:
-            args.passphrase_file = str(self._secret("signing-key passphrase"))
         if changed:
             from build_iso import CONF_PATH, validate_config
             validate_config(self.x.c)
@@ -268,18 +299,28 @@ class BootstrapWorkflow:
             raise ValueError(f"setup-host prerequisite preparation failed (child exited {rc})")
         self.stage("setup-host", "complete", "discovery and transport helpers prepared")
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> list[str]:
+        errors = []
         for path in self.secret_files:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(f"could not remove runtime secret {path}: {exc}")
         # Preserve mounts during a resumable workflow. They are unmounted only
         # after completion, and only if this run created them.
         for path in reversed(self.mounted):
             try:
                 self._run_privileged(["umount", str(path)])
             except ValueError:
-                self.stage("cleanup", "failed", f"could not unmount workflow mount {path}")
+                errors.append(f"could not unmount workflow mount {path}")
+        if self.lock_file is not None:
+            fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+            self.lock_file.close()
+            self.lock_file = None
+        return errors
 
-    def _validate(self, role: str, *, minimum_mb: int) -> tuple[Path, dict]:
+    def _validate(self, role: str, *, minimum_mb: int,
+                  prepare_data: bool = False) -> tuple[Path, dict]:
         path = Path(self.cfg.get(f"{role}_path", ""))
         expected_source = self.cfg.get(f"{role}_source", "")
         expected_type = self.cfg.get(f"{role}_fstype", "")
@@ -310,9 +351,15 @@ class BootstrapWorkflow:
             raise ValueError(f"{role}: mount identity changed (expected {expected_source} "
                              f"{expected_type}; found {mount.get('source')} {mount.get('fstype')})")
         opts = set(mount.get("options", "").split(","))
-        if "ro" in opts or not os.access(path, os.W_OK | os.X_OK):
+        if "ro" in opts:
             raise ValueError(f"{role}: destination is read-only or not writable")
-        if shutil.disk_usage(path).free < minimum_mb * 1024**2:
+        data = path / ".inqubestigation" / role
+        if prepare_data and not data.exists():
+            self._run_privileged(["install", "-d", "-m", "0700", "-o", str(os.getuid()),
+                                  "-g", str(os.getgid()), "--", str(data)])
+        if not data.is_dir() or data.is_symlink() or not os.access(data, os.W_OK | os.X_OK):
+            raise ValueError(f"{role}: dedicated data directory is unavailable or not writable")
+        if shutil.disk_usage(data).free < minimum_mb * 1024**2:
             raise ValueError(f"{role}: less than {minimum_mb} MiB is available")
         if role == "backup" and kind not in ("physical-device", "host-share"):
             raise ValueError("backup: kind must establish physical-device or host-share; "
@@ -320,7 +367,8 @@ class BootstrapWorkflow:
         if role == "export" and (kind != "host-share" or expected_type not in
                                   {"virtiofs", "9p", "cifs", "nfs", "nfs4"}):
             raise ValueError("export: authenticated physical-host share transport is required")
-        return path, mount
+        self.data_paths[role] = data
+        return data, mount
 
     def onboard(self, args) -> None:
         """Aggregate every knowable failure before any expensive child runs."""
@@ -331,22 +379,32 @@ class BootstrapWorkflow:
         missing = []
         if not self.x.c.get("iso_sign_key") and not (args.uid or args.use_key):
             missing.append("signing identity: pass --uid/--use-key or configure iso_sign_key")
-        if not args.passphrase_file:
-            missing.append("runtime signing/backup authorization: --passphrase-file is required")
-        else:
+        interactive = not getattr(args, "non_interactive", False) and sys.stdin.isatty()
+        if not args.passphrase_file and not args.no_passphrase and interactive:
+            args.passphrase_file = str(self._secret("signing-key authorization"))
+        if not getattr(args, "backup_passphrase_file", None) and interactive:
+            args.backup_passphrase_file = str(self._secret("backup-encryption authorization"))
+        if not args.passphrase_file and not args.no_passphrase:
+            missing.append("runtime signing authorization provider is missing in non-interactive mode")
+        if not getattr(args, "backup_passphrase_file", None):
+            missing.append("runtime backup-encryption authorization provider is missing in non-interactive mode")
+        for label, raw in (("signing", args.passphrase_file),
+                           ("backup encryption", getattr(args, "backup_passphrase_file", None))):
+            if not raw:
+                continue
             try:
                 from build_iso import protected_secret_file, validate_config
                 validate_config(self.x.c)
-                protected_secret_file(args)
+                protected_secret_file(type("SecretArgs", (), {"passphrase_file": raw})())
             except Exception as exc:
-                missing.append(f"runtime secret source: {exc}")
+                missing.append(f"runtime {label} secret source: {exc}")
         for role, minimum in (("backup", self.cfg["min_backup_mb"]),
                               ("export", self.cfg["min_export_mb"])):
             if role == "export" and self.cfg.get("build_only"):
                 continue
             try:
                 self.prepare_mount(role)
-                self._validate(role, minimum_mb=int(minimum))
+                self._validate(role, minimum_mb=int(minimum), prepare_data=True)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 missing.append(str(exc))
         if self.backup_path and self.cfg.get("export_path"):
@@ -356,6 +414,7 @@ class BootstrapWorkflow:
         if install.get("unattended") and not install.get("disk"):
             missing.append("unattended install requires a stable target disk identity")
         if missing:
+            self.current_stage = "onboarding"
             raise ValueError("upfront onboarding blocked before build:\n - " + "\n - ".join(missing))
         print("\nUPFRONT REVIEW (non-secret)")
         print(f"  work: {self.x.work}")
@@ -414,13 +473,14 @@ class BootstrapWorkflow:
                   "elapsed_seconds": round((now - self.started).total_seconds(), 3),
                   "completed_stages": self.completed, "detail": detail,
                   "log": str(self.x.log), "resume": "./build_iso.py bootstrap --yes "
-                  "--passphrase-file <protected-runtime-file>"}
+                  "(runtime authorizations are collected afresh)"}
         tmp = self.status_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
         os.replace(tmp, self.status_path)
         self.summary_path.write_text(f"{state}: {stage}\n{detail}\nstatus: {self.status_path}\n")
 
     def stage(self, name: str, state: str, detail: str) -> None:
+        self.current_stage = name
         if state == "complete" and name not in self.completed:
             self.completed.append(name)
         self._write_status(state, name, detail)
@@ -474,19 +534,19 @@ class BootstrapWorkflow:
         self._verify_release(final, names)
         artifacts = {name: {"bytes": (final / name).stat().st_size,
                             "sha256": self._hash(final / name)} for name in names}
-        inventory = {"schema": self.VERSION, "repository": str(Path(__file__).parent),
-                     "machine": "build-vm", "work": str(self.x.work),
-                     "output": str(self.x.out_dir), "log": str(self.x.log),
-                     "status": str(self.status_path), "gnupg_home": os.environ.get(
-                         "GNUPGHOME", str(Path.home() / ".gnupg")),
-                     "signing_fingerprint": self.x.c.get("iso_sign_key"),
-                     "backup": {"path": str(self.backup_path), "source": self.cfg["backup_source"],
-                                "kind": self.cfg["backup_kind"], "verification": "bootstrap stage"},
-                     "export": {"guest_path": str(final), "mount": identity,
-                                "host_path": self.cfg.get("host_path") or None,
-                                "host_mapping_source": "operator-configured" if self.cfg.get("host_path") else "unknown",
-                                "verified": True, "artifacts": artifacts},
-                     "runtime_secret": {"persisted": False, "value_reported": False}}
+        inventory = json.loads(self.inventory_path.read_text())
+        inventory["signing_fingerprint"] = self.x.c.get("iso_sign_key")
+        inventory["runtime_secret"] = {"persisted": False, "value_reported": False}
+        inventory["backup"].update(
+            path=str(self.data_paths.get("backup", self.backup_path)), state="verified",
+            verified=True, source=self.cfg["backup_source"], kind=self.cfg["backup_kind"])
+        inventory["export"].update(
+            path=str(final), state="verified", verified=True, mount=identity,
+            artifacts=artifacts)
+        host_root = self.cfg.get("host_path")
+        inventory["native_host_export"].update(
+            path=str(Path(host_root) / release) if host_root else None,
+            state="operator-attested" if host_root else "unknown", verified=False)
         tmp = self.inventory_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
         os.chmod(tmp, 0o600)
