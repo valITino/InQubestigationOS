@@ -1,12 +1,148 @@
 # Review and fixes
 
-Two verification passes against primary sources, and what they found. Defects
+Three verification passes against primary sources, and what they found. Defects
 are recorded here rather than quietly patched, so nobody reintroduces them.
 
+- [Pass 3 — 2026-09-14](#pass-3--2026-09-14)
 - [Pass 2 — v2.2, 2026-09-08](#pass-2--v22-2026-09-08)
 - [Pass 1 — v2.1, 2026-09-01](#pass-1--v21-2026-09-01)
 - [What is actually tested](#what-is-actually-tested)
 - [Still not verified](#still-not-verified--requires-real-hardware)
+
+---
+
+## Pass 3 — 2026-09-14
+
+Passes 1 and 2 read this repository against the design it implements, and
+against the upstream *packages* it installs. Pass 3 read it against the
+**builder it drives** — qubes-builderv2 at `mm_db047c1c`, the `qubes-release`
+component at `release4.3`, and `qubes-lorax-templates` at `release4.3`, all
+checked out and read rather than recalled. Most of what it found could not have
+been caught by reading this repository alone, because the defect was always an
+assumption about what upstream does with what we hand it.
+
+Every finding below was reproduced before it was fixed, and every fix was
+checked by reverting it and confirming the suite fails.
+
+### Would not have worked
+
+**1. The build could not start.** `builder.yml` is seeded verbatim from
+upstream's `example-configs/qubes-os-r4.3.yml`, which ships the container
+executor commented out and `executor: {type: qubes, options: {dispvm: "@dispvm"}}`
+live. That executor drives qrexec into a disposable qube. On the Debian/Fedora
+build host this project documents — and that `doctor` explicitly checks for, by
+refusing to run in dom0 — the very first `./qb` call could not run. Nothing in
+the repository ever wrote an `executor` key.
+
+**2. Nothing the installer needs ever reached the installer.** The `%post`
+provisioning payload, the first-boot service and timer, and the unattended
+Anaconda answers were written into `qubes-release/conf/investigator.ks`, and
+`builder.yml`'s `iso: kickstart:` pointed at it. That file is a *compose*
+manifest: `qubesbuilder/plugins/installer/Makefile:116` feeds it to
+`scripts/ksparser`, which extracts `repo` lines and the package list and
+discards everything else. `LORAX_OPTS` carries no kickstart, and `inst.ks`
+appears nowhere in qubes-builderv2. An install would have produced stock Qubes
+with no provisioner on it.
+
+The route Qubes actually provides was found in its own lorax templates: both
+`grub2-bios.cfg` and `grub2-efi.cfg` on `release4.3` end with
+`if search --set=oem -l QUBES_OEM` … `inst.ks=hd:LABEL=QUBES_OEM` and
+`set default="qubes-oem"`. The install-time kickstart now goes on a
+QUBES_OEM-labelled filesystem, which `write-usb` creates. The signed ISO is not
+modified.
+
+**3. The default build aborted before producing an ISO.**
+`validate_install_contract` required `lang`, `keyboard`, `timezone`,
+`user --name=`, `autopart --encrypted` and `reboot` of the stock kickstart plus
+ours. The real `conf/iso-online.ks` and `conf/qubes-kickstart.cfg` on
+`release4.3` contain nothing but `repo` lines and a `%packages` block — none of
+those six. The contract could never be satisfied, so the default,
+non-unattended build failed every time.
+
+**4. Five "investigator" templates that were stock Debian.**
+qubes-builderv2 finds a Debian flavor's content at
+`<sources>/builder-debian/template_debian/<flavor>`; the template plugin builds
+that list itself (`template_flavor_dir` starts empty) and hardcodes extra
+directories only for `whonix-*`, `kicksecure` and names starting with `kali`.
+There is no configuration hook, and `builder-debian/template_debian` holds only
+gnome, xfce, minimal, firmware and flash. A flavor with no directory there does
+not fail — the plugin falls back to the distribution defaults. The build
+succeeded, produced `qubes-template-investigator-kali-*.rpm` containing stock
+Debian trixie, and both checks this script made (the RPMs exist, the ISO lists
+them) passed. The build now verifies the flavor directories on that exact search
+path and refuses; `tier` defaults to 1, where `golden_image.py` builds the
+investigator templates on the target.
+
+**5. The documented release path always failed.** `release_candidate.py` never
+passed `--backup-passphrase-file`, but bootstrap onboarding requires a
+backup-encryption secret on any non-interactive run and a trusted runner has no
+terminal to prompt at. It failed at onboarding, before anything was built.
+
+**6. `bootstrap` gave `backup-key` the wrong secret.** Unlocking the signing key
+to export it and encrypting the resulting backup are two different passphrases —
+the code's own prompt says "They may differ" — and both were taken from
+`--passphrase-file`, which bootstrap filled with the backup secret.
+
+### Would have been accepted when it should not have been
+
+**7. A revoked signing key passed every check.** Measured against gpg 2.4: a
+revoked key still emits `VALIDSIG` and gpg still exits 0. Only `GOODSIG`
+becoming `REVKEYSIG`, plus a `KEYREVOKED` line, distinguishes it. `write-usb` —
+the last checkpoint before an image reaches removable media — and the
+release-candidate gate both rested on `VALIDSIG` alone.
+
+**8. A genuine image was rejected by its own tooling.** `VALIDSIG` names the key
+that made the signature *first* and the primary *last*. A normal GnuPG key signs
+with a signing subkey, which is the shape `gen-key --use-key` adopts, so
+comparing the first field against the unit's primary fingerprint rejected a
+perfectly good image — in `write-usb`, in the release gate, and in the
+`verify-iso.sh` shipped to recipients. `bootstrap_workflow.py` read both fields
+and was already correct.
+
+**9. An unchecked supply chain reported as a checked one.** Every upstream fetch
+failure in `check-upstream` was a WARN, and only FAIL was blocking, so with no
+network it printed its findings and exited 0 having verified nothing — and exit
+0 is what the bootstrap step, the pre-build gate, the release gate and the
+scheduled CI job all read as "current". Unreachable sources are now a distinct
+state, and blocking.
+
+**10. One documented command bricked the configuration.** The `--set` line
+printed in GUIDE §8 wrote `install.disk=/dev/nvme0n1`; both writes reported
+success, and every later invocation then died in `load_config`'s cross-field
+gate before doing anything — including the `--set` needed to correct it. Only
+hand-editing the JSON recovered it.
+
+### The tests were the problem too
+
+Rewiring `sys-proxy` straight to `sys-firewall` — removing the IPS and the DPI
+recorder from the traffic path entirely — left the whole suite green. Everything
+asserted that the provisioner *ran*; nothing asserted what it *built*, and the
+stub answers every in-qube command 0.
+
+- The chain topology is now read back off the world the run produced, including
+  a sweep over every qube for anything attached above `sys-proxy`.
+- `--verify` executes 83 checks and nothing asserted that. There is now a floor
+  and a list of the groups by name — the floor alone is too blunt, because
+  deleting one group stays above any threshold loose enough not to be brittle.
+- Generated shell scripts are handed to `bash -n`. Writing that check exposed
+  its own blind spot: keying on the shebang alone meant a script that *lost*
+  its `#!` line stopped being checked rather than failing.
+- `check_unbound` was called against `sys-proxy`, but phase 7 writes
+  `unbound-quad9.conf` into `sys-firewall`, so six DNS-over-TLS assertions never
+  ran.
+- The Tor-gateway check read `"sys-whonix" not in [line for line in … if
+  "sys-whonix" in line]` — a list of whole lines tested for membership of the
+  bare string, which no line can equal. It could not fail.
+
+Static checks went from 59 to 106 on the same generated output. None of the new
+ones needed a code change to pass; they were simply never asked.
+
+### Still true after this pass
+
+Neither script has been run end to end on real hardware, and that is the one
+thing no amount of tooling closes. What changed is that the failures waiting
+there are now hardware failures rather than failures that a careful reading of
+upstream would have predicted.
 
 ---
 

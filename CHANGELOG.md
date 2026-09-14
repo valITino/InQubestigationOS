@@ -1,5 +1,64 @@
 # Changelog
 
+## 2.3 — 2026-09-14
+
+A third verification pass, this one against the **builder** rather than the
+design or the packages: qubes-builderv2 at `mm_db047c1c`, `qubes-release` at
+`release4.3`, and `qubes-lorax-templates` at `release4.3`, read rather than
+recalled. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
+
+**Fixed — would not have worked**
+
+- `builder.yml` kept upstream's `executor: type: qubes`, which drives qrexec
+  into a disposable qube. On the Debian/Fedora build host this project
+  documents, the first `./qb` call could not run. It now selects the container
+  executor and verifies the choice through `qb config get-var executor`.
+- The `%post` payload, the first-boot unit and the unattended Anaconda answers
+  were written into a kickstart qubes-builderv2 uses only as a compose
+  manifest — `ksparser` extracts repos and packages and discards the rest,
+  lorax takes no kickstart, and `inst.ks` appears nowhere in the builder. None
+  of it reached the installed machine. They now go on a QUBES_OEM-labelled
+  filesystem, the OEM install route Qubes' own lorax templates provide, which
+  `write-usb` creates without modifying the signed ISO.
+- `validate_install_contract` required six directives of a stock kickstart that
+  contains none of them, so the default (non-unattended) build aborted before
+  producing an ISO.
+- Template flavors had no content directory on the builder's search path, so
+  all five "investigator" templates built as stock Debian trixie while every
+  check — RPMs present, ISO lists them — passed. The build now verifies the
+  flavor directories and refuses; `tier` defaults to 1.
+- `release_candidate.py` never supplied the backup-encryption secret that
+  bootstrap onboarding requires on a non-tty, so the documented trusted-runner
+  release path always failed at onboarding.
+- `bootstrap` passed the backup passphrase to `backup-key --passphrase-file`,
+  which `backup_key` also used to unlock the signing key for export.
+
+**Fixed — accepted what it should have refused**
+
+- A revoked signing key still emits `VALIDSIG` and gpg still exits 0. `write-usb`
+  and the release gate rested on `VALIDSIG` alone and accepted it.
+- `VALIDSIG` names the signing subkey first and the primary last, so a genuine
+  image signed by an adopted key was rejected by `write-usb`, by the release
+  gate, and by the `verify-iso.sh` shipped to recipients.
+- Every upstream fetch failure in `check-upstream` was a non-blocking warning,
+  so a network outage produced a passing supply-chain verdict having verified
+  nothing.
+- The `--set` command printed in GUIDE §8 left `iso-build.json` in a state where
+  every later invocation — including the corrective `--set` — died before doing
+  anything.
+
+**Tests**
+
+- Rewiring `sys-proxy` past the IPS and the DPI recorder used to leave the suite
+  green. The chain topology, an acceptance-coverage floor and the acceptance
+  groups by name, `bash -n` over every generated script, and two checks that
+  could not fail (one reading the wrong qube, one a tautology) are all fixed.
+  Static checks went from 59 to 106 on the same output.
+- New: `tests/oem_media_checks.py` (real sgdisk/mkfs/mount against a loop
+  device) and `tests/signature_checks.py` (real GnuPG keys, including a revoked
+  one). `pykickstart` is pinned in `requirements-dev.txt` so CI parses the
+  generated install-time kickstart on every push.
+
 ## 2.2 — 2026-09-08
 
 A second verification pass, and the automation of everything the first pass left

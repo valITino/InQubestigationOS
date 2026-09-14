@@ -41,7 +41,7 @@ from typing import Callable
 # ===========================================================================
 DEFAULT_CONFIG: dict = {
     "image_name": "InQubestigationOS",
-    "image_version": "2.2",
+    "image_version": "2.3",
     "expect_qubes_release": "4.3",
 
     # Base templates. Verified against qubes-release release4.3 comps-dom0.xml,

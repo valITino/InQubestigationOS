@@ -64,7 +64,13 @@ def main():
         custom = root / "target.json"
         custom.write_text(json.dumps({"wazuh": {"mode": "central",
                                                  "central_address": "10.0.0.5"},
-                                      "image_version": "2.2"}))
+                                      # Read from the provisioner rather than
+                                      # written here: a hardcoded copy silently
+                                      # drifts at the next version bump, and
+                                      # this fixture exists to exercise the
+                                      # check that catches exactly that.
+                                      "image_version":
+                                          gi.DEFAULT_CONFIG["image_version"]}))
         x.c["provisioner_config"] = str(custom)
         with mock.patch.object(bi, "kickstart_python", return_value=(None, "")):
             rel = bi.write_kickstart(x, stock.name, [])
