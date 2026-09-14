@@ -29,6 +29,9 @@ jobs:
         run: |
           sudo add-apt-repository --yes universe
           sudo apt-get update
+          # write-usb builds the QUBES_OEM partition with these; the media
+          # checks below run the real tools against a loop device.
+          sudo apt-get install -y gdisk dosfstools
       - name: Compile both scripts
         run: python3 -m py_compile golden_image.py build_iso.py bootstrap_workflow.py release_candidate.py acceptance_runner.py
       - name: Lint Python
@@ -47,6 +50,10 @@ jobs:
         run: ./tests/release_checks.py
       - name: Test acceptance evidence and maintenance gates
         run: ./tests/acceptance_checks.py
+      # Root and a loop device: this is the only check that establishes that
+      # appending the QUBES_OEM partition leaves the isohybrid MBR intact.
+      - name: Test the QUBES_OEM partition against real media
+        run: sudo ./tests/oem_media_checks.py
       # Also run standalone so a failure names itself in the job summary.
       - name: The build-host support holds up
         if: always()

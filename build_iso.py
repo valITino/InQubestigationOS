@@ -151,6 +151,11 @@ DEFAULT_CONFIG: dict = {
         "required_template": "debian-13-xfce",
         # Complete Qubes' own initial setup non-interactively at first boot.
         "auto_initial_setup": True,
+        # Filesystem for the QUBES_OEM partition that carries the install-time
+        # kickstart. vfat is the widest-compatibility choice and what an OEM
+        # partition conventionally is; ext4 is accepted for hosts without
+        # dosfstools. The LABEL is fixed by Qubes' lorax templates, not by this.
+        "oem_fstype": "vfat",
     },
     # Optional non-secret golden_image.py configuration to embed. Blank uses
     # the provisioner's embedded defaults. Secrets are rejected.
@@ -3095,6 +3100,11 @@ def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
             ("venv support, for the kickstart validator",
              ["python3-venv", "python3-virtualenv"]),
             ("kickstart validation", ["python3-pykickstart"]),
+            # write-usb appends the QUBES_OEM partition that carries the
+            # install-time kickstart. Without these the stick boots into a
+            # plain manual installer and nothing provisions the machine.
+            ("GPT partitioning for the QUBES_OEM partition", ["gdisk"]),
+            ("FAT tools for the QUBES_OEM partition", ["dosfstools"]),
         ]
     # "docker" is NOT a Fedora binary package name — it is a virtual provide of
     # moby-engine, so `dnf list docker` finds nothing and the old hardcoded
@@ -3119,6 +3129,11 @@ def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
         # it works too, and is kept as a fallback for a Fedora that has only
         # that name.
         ("kickstart validation", ["python3-kickstart", "pykickstart"]),
+        # write-usb appends the QUBES_OEM partition that carries the
+        # install-time kickstart. Without these the stick boots into a plain
+        # manual installer and nothing provisions the machine.
+        ("GPT partitioning for the QUBES_OEM partition", ["gdisk"]),
+        ("FAT tools for the QUBES_OEM partition", ["dosfstools"]),
     ]
     if ce == "docker":
         plan.insert(1, ("the docker command (split from the engine in Fedora)",
@@ -3353,6 +3368,9 @@ def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
     loop.
     """
     gaps = [t for t in ("git", "curl", "gpg", "rsync", ce) if not shutil.which(t)]
+    # Needed only by write-usb, but missing them there means discovering it
+    # with the stick already written and the operator waiting.
+    gaps += [t for t in ("sgdisk", "mkfs.vfat") if not shutil.which(t)]
     if not _have_module("yaml"):
         # Named by what it is, not by one distribution's package name: this
         # message is printed on Fedora hosts too, where it is python3-pyyaml.
@@ -4834,6 +4852,27 @@ def write_usb(x: Ctx) -> int:
         raise Fatal("readback does NOT match the image. The write failed silently "
                     "or the media is faulty. Do not distribute this stick.")
 
+    # Only now, after the image has been compared against the stick: appending
+    # the partition rewrites the GPT, which lives inside the ISO's system area.
+    ks = oem_kickstart_path(x)
+    if getattr(x.args, "no_oem", False):
+        x.warn(f"--no-oem: no {OEM_LABEL} partition written. The installer will "
+               f"not find a kickstart, so nothing provisions the machine and "
+               f"the install is an ordinary manual Qubes install.")
+    elif not ks.is_file():
+        raise Fatal(
+            f"no install-time kickstart at {ks}.\n"
+            f"     It is written by `./build_iso.py iso`. Without it the "
+            f"installer has nothing to read and the provisioning payload never\n"
+            f"     reaches dom0. Rebuild, or pass --no-oem to write a plain "
+            f"Qubes installer stick deliberately.")
+    else:
+        target = getattr(x.args, "oem_device", None) or dev_path
+        if target != dev_path:
+            x.info(f"writing the {OEM_LABEL} filesystem to {target} instead of "
+                   f"the image stick")
+        write_oem_partition(x, target, ks)
+
     print(f"""
   Also copy these onto a SEPARATE stick or an internal page — never only the
   one carrying the image:
@@ -4843,6 +4882,130 @@ def write_usb(x: Ctx) -> int:
       {x.out_dir / 'verify-iso.sh'}
 """)
     return 0
+
+
+#  Qubes' own lorax templates look for exactly this label and nothing else:
+#  `if search --set=oem -l QUBES_OEM` in templates/config_files/x86/grub2-bios.cfg
+#  and grub2-efi.cfg. It is not a name this project is free to choose.
+OEM_LABEL = "QUBES_OEM"
+
+
+def oem_kickstart_path(x: Ctx) -> Path:
+    return x.out_dir / "oem" / "ks.cfg"
+
+
+def partition_node(dev_path: str, number: int) -> str:
+    """/dev/sdb + 3 -> /dev/sdb3;  /dev/nvme0n1 + 3 -> /dev/nvme0n1p3."""
+    return f"{dev_path}p{number}" if dev_path[-1:].isdigit() else f"{dev_path}{number}"
+
+
+def _gpt_partition_numbers(x: Ctx, dev_path: str) -> set[int]:
+    out = x.run(*_sudo(["sgdisk", "-p", dev_path]), check=False, capture=True)
+    found = set()
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+\d+\s+\d+\s", line)
+        if m:
+            found.add(int(m.group(1)))
+    return found
+
+
+def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
+    """Add the QUBES_OEM partition carrying the install-time kickstart.
+
+    Anaconda reads it because Qubes' lorax templates add an OEM boot entry with
+    `inst.ks=hd:LABEL=QUBES_OEM` and make it the default when a filesystem with
+    that label is present. Nothing here modifies the ISO image itself, so the
+    detached signature and the checksum still describe the artefact that was
+    verified before the write.
+
+    Two facts this depends on, both measured rather than assumed (see
+    tests/oem_media_checks.py, which runs the real sgdisk/mkfs/mount against a
+    loop device):
+
+      * `dd` of a hybrid ISO leaves the backup GPT at the end of the IMAGE, not
+        the end of the stick, so `sgdisk -e` has to move it before a partition
+        can be appended.
+      * `sgdisk -e` plus appending a partition leaves sector 0 — the isohybrid
+        MBR that BIOS boots from — byte for byte unchanged.
+
+    It does rewrite the primary GPT in sectors 1-33, which lie inside the ISO's
+    32 KiB system area. That is why this runs only after the image readback has
+    already compared the stick against the ISO, and why the media check offered
+    by the "Test media and install" boot entry will report a mismatch on a stick
+    prepared this way. The install and OEM entries do not run that check.
+    """
+    fstype = x.c["install"]["oem_fstype"]
+    if fstype not in ("vfat", "ext4"):
+        raise Fatal(f"install.oem_fstype must be vfat or ext4, not {fstype!r}")
+    mkfs_tool = "mkfs.vfat" if fstype == "vfat" else "mkfs.ext4"
+    for tool in ("sgdisk", mkfs_tool, "blkid"):
+        if not shutil.which(tool):
+            raise Fatal(
+                f"{tool} is not installed, so the {OEM_LABEL} partition cannot "
+                f"be created and the installer would never read the kickstart.\n"
+                f"     fix: ./build_iso.py setup-host")
+    if x.args.dry_run:
+        x.info(f"[dry-run] sgdisk -e {dev_path}; append a {fstype} partition "
+               f"labelled {OEM_LABEL}; copy {ks.name} onto it")
+        return
+
+    x.info(f"creating the {OEM_LABEL} partition that carries the kickstart")
+    before = _gpt_partition_numbers(x, dev_path)
+    # The backup GPT came from the ISO and sits at the end of the image.
+    x.run(*_sudo(["sgdisk", "-e", dev_path]))
+    # Partition number 0 tells sgdisk to take the first free one.
+    x.run(*_sudo(["sgdisk", "-n", "0:0:0", "-t", "0:0700",
+                  "-c", f"0:{OEM_LABEL}", dev_path]))
+    # Both are best-effort re-read nudges, and neither is guaranteed to be
+    # installed. check=False does not cover a missing binary — subprocess
+    # raises before there is a return code to ignore — so probe first.
+    for nudge in (["partx", "-u", dev_path], ["udevadm", "settle"]):
+        if shutil.which(nudge[0]):
+            x.run(*_sudo(nudge), check=False)
+    after = _gpt_partition_numbers(x, dev_path)
+    new = sorted(after - before)
+    if len(new) != 1:
+        raise Fatal(f"expected exactly one new partition on {dev_path}, "
+                    f"got {new or 'none'}. The stick has not been prepared; "
+                    f"do not distribute it.")
+    part = partition_node(dev_path, new[0])
+    if not Path(part).exists():
+        raise Fatal(f"{part} did not appear after partitioning {dev_path}")
+
+    if fstype == "vfat":
+        x.run(*_sudo([mkfs_tool, "-n", OEM_LABEL, part]))
+    else:
+        x.run(*_sudo([mkfs_tool, "-q", "-L", OEM_LABEL, part]))
+
+    # GRUB finds this by label. If the label is not what the boot entry looks
+    # for, the OEM entry never appears and the install is silently manual.
+    seen = x.run(*_sudo(["blkid", "-s", "LABEL", "-o", "value", part]),
+                 check=False, capture=True).strip()
+    if seen != OEM_LABEL:
+        raise Fatal(f"{part} reports LABEL={seen!r}, not {OEM_LABEL!r} — the "
+                    f"OEM boot entry would never fire.")
+
+    with tempfile.TemporaryDirectory() as td:
+        x.run(*_sudo(["mount", part, td]))
+        try:
+            x.run(*_sudo(["cp", str(ks), str(Path(td) / "ks.cfg")]))
+            x.run(*_sudo(["sync"]))
+        finally:
+            x.run(*_sudo(["umount", td]), check=False)
+        # Mount again and compare bytes: a copy that succeeded into the page
+        # cache and never reached the stick is exactly the failure this whole
+        # command exists to rule out.
+        x.run(*_sudo(["mount", part, td]))
+        try:
+            written = Path(td) / "ks.cfg"
+            got = x.run(*_sudo(["cat", str(written)]), check=False,
+                        capture=True)
+            if got != ks.read_text():
+                raise Fatal(f"the kickstart on {part} does not match "
+                            f"{ks}. Do not distribute this stick.")
+        finally:
+            x.run(*_sudo(["umount", td]), check=False)
+    x.ok(f"{OEM_LABEL} partition {part} carries ks.cfg, verified by readback")
 
 
 def want_digest(x: Ctx) -> str:
@@ -4999,6 +5162,14 @@ lifecycle
                    help="permit a non-removable target (destroys it)")
     u.add_argument("--wait", action="store_true",
                    help="wait for a removable device to be plugged in")
+    u.add_argument("--oem-device", metavar="/dev/sdY",
+                   help=f"put the {OEM_LABEL} kickstart partition on this device "
+                        f"instead of the image stick (leaves the image stick's "
+                        f"media check intact)")
+    u.add_argument("--no-oem", action="store_true",
+                   help=f"do not write the {OEM_LABEL} partition; the installer "
+                        f"will then find no kickstart and nothing provisions the "
+                        f"machine")
     b = p.add_argument_group("backup-key / restore-key")
     b.add_argument("--to", metavar="DIR", help="where to write the key backup")
     b.add_argument("--from", dest="from_dir", metavar="DIR",
