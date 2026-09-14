@@ -2575,6 +2575,10 @@ Verify before installing:
 #  a script that has not been written yet. These are those scripts.
 # ===========================================================================
 OK, WARN, FAIL = "ok", "warn", "fail"
+#  "I looked and it is wrong" and "I could not look" are different answers, and
+#  conflating them is how check-upstream came to exit 0 during a network outage
+#  having verified nothing at all.
+UNKNOWN = "unknown"
 
 
 class Check:
@@ -2584,8 +2588,9 @@ class Check:
         self.name, self.state, self.detail, self.fix = name, state, detail, fix
 
 
-def _print_checks(x: Ctx, checks: list[Check]) -> int:
-    sym = {OK: (G, "✓"), WARN: (Y, "!"), FAIL: (R, "✗")}
+def _print_checks(x: Ctx, checks: list[Check],
+                  unknown_blocks: bool = False) -> int:
+    sym = {OK: (G, "✓"), WARN: (Y, "!"), FAIL: (R, "✗"), UNKNOWN: (Y, "?")}
     for c in checks:
         col, mark = sym[c.state]
         line = f"  {col}{mark}{RST} {c.name}"
@@ -2597,9 +2602,18 @@ def _print_checks(x: Ctx, checks: list[Check]) -> int:
             print(f"      {D}fix: {c.fix}{RST}")
     bad = [c for c in checks if c.state == FAIL]
     warns = [c for c in checks if c.state == WARN]
-    print(f"\n  {G}{len(checks) - len(bad) - len(warns)} ok{RST}   "
-          f"{Y}{len(warns)} warnings{RST}   {R}{len(bad)} blocking{RST}")
-    return 1 if bad else 0
+    unknown = [c for c in checks if c.state == UNKNOWN]
+    print(f"\n  {G}{len(checks) - len(bad) - len(warns) - len(unknown)} ok{RST}   "
+          f"{Y}{len(warns)} warnings{RST}   "
+          f"{Y}{len(unknown)} not checked{RST}   {R}{len(bad)} blocking{RST}")
+    if unknown and unknown_blocks:
+        print(f"\n  {R}{len(unknown)} upstream source(s) could not be reached, so "
+              f"they were not verified.{RST}")
+        print("  This is reported as a failure rather than a pass: a green run "
+              "here is taken\n  to mean the supply chain was checked. Re-run "
+              "with network, or pass\n  --allow-unreachable to accept an "
+              "unverified supply chain deliberately.")
+    return 1 if bad or (unknown and unknown_blocks) else 0
 
 
 def host_os_release() -> dict[str, str]:
@@ -4303,10 +4317,10 @@ def check_upstream(x: Ctx) -> int:
                            "two independent sources agreeing is the standard "
                            "before a police workstation trusts a repository"))
         except Exception as e:                               # noqa: BLE001
-            c.append(Check("Kali: independent keyserver reachable", WARN,
+            c.append(Check("Kali: independent keyserver reachable", UNKNOWN,
                            f"{type(e).__name__}: {e}"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Kali: keyring reachable", WARN, f"{type(e).__name__}: {e}",
+        c.append(Check("Kali: keyring reachable", UNKNOWN, f"{type(e).__name__}: {e}",
                        "network check skipped — re-run where the build host has "
                        "outbound HTTPS"))
 
@@ -4341,7 +4355,7 @@ def check_upstream(x: Ctx) -> int:
                            "re-add the key in tpl-ids before it expires or the "
                            "DPI recorder quietly stops receiving updates"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Zeek: OBS key reachable", WARN, f"{type(e).__name__}: {e}"))
+        c.append(Check("Zeek: OBS key reachable", UNKNOWN, f"{type(e).__name__}: {e}"))
 
     # --- Wazuh --------------------------------------------------------
     #  Read the apt index this image actually installs from, not a release
@@ -4369,7 +4383,7 @@ def check_upstream(x: Ctx) -> int:
                            f"{pinned} is newer than anything in the repository",
                            "the agents would never install"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Wazuh: package index reachable", WARN, f"{type(e).__name__}: {e}"))
+        c.append(Check("Wazuh: package index reachable", UNKNOWN, f"{type(e).__name__}: {e}"))
 
     # --- Wazuh signing key --------------------------------------------
     try:
@@ -4391,7 +4405,7 @@ def check_upstream(x: Ctx) -> int:
                                OK if days > 90 else (WARN if days > 0 else FAIL),
                                f"{days} days left"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Wazuh: signing key reachable", WARN, f"{type(e).__name__}: {e}"))
+        c.append(Check("Wazuh: signing key reachable", UNKNOWN, f"{type(e).__name__}: {e}"))
 
     # --- the vendor scripts phase 8 runs as root ----------------------
     try:
@@ -4410,7 +4424,7 @@ def check_upstream(x: Ctx) -> int:
                            "update wazuh.certs_tool_sha256 / "
                            "wazuh.passwords_tool_sha256 in golden-image.json"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Wazuh: vendor scripts reachable", WARN,
+        c.append(Check("Wazuh: vendor scripts reachable", UNKNOWN,
                        f"{type(e).__name__}: {e}"))
 
     # --- Qubes security bulletins ------------------------------------
@@ -4453,10 +4467,11 @@ def check_upstream(x: Ctx) -> int:
                            "older than its dom0 patch level installs known-"
                            "vulnerable dom0 before its first update"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Qubes: security bulletin index reachable", WARN,
+        c.append(Check("Qubes: security bulletin index reachable", UNKNOWN,
                        f"{type(e).__name__}: {e}"))
 
-    rc = _print_checks(x, c)
+    rc = _print_checks(
+        x, c, unknown_blocks=not getattr(x.args, "allow_unreachable", False))
 
     if update and not x.args.dry_run:
         merged = deep_merge(lock, seen)
@@ -5337,6 +5352,9 @@ lifecycle
                    help="do not check the supply chain before building")
     c.add_argument("--update", action="store_true",
                    help="record what upstream currently offers as the new baseline")
+    c.add_argument("--allow-unreachable", action="store_true",
+                   help="exit 0 even when an upstream source could not be "
+                        "reached and therefore was not verified")
     args = p.parse_args()
     # --yes answers prompts. It must NOT imply --force, which also means
     # "rebuild the templates even though their RPMs are present" — an

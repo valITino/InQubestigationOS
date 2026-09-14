@@ -333,7 +333,36 @@ def main():
         assert str(back_pf) in bi.gpg_secret_options(
             sel, attr="backup_passphrase_file")
 
-    print("  35/35 unattended orchestration checks pass")
+        # ---------------------------------------------------------------
+        # "I looked and it is wrong" and "I could not look" are different
+        # answers. Every upstream fetch failure in check-upstream used to be a
+        # WARN, and only FAIL was blocking, so a total network outage exited 0
+        # having verified nothing — satisfying the bootstrap step, the
+        # pre-build gate, the release-candidate gate and the one CI job that
+        # is supposed to block.
+        x = ctx(td)
+        unreachable = [bi.Check("Kali: keyring reachable", bi.UNKNOWN, "URLError")]
+        assert bi._print_checks(x, unreachable, unknown_blocks=True) == 1
+        assert bi._print_checks(x, unreachable, unknown_blocks=False) == 0
+        # A real finding still blocks regardless.
+        assert bi._print_checks(x, [bi.Check("drift", bi.FAIL)],
+                                unknown_blocks=False) == 1
+        # A plain warning still does not.
+        assert bi._print_checks(x, [bi.Check("expiring", bi.WARN)],
+                                unknown_blocks=True) == 0
+
+        # Every "reachable" probe must report UNKNOWN, not WARN: a WARN there
+        # is indistinguishable from "checked, minor finding".
+        source = (ROOT / "build_iso.py").read_text()
+        assert 'reachable", WARN' not in source, \
+            "an unreachable upstream must be UNKNOWN, not WARN"
+        assert source.count('reachable", UNKNOWN') >= 6, \
+            "the upstream reachability probes lost their UNKNOWN state"
+        # And the gate must block on them unless explicitly overridden.
+        assert 'unknown_blocks=not getattr(x.args, "allow_unreachable", False)' \
+            in source
+
+    print("  41/41 unattended orchestration checks pass")
     return 0
 
 
