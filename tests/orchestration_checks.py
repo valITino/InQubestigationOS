@@ -138,7 +138,10 @@ def main():
         assert not x.done("templates")
         x.mark("templates")
         assert x.done("templates")
-        x.c["tier"] = 1
+        # Changing an input the mark is bound to invalidates it. Written as
+        # "flip to the other tier" rather than a literal, so it keeps testing
+        # the binding regardless of which tier is the default.
+        x.c["tier"] = 2 if int(x.c["tier"]) == 1 else 1
         assert not x.done("templates")
 
         # Bootstrap applies --set before Ctx derives work/output paths. Mock
@@ -362,7 +365,43 @@ def main():
         assert 'unknown_blocks=not getattr(x.args, "allow_unreachable", False)' \
             in source
 
-    print("  41/41 unattended orchestration checks pass")
+        # ---------------------------------------------------------------
+        # A template flavor with no content directory on qubes-builderv2's
+        # search path does not fail there: the plugin falls back to the
+        # distribution defaults, so the build succeeds and produces
+        # qubes-template-<flavor>-*.rpm containing stock Debian. Every check
+        # this script used to make — RPMs present, ISO lists them — passed.
+        x = ctx(td)
+        names = ["investigator-kali", "investigator-ids"]
+        base = bi.template_flavor_content_dir(x, "investigator-kali").parent
+        assert base.name == "template_debian", base
+        assert base.parent.name == "builder-debian", base
+
+        # Sources not fetched yet: reported, not treated as proof of absence.
+        bi.verify_template_flavors(x, names, strict=False)
+        # After a build the sources must exist; a missing tree is then fatal.
+        expect_fatal(lambda: bi.verify_template_flavors(x, names, strict=True),
+                     "does not exist after a template build")
+
+        base.mkdir(parents=True)
+        # Tree exists but the flavors do not: stock Debian would ship.
+        expect_fatal(lambda: bi.verify_template_flavors(x, names, strict=True),
+                     "no flavor content for")
+        # Non-strict says so loudly but lets a caller continue to the strict
+        # check after the build.
+        bi.verify_template_flavors(x, names, strict=False)
+
+        for n in names:
+            bi.template_flavor_content_dir(x, n).mkdir()
+        bi.verify_template_flavors(x, names, strict=True)
+
+        # One missing out of two is still a refusal.
+        import shutil as _shutil
+        _shutil.rmtree(bi.template_flavor_content_dir(x, "investigator-ids"))
+        expect_fatal(lambda: bi.verify_template_flavors(x, names, strict=True),
+                     "investigator-ids")
+
+    print("  48/48 unattended orchestration checks pass")
     return 0
 
 

@@ -77,12 +77,22 @@ DEFAULT_CONFIG: dict = {
     "secpack_url": "https://github.com/QubesOS/qubes-secpack.git",
 
     # TIER 2 IS THE DEFAULT AND THE INTENDED PATH.
+    #   1 = stock templates only; the investigator templates are built on the
+    #       target by golden_image.py. 1-3 hours of first-boot work and a hard
+    #       dependency on connectivity at install time.
     #   2 = investigator templates baked into the ISO as RPMs. Installs with no
     #       network. First boot only wires the topology — minutes, not hours.
-    #   1 = stock templates only; the investigator templates get built on first
-    #       boot from the network. Smaller ISO, but 1-3 hours of first-boot work
-    #       and a hard dependency on connectivity at install time. Fallback only.
-    "tier": 2,
+    #
+    # The default is 1 because 2 cannot currently be built end to end from this
+    # repository. qubes-builderv2 finds a Debian template flavor's content at
+    # <sources>/builder-debian/template_debian/<flavor>, appended by the
+    # template plugin itself with no configuration hook, and hardcodes extra
+    # directories only for whonix-*, kicksecure and names starting with "kali".
+    # A flavor with no directory there does not fail: it silently builds as
+    # stock Debian while still producing qubes-template-<flavor>-*.rpm. Tier 2
+    # now refuses rather than shipping that; set it once those directories
+    # exist and the build will verify them.
+    "tier": 1,
 
     # "auto" picks the largest writable local filesystem with room for the
     # build, so "somewhere with 250 GB free" stops being something to work out.
@@ -1594,6 +1604,76 @@ def missing_template_rpms(x: Ctx) -> list[str]:
             if not list(rpmdir.glob(f"qubes-template-{n}-*.rpm"))]
 
 
+def template_flavor_content_dir(x: Ctx, flavor: str) -> Path:
+    """Where qubes-builderv2 looks for a Debian template flavor's scripts.
+
+    Derived from the real plugin, not guessed. qubesbuilder/plugins/template's
+    update_parameters() sets, for a Debian-family template:
+
+        template_content_dir = <sources>/builder-debian/template_<fullname>
+        template_flavor_dir += [f"+{option}:{template_content_dir}/{option}"
+                                for option in [flavor] + options]
+
+    with extra entries hardcoded only for whonix-*, kicksecure and flavors whose
+    name starts with "kali". There is no configuration hook: template_flavor_dir
+    starts as an empty list inside that function.
+    """
+    return (x.builder / "artifacts" / "sources" / "builder-debian"
+            / "template_debian" / flavor)
+
+
+def verify_template_flavors(x: Ctx, names: list[str], strict: bool) -> None:
+    """Refuse to pass off a stock Debian template as an investigator one.
+
+    A flavor whose directory is not on that search path is not an error in
+    qubes-builderv2: templateDirs()/getFileLocations() simply fall back to the
+    distribution defaults. The build then succeeds, produces
+    qubes-template-<flavor>-*.rpm, and every check this script made — the RPMs
+    are present, the ISO lists them — passed. What shipped was stock Debian
+    trixie with an investigator name on it.
+
+    `strict` is for after a build, when the sources are certain to exist.
+    Before one they may not have been fetched yet, so a missing tree is
+    reported rather than treated as proof of absence.
+    """
+    # A non-empty name, because Path("x") / "" is Path("x") — using "" here
+    # resolved one directory too high and reported the wrong path.
+    base = template_flavor_content_dir(x, "flavor").parent
+    if not base.is_dir():
+        if strict:
+            raise Fatal(
+                f"{base} does not exist after a template build, so the flavor "
+                f"content directories cannot be confirmed.\n"
+                f"     Refusing to certify these templates as investigator "
+                f"builds.")
+        x.info("builder-debian sources are not fetched yet; flavor content "
+               "will be confirmed after the first template build")
+        return
+    missing = [n for n in names if not template_flavor_content_dir(x, n).is_dir()]
+    if not missing:
+        x.ok(f"flavor content present for all {len(names)} templates "
+             f"({base})")
+        return
+    detail = "\n".join(f"       {template_flavor_content_dir(x, n)}"
+                       for n in missing)
+    message = (
+        f"no flavor content for: {', '.join(missing)}\n"
+        f"     qubes-builderv2 looks for each flavor here:\n{detail}\n"
+        f"     Nothing there means the template builds as STOCK Debian "
+        f"{x.c['dist_codename']} —\n"
+        f"     no Kali, no Zeek, no Suricata, no Wazuh — while still producing\n"
+        f"     qubes-template-<name>-*.rpm, so the RPM and ISO checks below "
+        f"pass anyway.\n"
+        f"     builderv2 hardcodes extra flavor directories only for whonix-*,\n"
+        f"     kicksecure and names starting with 'kali'; there is no config "
+        f"hook.\n"
+        f"     Either provide those directories, or set tier=1 and let\n"
+        f"     golden_image.py build the investigator templates on the target.")
+    if strict:
+        raise Fatal(message)
+    x.warn(message)
+
+
 def build_templates(x: Ctx):
     x.phase("t3", "wire templates into builder.yml and build")
     bcfg = x.builder / "builder.yml"
@@ -1613,6 +1693,11 @@ def build_templates(x: Ctx):
             (False, *component_source(x))))}],
     }, "investigator templates")
 
+    # Fail fast when the sources are already there; otherwise this is
+    # re-checked strictly below, once the first build has fetched them.
+    if not x.args.dry_run:
+        verify_template_flavors(x, names, strict=False)
+
     x.warn(f"the long one: {len(names)} templates, each a full debootstrap. "
            f"Kali dominates.")
     for n in names:
@@ -1623,6 +1708,10 @@ def build_templates(x: Ctx):
 
     rpmdir = x.builder / "artifacts" / "templates" / "rpm"
     if not x.args.dry_run:
+        # Before the RPM checks, because those pass either way: an RPM named
+        # qubes-template-investigator-kali exists whether or not anything
+        # investigator-specific went into it.
+        verify_template_flavors(x, names, strict=True)
         missing = missing_template_rpms(x)
         if missing:
             raise Fatal(f"missing template RPMs: {', '.join(missing)}\n"

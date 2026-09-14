@@ -31,7 +31,7 @@ and not the laptop you are building — it is a separate machine or VM.
 |---|---|---|
 | A Debian-family or Fedora-family Linux | qubes-builderv2 ships dependency lists for both families. Debian, Kali and Ubuntu all qualify — see the next table | you |
 | Docker, usable without `sudo` | Build cages. Podman cannot currently build DEB packages | `setup-host` |
-| ~250 GB free disk | Five templates plus the ISO. Tier 1 needs ~100 GB | you |
+| ~100 GB free disk | Tier 1, the default. Tier 2 builds five templates locally and needs ~250 GB | you |
 | 8 GB RAM minimum | Builds are slow and can OOM below this | you |
 | 4 CPU cores recommended | Nothing enforces it, but two cores roughly doubles an already long build | you |
 | Several hours | The Kali *template* dominates — and see the warning below about the two different things called "Kali" here | you |
@@ -111,7 +111,7 @@ it as follows:
 
 | | |
 |---|---|
-| **Virtual disk** | 250 GB for Tier 2, 100 GB for Tier 1. Prefer a dynamically-allocated disk so it only consumes what it uses, but **check the host has the space to grow into** — running the physical disk out mid-build is the most common way this fails. |
+| **Virtual disk** | 100 GB for Tier 1 (the default), 250 GB for Tier 2. Prefer a dynamically-allocated disk so it only consumes what it uses, but **check the host has the space to grow into** — running the physical disk out mid-build is the most common way this fails. |
 | **RAM** | 8 GB minimum, 12–16 GB if the physical machine allows. |
 | **CPUs** | 4 cores recommended, 2 workable. |
 | **Guest additions** | Not needed. Nothing here uses a GUI. |
@@ -350,7 +350,7 @@ sensible default. To change anything else, name it — no editor, and a typo is
 rejected rather than silently ignored:
 
 ```bash
-./build_iso.py --set work_dir=/srv/build --set tier=2
+./build_iso.py --set work_dir=/srv/build
 ./build_iso.py --get tier
 ./build_iso.py config                    # print every effective setting
 ```
@@ -360,10 +360,10 @@ The settings that matter:
 | Key | Set it to |
 |---|---|
 | `iso_sign_key` | set for you by `gen-key` |
-| `tier` | `2` (default) — templates baked in, installs with no network |
+| `tier` | `1` (default) — stock templates in the ISO; the investigator templates are built on the target at first boot, which needs network and 1-3 hours |
 | `qubes_release` | `r4.3` |
 | `mock_config` | `auto` (default) — derived from the fetched builder for your release |
-| `work_dir` | Somewhere with 250 GB free |
+| `work_dir` | Somewhere with 100 GB free, or 250 GB for tier 2 |
 | `auto_provision` | `true` — first boot configures itself |
 
 Before a first build, check that what the image trusts is still what upstream
@@ -608,8 +608,10 @@ Then the install is:
 
 ## 9. First boot
 
-Provisioning starts automatically. On a Tier 2 image the templates are already
-on disk, so this wires the topology only — minutes, not hours.
+Provisioning starts automatically. On a Tier 1 image — the default — the
+investigator templates are built here, from the network: expect 1-3 hours and
+make sure the machine has connectivity. On a Tier 2 image the templates are
+already on disk, so this wires the topology only, in minutes.
 
 Watch it:
 
