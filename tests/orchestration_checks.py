@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -84,11 +85,19 @@ def main():
 
         # Bootstrap forwards every option only to children where it applies,
         # and stops immediately when a child fails.
+        # Two DISTINCT secrets, so the assertions below can tell which one
+        # reached which flag. With one file used for both, a mapping that sent
+        # the backup secret to --passphrase-file looked identical to a correct
+        # one — which is how that bug survived.
         secret = Path(td) / "secret2"
         secret.write_text("x")
         secret.chmod(0o600)
+        backup_secret = Path(td) / "secret2-backup"
+        backup_secret.write_text("y")
+        backup_secret.chmod(0o600)
         a = args(action="bootstrap", uid="Unit", use_key=fp, expire="2y",
-                 passphrase_file=str(secret), backup_passphrase_file=str(secret),
+                 passphrase_file=str(secret),
+                 backup_passphrase_file=str(backup_secret),
                  to="/media/backup")
         x = ctx(td, a)
         x.c["bootstrap"]["backup_path"] = "/media/backup"
@@ -111,6 +120,17 @@ def main():
         assert "--uid" in flat and "--use-key" in flat and "--expire" in flat
         assert "--to" in flat and flat.count("--passphrase-file") >= 3
         assert not any("check-upstream" in command for command in calls)
+
+        # backup-key takes two different secrets: --passphrase-file unlocks
+        # the signing key so it can be exported, --backup-passphrase-file
+        # encrypts the resulting backup. gpg is asked to do two separate
+        # things and they are not the same passphrase.
+        backup_argv = next(c for c in calls if "backup-key" in c)
+        assert backup_argv[backup_argv.index("--passphrase-file") + 1] \
+            == str(secret), backup_argv
+        assert "--backup-passphrase-file" in backup_argv, backup_argv
+        assert backup_argv[backup_argv.index("--backup-passphrase-file") + 1] \
+            == str(backup_secret), backup_argv
 
         # Legacy/stale marks cannot resume; current input-bound marks can.
         x = ctx(td)
@@ -256,7 +276,64 @@ def main():
                 f"executor={executor_type!r} — that call needs qrexec and "
                 f"cannot work on a Debian/Fedora build host")
 
-    print("  24/24 unattended orchestration checks pass")
+        # ---------------------------------------------------------------
+        # A --set that would produce an unusable configuration must change
+        # nothing. The documented GUIDE command set install.unattended=true
+        # with a kernel-name disk; both writes reported success and every
+        # later invocation — including the --set needed to fix it — then died
+        # in load_config before doing anything.
+        conf = Path(td) / "lockout.json"
+        with mock.patch.object(bi, "CONF_PATH", conf):
+            conf.write_text(json.dumps({}))
+            x = ctx(td)
+            expect_fatal(
+                lambda: bi.config_set_many(
+                    x, [("install.unattended", "true"),
+                        ("install.disk", "/dev/nvme0n1")]),
+                "by-id")
+            # Nothing written: the file is still loadable and still says the
+            # install is manual.
+            assert json.loads(conf.read_text()) == {}, conf.read_text()
+            reloaded = bi.load_config()
+            assert reloaded["install"]["unattended"] is False
+
+            # The same pair with a stable identity is accepted, and both
+            # values land together — they are only valid as a pair.
+            assert bi.config_set_many(
+                x, [("install.unattended", "true"),
+                    ("install.disk", "/dev/disk/by-id/nvme-TEST")], quiet=True) == 0
+            stored = json.loads(conf.read_text())
+            assert stored["install"]["unattended"] is True
+            assert stored["install"]["disk"] == "/dev/disk/by-id/nvme-TEST"
+
+            # A file already in a bad state stays repairable with the tool.
+            conf.write_text(json.dumps(
+                {"install": {"unattended": True, "disk": "/dev/nvme0n1"}}))
+            assert bi.load_config(validate_semantics=False)["install"]["disk"] \
+                == "/dev/nvme0n1"
+            assert bi.config_set_many(
+                x, [("install.disk", "/dev/disk/by-id/nvme-FIXED")],
+                quiet=True) == 0
+            assert bi.load_config()["install"]["disk"] == "/dev/disk/by-id/nvme-FIXED"
+
+        # ---------------------------------------------------------------
+        # backup-key needs two different secrets: one unlocks the signing key
+        # so it can be exported, the other encrypts the backup. bootstrap used
+        # to hand the backup secret to --passphrase-file, so the export step
+        # tried to unlock the signing key with it.
+        sign_pf = Path(td) / "sign.secret"
+        back_pf = Path(td) / "backup.secret"
+        for f in (sign_pf, back_pf):
+            f.write_text("x")
+            f.chmod(0o600)
+        # The two secrets must reach gpg as two distinct options.
+        sel = SimpleNamespace(passphrase_file=str(sign_pf),
+                              backup_passphrase_file=str(back_pf))
+        assert str(sign_pf) in bi.gpg_secret_options(sel, attr="passphrase_file")
+        assert str(back_pf) in bi.gpg_secret_options(
+            sel, attr="backup_passphrase_file")
+
+    print("  35/35 unattended orchestration checks pass")
     return 0
 
 

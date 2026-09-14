@@ -66,12 +66,19 @@ jobs:
         shell: bash
         env:
           SESSION_SECRET: ${{ secrets.IQ_GPG_SESSION_SECRET }}
+          BACKUP_SECRET: ${{ secrets.IQ_BACKUP_SESSION_SECRET }}
         run: |
           set -eu
           umask 077
           test -n "$SESSION_SECRET"
+          # Distinct from the signing secret: one unlocks the approved signing
+          # key, the other encrypts its backup. release_candidate.py refuses
+          # them if they are the same file.
+          test -n "$BACKUP_SECRET"
+          test "$SESSION_SECRET" != "$BACKUP_SECRET"
           printf '%s' "$SESSION_SECRET" > "$RUNNER_TEMP/iq-gpg-session"
-          unset SESSION_SECRET
+          printf '%s' "$BACKUP_SECRET" > "$RUNNER_TEMP/iq-backup-session"
+          unset SESSION_SECRET BACKUP_SECRET
       - name: Build and stage the verified candidate
         shell: bash
         env:
@@ -89,13 +96,14 @@ jobs:
             --work-dir "$WORK_DIR" --backup-dir "$BACKUP_DIR" \
             --candidate-dir "$CANDIDATE_DIR" \
             --passphrase-file "$RUNNER_TEMP/iq-gpg-session" \
+            --backup-passphrase-file "$RUNNER_TEMP/iq-backup-session" \
             --signing-fingerprint "$SIGNING_FPR" \
             --max-artifact-gb "${MAX_ARTIFACT_GB:-20}" \
             | tee "$RUNNER_TEMP/release-result.jsonl"
       - name: Remove the signing session
         if: always()
         shell: bash
-        run: rm -f "$RUNNER_TEMP/iq-gpg-session"
+        run: rm -f "$RUNNER_TEMP/iq-gpg-session" "$RUNNER_TEMP/iq-backup-session"
       - name: Report retained audit location
         if: always()
         shell: bash

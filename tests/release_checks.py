@@ -81,7 +81,32 @@ def main():
     for gate in ("min-work-gb", "min-docker-gb", "sudo", "docker", "list-secret-keys",
                  "check-upstream", "signature signer mismatch", "allowlist mismatch"):
         assert gate in source, gate
-    print("  23/23 release-candidate policy checks pass")
+
+    # bootstrap onboarding requires a backup-encryption secret on any
+    # non-interactive run (bootstrap_workflow.py), and a trusted runner has no
+    # terminal to prompt at. Without it this entry point failed at onboarding,
+    # before anything was built — so the documented release path never worked.
+    bootstrap_call = source[source.index('"bootstrap"'):]
+    bootstrap_call = bootstrap_call[:bootstrap_call.index("]") + 1]
+    assert "--passphrase-file" in bootstrap_call, bootstrap_call
+    assert "--backup-passphrase-file" in bootstrap_call, bootstrap_call
+    assert "a.backup_passphrase_file" in bootstrap_call, bootstrap_call
+    # Required, not optional: an unset one would reintroduce the same failure.
+    assert '"--backup-passphrase-file", required=True' in source
+
+    # The workflow has to materialise a second, distinct secret, and remove it.
+    assert "IQ_BACKUP_SESSION_SECRET" in workflow
+    assert "iq-backup-session" in workflow
+    assert '"$SESSION_SECRET" != "$BACKUP_SECRET"' in workflow
+    removal = workflow[workflow.index("- name: Remove the signing session"):]
+    assert "iq-backup-session" in removal[:removal.index("- name:", 10)], \
+        "the backup secret must be removed from the runner too"
+
+    # The two secrets are not interchangeable, and using one file for both
+    # would mean the backup is protected by the signing passphrase.
+    assert ("a.passphrase_file.resolve() == a.backup_passphrase_file.resolve()"
+            in source), "the two passphrase files must be rejected if identical"
+    print("  30/30 release-candidate policy checks pass")
     return 0
 
 

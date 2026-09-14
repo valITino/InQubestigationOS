@@ -809,8 +809,16 @@ def bootstrap(x: Ctx, args) -> int:
             backup_args += ["--to", str(backup_to)]
         if args.use_key:
             backup_args += ["--use-key", args.use_key]
+        # Each secret to the flag that means it. These are different
+        # passphrases: one unlocks the signing key so it can be exported, the
+        # other encrypts the backup. Passing the backup secret as
+        # --passphrase-file made the export step try to unlock the signing key
+        # with it.
+        if args.passphrase_file:
+            backup_args += ["--passphrase-file", args.passphrase_file]
         if getattr(args, "backup_passphrase_file", None):
-            backup_args += ["--passphrase-file", args.backup_passphrase_file]
+            backup_args += ["--backup-passphrase-file",
+                            args.backup_passphrase_file]
         steps[1] = ("backup-key", steps[1][1], ["backup-key", *backup_args])
 
         print(f"\n{B}{C}══ bootstrap{RST}")
@@ -2716,7 +2724,7 @@ def _sudo(argv: list[str]) -> list[str]:
     return argv if os.geteuid() == 0 else ["sudo", *argv]
 
 
-def protected_secret_file(args) -> Path | None:
+def protected_secret_file(args, *, attr: str = "passphrase_file") -> Path | None:
     """Return a validated runtime secret file, never its contents.
 
     Named pipes and /proc/self/fd/N are accepted for secret managers. Ordinary
@@ -2725,19 +2733,20 @@ def protected_secret_file(args) -> Path | None:
     secret-key operation, so losing descriptor/file access during a resumed
     orchestration fails closed.
     """
-    raw = getattr(args, "passphrase_file", None)
+    raw = getattr(args, attr, None)
     if not raw:
         return None
+    flag = "--" + attr.replace("_", "-")
     path = Path(raw)
     try:
         st = path.stat()
     except OSError as exc:
-        raise Fatal(f"cannot access --passphrase-file {path}: {exc}") from exc
+        raise Fatal(f"cannot access {flag} {path}: {exc}") from exc
     owner = int(os.environ.get("SUDO_UID", os.getuid()))
     if st.st_uid != owner:
-        raise Fatal(f"--passphrase-file {path} must be owned by build UID {owner}")
+        raise Fatal(f"{flag} {path} must be owned by build UID {owner}")
     if st.st_mode & 0o077:
-        raise Fatal(f"--passphrase-file {path} permissions are too open; use chmod 600")
+        raise Fatal(f"{flag} {path} permissions are too open; use chmod 600")
     if not (path.is_file() or str(path).startswith("/proc/self/fd/")
             or __import__("stat").S_ISFIFO(st.st_mode)):
         raise Fatal("--passphrase-file must be a regular file, protected FIFO, or "
@@ -2745,9 +2754,16 @@ def protected_secret_file(args) -> Path | None:
     return path
 
 
-def gpg_secret_options(args, *, yes: bool = True) -> list[str]:
-    """GPG options for an unattended operation involving private material."""
-    pf = protected_secret_file(args)
+def gpg_secret_options(args, *, yes: bool = True,
+                       attr: str = "passphrase_file") -> list[str]:
+    """GPG options for an unattended operation involving private material.
+
+    `attr` names which secret this operation needs. They are not
+    interchangeable: unlocking the signing key to export it and encrypting the
+    resulting backup are two different passphrases, and the code's own prompt
+    says so ("They may differ; both are needed to restore").
+    """
+    pf = protected_secret_file(args, attr=attr)
     opts = ["--batch"]
     if yes:
         opts.append("--yes")
@@ -3799,19 +3815,36 @@ def backup_key(x: Ctx) -> int:
     old_umask = os.umask(0o077)
     try:
         sec = dest / f"{fpr}-secret.asc"
-        pf = protected_secret_file(x.args)
-        if not pf:
+        # Two different secrets. --passphrase-file unlocks the SIGNING key so
+        # it can be exported; --backup-passphrase-file encrypts the resulting
+        # backup. Feeding one to both steps meant a non-interactive backup
+        # could only work when the two happened to be the same string, and
+        # otherwise failed at the export with a confusing gpg error.
+        signing_pf = protected_secret_file(x.args, attr="passphrase_file")
+        backup_pf = protected_secret_file(x.args, attr="backup_passphrase_file")
+        if backup_pf is None and signing_pf is not None:
+            # Backwards compatible: one file given, used for both, as before.
+            backup_pf = signing_pf
+            backup_attr = "passphrase_file"
+            x.info("one --passphrase-file given: using it for both the key "
+                   "export and the backup encryption")
+        else:
+            backup_attr = "backup_passphrase_file"
+        if not signing_pf and not backup_pf:
             if not sys.stdin.isatty():
                 raise Fatal("backing up a key needs a terminal for the "
                             "passphrase prompts, or --passphrase-file <path> "
-                            "to encrypt the backup non-interactively.")
+                            "(to unlock the signing key) and "
+                            "--backup-passphrase-file <path> (to encrypt the "
+                            "backup) to run non-interactively.")
             x.info("gpg will ask for the key's passphrase, and then for a "
                    "passphrase to encrypt the backup with. They may differ; both "
                    "are needed to restore.")
         # Encrypted at rest with a passphrase, not a bare export: this file is
         # about to be carried somewhere.
         sec.unlink(missing_ok=True)
-        rc = subprocess.run(["gpg", *gpg_secret_options(x.args),
+        rc = subprocess.run(["gpg", *gpg_secret_options(x.args,
+                                                        attr="passphrase_file"),
                              "--export-secret-keys", "--armor", "--output",
                              str(sec), fpr], stdin=subprocess.DEVNULL).returncode
         if rc != 0 or not sec.exists():
@@ -3821,8 +3854,8 @@ def backup_key(x: Ctx) -> int:
         enc.unlink(missing_ok=True)
         argv = ["gpg", "--symmetric", "--cipher-algo", "AES256",
                 "--output", str(enc)]
-        if pf:
-            argv[1:1] = gpg_secret_options(x.args)
+        if backup_pf:
+            argv[1:1] = gpg_secret_options(x.args, attr=backup_attr)
         rc = subprocess.run(argv + [str(sec)]).returncode
         if rc != 0 or not enc.exists():
             sec.unlink(missing_ok=True)
@@ -3951,37 +3984,72 @@ def config_get(x: Ctx, dotted: str) -> int:
 
 
 def config_set(x: Ctx, dotted: str, raw: str, quiet: bool = False) -> int:
-    if dotted not in _flat_keys(DEFAULT_CONFIG):
-        near = [k for k in sorted(_flat_keys(DEFAULT_CONFIG))
-                if dotted.split(".")[-1] in k]
-        raise Fatal(f"'{dotted}' is not a configuration key."
-                    + (f"\n     did you mean: {', '.join(near[:5])}" if near else ""))
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        value = raw
+    return config_set_many(x, [(dotted, raw)], quiet=quiet)
 
+
+def config_set_many(x: Ctx, pairs: list[tuple[str, str]], quiet: bool = False) -> int:
+    """Apply every --set, then validate ONCE, then write.
+
+    All of them before validating, because a legitimate pair can be invalid
+    halfway through: `--set install.unattended=true --set install.disk=...`
+    describes a valid configuration only once both have been applied.
+
+    Validating before the write is what keeps the file repairable. Writing
+    first and validating at load time meant a single documented command could
+    leave iso-build.json in a state where every later invocation — including
+    the --set needed to correct it — died in load_config before doing
+    anything, and only hand-editing the JSON could recover it.
+    """
     stored: dict = {}
     if CONF_PATH.exists():
         try:
             stored = json.loads(CONF_PATH.read_text())
         except (json.JSONDecodeError, ValueError) as e:
             raise Fatal(f"{CONF_PATH.name} is not valid JSON: {e}")
-    node = stored
-    parts = dotted.split(".")
-    for part in parts[:-1]:
-        node = node.setdefault(part, {})
-        if not isinstance(node, dict):
-            raise Fatal(f"cannot set {dotted}: {part} is not a section")
-    node[parts[-1]] = value
+
+    applied: list[tuple[str, object]] = []
+    for dotted, raw in pairs:
+        if dotted not in _flat_keys(DEFAULT_CONFIG):
+            near = [k for k in sorted(_flat_keys(DEFAULT_CONFIG))
+                    if dotted.split(".")[-1] in k]
+            raise Fatal(f"'{dotted}' is not a configuration key."
+                        + (f"\n     did you mean: {', '.join(near[:5])}" if near else ""))
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        node = stored
+        parts = dotted.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise Fatal(f"cannot set {dotted}: {part} is not a section")
+        node[parts[-1]] = value
+        applied.append((dotted, value))
+
+    merged = deep_merge(DEFAULT_CONFIG, stored)
+    try:
+        # validate_config raises ValueError, not Fatal.
+        validate_config(merged)
+    except (ValueError, Fatal) as exc:
+        raise Fatal(
+            f"{exc}\n"
+            f"     Refusing to write {CONF_PATH.name}: it would leave a "
+            f"configuration no build can use.\n"
+            f"     Nothing has been changed. Set the values that go together "
+            f"in one command, e.g.\n"
+            f"       ./build_iso.py --set install.unattended=true "
+            f"--set install.disk=/dev/disk/by-id/...") from None
 
     if x.args.dry_run:
-        x.info(f"[dry-run] {dotted} = {value!r}")
+        for dotted, value in applied:
+            x.info(f"[dry-run] {dotted} = {value!r}")
         return 0
     CONF_PATH.write_text(json.dumps(stored, indent=2) + "\n")
-    x.c = deep_merge(DEFAULT_CONFIG, stored)
+    x.c = merged
     if not quiet:
-        x.ok(f"{dotted} = {value!r}   ({CONF_PATH.name})")
+        for dotted, value in applied:
+            x.ok(f"{dotted} = {value!r}   ({CONF_PATH.name})")
     return 0
 
 
@@ -5028,7 +5096,8 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
-def load_config(write_only=False, dry_run=False) -> dict:
+def load_config(write_only=False, dry_run=False,
+                validate_semantics: bool = True) -> dict:
     if CONF_PATH.exists():
         if write_only:
             print(f"iso-build.json already exists — not overwriting: {CONF_PATH}",
@@ -5051,7 +5120,10 @@ def load_config(write_only=False, dry_run=False) -> dict:
                         raise ValueError(f"{name} must be {type(expected).__name__}")
             validate(DEFAULT_CONFIG, supplied)
             merged = deep_merge(DEFAULT_CONFIG, supplied)
-            validate_config(merged)
+            if validate_semantics:
+                # Skipped for --set, so that a file already in a bad state can
+                # still be corrected with the tool rather than by hand.
+                validate_config(merged)
             return merged
         except json.JSONDecodeError as e:
             print(f"{R}FATAL:{RST} {CONF_PATH.name} is not valid JSON: {e}",
@@ -5203,17 +5275,20 @@ lifecycle
         # even the default config. ('config' writes it — that is its job.)
         cfg = load_config(write_only=args.write_config,
                           dry_run=args.dry_run
-                          or args.action in ("doctor", "list-kickstarts"))
+                          or args.action in ("doctor", "list-kickstarts"),
+                          validate_semantics=not args.set_kv)
         # Bootstrap consumes configuration while constructing paths and before
         # spawning any dependent stage.  Apply and persist its overrides now;
         # the old dispatch below happened too late and silently ignored them.
         if args.action == "bootstrap" and args.set_kv:
             probe = Ctx(cfg, args)
+            pairs = []
             for kv in args.set_kv:
                 if "=" not in kv:
                     raise Fatal(f"--set expects KEY=VALUE, got '{kv}'")
                 key, value = kv.split("=", 1)
-                config_set(probe, key.strip(), value.strip(), quiet=True)
+                pairs.append((key.strip(), value.strip()))
+            config_set_many(probe, pairs, quiet=True)
             cfg = load_config()
         x = Ctx(cfg, args)
         tier2 = int(cfg["tier"]) == 2
@@ -5242,11 +5317,14 @@ lifecycle
 
         if args.action == "config":
             rc = 0
+            pairs = []
             for kv in (args.set_kv or []):
                 if "=" not in kv:
                     raise Fatal(f"--set expects KEY=VALUE, got '{kv}'")
                 k, v = kv.split("=", 1)
-                rc |= config_set(x, k.strip(), v.strip())
+                pairs.append((k.strip(), v.strip()))
+            if pairs:
+                rc |= config_set_many(x, pairs)
             if args.get_key:
                 rc |= config_get(x, args.get_key)
             if not args.set_kv and not args.get_key:

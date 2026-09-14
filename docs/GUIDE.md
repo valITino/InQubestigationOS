@@ -562,8 +562,20 @@ the generated kickstart carries the language, keyboard, timezone and
 partitioning answers, so Anaconda stops asking them:
 
 ```bash
-./build_iso.py --set install.unattended=true --set install.disk=/dev/nvme0n1
+# Find the target's stable identity ON THE LAPTOP, not on the build host:
+ls -l /dev/disk/by-id/ | grep -v part
+
+./build_iso.py --set install.unattended=true \
+  --set install.disk=/dev/disk/by-id/nvme-SAMSUNG_MZVL2512HCJQ_S64ANS0T123456
 ```
+
+`install.disk` must be a `/dev/disk/by-id/...` or `/dev/disk/by-path/...` path.
+A kernel name like `/dev/nvme0n1` is refused: those are assigned in discovery
+order and the disk that answers to it on the build host is not the one that
+answers to it on the laptop — which, for a directive that erases the disk, is
+not a mistake worth being able to make. Both `--set`s go in **one command**:
+`unattended` without a target disk is not a configuration a build can use, so
+setting them separately is refused and nothing is written.
 
 It is **off by default** on purpose: it names a disk and erases it, which is not
 a thing to turn on by accident. Turn it on once you have decided which disk, and

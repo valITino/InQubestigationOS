@@ -76,7 +76,15 @@ def main() -> int:
     p.add_argument("--work-dir", required=True, type=Path)
     p.add_argument("--backup-dir", required=True, type=Path)
     p.add_argument("--candidate-dir", required=True, type=Path)
-    p.add_argument("--passphrase-file", required=True, type=Path)
+    p.add_argument("--passphrase-file", required=True, type=Path,
+                   help="unlocks the approved signing key")
+    # bootstrap onboarding requires a backup-encryption secret on any
+    # non-interactive run, and a trusted runner has no terminal to prompt at.
+    # Without this the documented release path failed at onboarding, before
+    # anything was built.
+    p.add_argument("--backup-passphrase-file", required=True, type=Path,
+                   help="encrypts the signing-key backup (a DIFFERENT secret "
+                        "from --passphrase-file)")
     p.add_argument("--signing-fingerprint", required=True)
     p.add_argument("--min-work-gb", type=int, default=250)
     p.add_argument("--min-docker-gb", type=int, default=100)
@@ -122,9 +130,16 @@ def main() -> int:
     if parsed_remote.username or parsed_remote.password:
         raise Gate("component_remote must not embed credentials; use a protected "
                    "runner credential helper")
-    st = a.passphrase_file.stat()
-    if st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise Gate("runtime passphrase file must be owned by this user and mode 0600")
+    for label, secret in (("signing", a.passphrase_file),
+                          ("backup-encryption", a.backup_passphrase_file)):
+        st = secret.stat()
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise Gate(f"runtime {label} passphrase file must be owned by this "
+                       "user and mode 0600")
+    if a.passphrase_file.resolve() == a.backup_passphrase_file.resolve():
+        raise Gate("the signing and backup-encryption passphrase files must be "
+                   "distinct; a backup encrypted with the signing passphrase "
+                   "protects nothing the signing key does not already")
     if run(["gpg", "--batch", "--list-secret-keys", fingerprint],
            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
         raise Gate("approved secret signing key is unavailable")
@@ -142,7 +157,8 @@ def main() -> int:
                    check=True)
     command = [sys.executable, "build_iso.py", "bootstrap", "--yes",
                "--use-key", fingerprint, "--passphrase-file",
-               str(a.passphrase_file), "--to", str(a.backup_dir)]
+               str(a.passphrase_file), "--backup-passphrase-file",
+               str(a.backup_passphrase_file), "--to", str(a.backup_dir)]
     subprocess.run(command, cwd=ROOT, check=True)
 
     output = a.work_dir / "output"
