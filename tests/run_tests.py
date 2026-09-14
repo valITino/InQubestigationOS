@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,11 @@ BASE_VMS = [
 ]
 
 RESULTS: list[tuple[str, bool, str]] = []
+
+# How many acceptance checks --verify must actually execute. Not a target to
+# tune: it exists so that DELETING acceptance groups fails the suite. Raise it
+# when groups are added; never lower it to make a run pass.
+ACCEPTANCE_FLOOR = 75
 
 
 def stage(name: str, ok: bool, detail: str = "") -> None:
@@ -176,6 +182,54 @@ def main() -> int:
     stage("phases recorded as complete", len(done) >= 11,
           f"only {len(done)} phases marked: {' '.join(done)}")
 
+    # ------------------------------------------------------------------
+    # The inspected chain, read back off the world the run actually built.
+    #
+    # Everything above this asserts that the provisioner RAN. None of it
+    # asserted WHAT IT BUILT, and the stub answers every in-qube command 0,
+    # so rewiring sys-proxy straight to sys-firewall — removing the Suricata
+    # IPS and the Zeek DPI recorder from the path entirely, which is the
+    # design's central claim — left the whole suite green.
+    world = json.loads((work / "world.json").read_text())
+    prefs = {name: vm.get("prefs", {}) for name, vm in world.get("vms", {}).items()}
+
+    def netvm_of(name: str) -> str:
+        return prefs.get(name, {}).get("netvm", "")
+
+    # qube -> sys-proxy -> sys-ids -> sys-dpi -> sys-firewall -> sys-net
+    CHAIN = [("sys-proxy", "sys-ids"), ("sys-ids", "sys-dpi"),
+             ("sys-dpi", "sys-firewall")]
+    for downstream, upstream in CHAIN:
+        stage(f"{downstream} routes through {upstream}",
+              netvm_of(downstream) == upstream,
+              f"{downstream} netvm is {netvm_of(downstream)!r}, not {upstream!r}"
+              " — traffic would skip an inspection hop")
+
+    # No clearnet qube may attach above sys-proxy. This is the property the
+    # whole topology exists to enforce, so it is asserted over every qube
+    # rather than over a list that could quietly stop including one.
+    chain_members = {"sys-proxy", "sys-ids", "sys-dpi", "sys-firewall",
+                     "sys-net", "sys-usb", "sys-whonix"}
+    bypassing = sorted(
+        name for name, p in prefs.items()
+        if name not in chain_members
+        and p.get("netvm") in ("sys-firewall", "sys-net"))
+    stage("no clearnet qube bypasses the inspected chain", not bypassing,
+          f"attached above sys-proxy: {', '.join(bypassing)}")
+
+    # The Tor branch joins at the firewall and is deliberately uninspected.
+    stage("sys-whonix joins at the firewall",
+          netvm_of("sys-whonix") in ("sys-firewall", ""),
+          f"sys-whonix netvm is {netvm_of('sys-whonix')!r}")
+
+    # Offline qubes must have no netvm at all. An offline qube reports 'none',
+    # not an empty string, so both spellings are accepted deliberately.
+    for offline in ("vault", "dvm-offline"):
+        if offline in prefs:
+            stage(f"{offline} has no netvm",
+                  netvm_of(offline) in ("", "none", "None"),
+                  f"{offline} netvm is {netvm_of(offline)!r}")
+
     creds = Path(env["HOME"]) / "golden-image" / "credentials.json"
     stage("credentials file created", creds.exists())
     if creds.exists():
@@ -238,6 +292,43 @@ def main() -> int:
           (p3.returncode == 0) == ("0 failed" in p3.stdout.replace("\x1b[31m", "")
                                    .replace("\x1b[0m", "")),
           f"rc={p3.returncode} but the summary says otherwise")
+
+    # A floor on how much --verify actually checks. Without one, deleting whole
+    # acceptance groups from golden_image.py — chain order, clearnet bypass,
+    # offline netvm — left the suite completely green: every remaining stage
+    # only asked whether the command ran and whether its exit code agreed with
+    # its own summary, both of which stay true as the suite shrinks.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", p3.stdout)
+    counts = {word: int(n) for n, word in
+              re.findall(r"(\d+)\s+(passed|warnings|failed)", plain)}
+    executed = sum(counts.get(k, 0) for k in ("passed", "warnings", "failed"))
+    stage("--verify reports a countable result", bool(counts), plain[-300:])
+    stage(f"--verify runs at least {ACCEPTANCE_FLOOR} checks",
+          executed >= ACCEPTANCE_FLOOR,
+          f"only {executed} acceptance checks executed "
+          f"({counts}) — groups have been removed or are silently skipping")
+
+    # The count alone is too blunt: deleting one group costs only the handful
+    # of checks it contributed and stays above any floor loose enough not to be
+    # brittle. So the groups that carry the design's security claims are named.
+    # Deleting one has to fail, not merely lower a number.
+    REQUIRED_GROUPS = [
+        "every qube and template this design requires exists",
+        "chain order",
+        "no clearnet qube bypasses the inspection stack",
+        "offline qubes have no netvm",
+        "Wazuh agent present in every template",
+        "supply chain integrity",
+        "DNS enforcement",
+        "inspection services",
+        "proxy logs the originating qube",
+        "Tor branch",
+        "backup",
+        "credentials",
+    ]
+    absent = [g for g in REQUIRED_GROUPS if g not in plain]
+    stage("every acceptance group is still present", not absent,
+          f"--verify no longer runs: {'; '.join(absent)}")
 
     print("\ngenerated configuration")
     p4 = subprocess.run([sys.executable, str(TESTS / "static_checks.py"),
