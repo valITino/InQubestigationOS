@@ -718,6 +718,11 @@ def setup_builder(x: Ctx):
     else:
         x.skip("builder.yml present")
 
+    # Unconditional, not only on the seeding path: a builder.yml left by an
+    # earlier run still carries the upstream Qubes-executor default, and every
+    # ./qb call below depends on this being right.
+    write_builder_executor(x)
+
     x.info("fetching qubes-release sources (kickstarts and comps live there)")
     x.run("./qb", "-c", "qubes-release", "package", "fetch",
           cwd=x.builder, live=True, check=False)
@@ -1447,7 +1452,16 @@ def _merge(base, over):
     return over
 
 
-def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
+def merge_builder_config(x: Ctx, updates: dict, what: str,
+                         replace_keys: tuple[str, ...] = ()) -> None:
+    """Merge `updates` into builder.yml.
+
+    Keys named in `replace_keys` are replaced wholesale rather than deep-merged.
+    That matters for mappings whose sub-keys are mutually exclusive: the upstream
+    example config selects the Qubes DispVM executor with an `options: {dispvm:}`
+    that means nothing to the container executor, and a deep merge would leave
+    that stray option sitting beside `image:`.
+    """
     bcfg = x.builder / "builder.yml"
     if x.args.dry_run:
         x.info(f"[dry-run] merge {what} into builder.yml: "
@@ -1475,7 +1489,10 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
     if not isinstance(current, dict):
         raise Fatal("builder.yml does not parse as a mapping")
 
-    merged = _merge(current, updates)
+    base = dict(current)
+    for key in replace_keys:
+        base.pop(key, None)
+    merged = _merge(base, updates)
     bcfg.write_text(
         f"# Merged by build_iso.py on {datetime.now():%Y-%m-%d %H:%M:%S} ({what}).\n"
         f"# Previous contents: {backup.name}\n"
@@ -1484,6 +1501,39 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
 
     # Automates the [VERIFY] this step used to print: ask the builder what it
     # actually sees rather than asking the operator to go and check.
+    if "executor" in updates:
+        # Asking the builder resolves this against its own config precedence,
+        # which is the only answer that matters: a stale `executor: type: qubes`
+        # left in builder.yml means every ./qb call needs qrexec, which a
+        # Debian/Fedora build host does not have.
+        raw = x.run("./qb", "config", "get-var", "executor", "--json",
+                    cwd=x.builder, check=False, capture=True).strip()
+        want = updates["executor"]["type"]
+        if not raw:
+            # qb could not be run at all. The file on disk is still the
+            # authority; say so rather than claiming a verification happened.
+            written = (merged.get("executor") or {}).get("type")
+            if written != want:
+                raise Fatal(f"builder.yml executor is {written!r}, not {want!r}")
+            x.warn("'qb config get-var executor' returned nothing — merged "
+                   f"executor is {written!r} on disk, but not verified through qb")
+            return
+        try:
+            resolved = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise Fatal(f"'qb config get-var executor --json' did not return "
+                        f"JSON ({exc}). Restored copy: {backup}") from exc
+        got = (resolved or {}).get("type")
+        if got != want:
+            raise Fatal(
+                f"builder.yml merged but 'qb config get-var executor' reports "
+                f"type={got!r}, not {want!r}.\n"
+                f"     Restored copy: {backup}")
+        image = ((resolved or {}).get("options") or {}).get("image", "")
+        x.ok(f"verified with 'qb config get-var executor': {got}"
+             + (f" ({image})" if image else ""))
+        return
+
     seen = x.run("./qb", "config", "get-var", "templates", cwd=x.builder,
                  check=False, capture=True)
     if seen.strip():
@@ -1497,6 +1547,32 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
     else:
         x.warn("'qb config get-var templates' returned nothing — could not verify "
                "the merge automatically")
+
+
+def write_builder_executor(x: Ctx) -> None:
+    """Point builder.yml at the container image setup-host actually built.
+
+    The upstream example config this repository seeds from ships the container
+    executor commented out and `executor: {type: qubes, options: {dispvm:}}`
+    live. That executor drives qrexec into a disposable qube, which exists only
+    on a Qubes host — so on the Debian/Fedora build host this project documents,
+    every `./qb` call fails before it starts. tools/generate-container-image.sh
+    tags the image `qubes-builder-fedora` (no explicit tag, hence `:latest`),
+    which is exactly what upstream's commented-out block names.
+
+    `executor` is replaced rather than merged: `dispvm` is meaningless to
+    ContainerExecutor, whose signature is (container_client, image, ...), and a
+    leftover option would ride along into its **kwargs.
+    """
+    engine = x.c["container_engine"]
+    if engine not in ("docker", "podman"):
+        raise Fatal(f"container_engine must be docker or podman, not {engine!r}")
+    merge_builder_config(
+        x,
+        {"executor": {"type": engine,
+                      "options": {"image": "qubes-builder-fedora:latest"}}},
+        f"{engine} executor",
+        replace_keys=("executor",))
 
 
 def missing_template_rpms(x: Ctx) -> list[str]:

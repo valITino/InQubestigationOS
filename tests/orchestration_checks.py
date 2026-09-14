@@ -142,7 +142,121 @@ def main():
         assert observed == {"work": chosen, "configured": str(chosen)}
         assert config.is_file() and str(chosen) in config.read_text()
 
-    print("  16/16 unattended orchestration checks pass")
+        # ---------------------------------------------------------------
+        # builder.yml must select an executor this build host can actually
+        # run. Upstream's example-configs/qubes-os-r4.3.yml ships the
+        # container executor commented out and the Qubes DispVM executor
+        # live; that one drives qrexec into a disposable qube, which does
+        # not exist on the Debian/Fedora build host this project documents.
+        # The shape below is upstream's, verbatim.
+        import yaml
+
+        x = ctx(td)
+        x.builder.mkdir(parents=True, exist_ok=True)
+        bcfg = x.builder / "builder.yml"
+        bcfg.write_text(
+            "git:\n"
+            "  branch: release4.3\n"
+            "components:\n"
+            "  - builder-rpm:\n"
+            "      branch: main\n"
+            "  - qubes-release\n"
+            "sign-key:\n"
+            "  rpm: DEADBEEF\n"
+            "  deb: DEADBEEF\n"
+            "executor:\n"
+            "  type: qubes\n"
+            "  options:\n"
+            '    dispvm: "@dispvm"\n')
+
+        # qb is absent here, so the merge reports it could not verify through
+        # the builder rather than claiming a verification it did not perform.
+        with mock.patch.object(x, "run", return_value=""):
+            bi.write_builder_executor(x)
+        merged = yaml.safe_load(bcfg.read_text())
+
+        assert merged["executor"]["type"] == "docker", merged["executor"]
+        # Replaced, not deep-merged: ContainerExecutor's signature is
+        # (container_client, image, ...) and a surviving `dispvm` would ride
+        # into its **kwargs.
+        assert merged["executor"]["options"] == {
+            "image": "qubes-builder-fedora:latest"}, merged["executor"]
+        assert "dispvm" not in yaml.safe_dump(merged["executor"])
+        # Everything else in the upstream config survives the merge.
+        assert merged["sign-key"] == {"rpm": "DEADBEEF", "deb": "DEADBEEF"}
+        assert merged["git"]["branch"] == "release4.3"
+        assert len(merged["components"]) == 2
+
+        # podman is a supported engine; anything else is refused rather than
+        # written into builder.yml for ./qb to choke on later.
+        x.c["container_engine"] = "podman"
+        with mock.patch.object(x, "run", return_value=""):
+            bi.write_builder_executor(x)
+        assert yaml.safe_load(bcfg.read_text())["executor"]["type"] == "podman"
+        x.c["container_engine"] = "nspawn"
+        expect_fatal(lambda: bi.write_builder_executor(x),
+                     "container_engine must be docker or podman")
+
+        # A builder that answers with a different executor than the one just
+        # written is a hard failure, not a warning: this is the check that
+        # catches config precedence putting something else in front.
+        x.c["container_engine"] = "docker"
+        with mock.patch.object(x, "run", return_value='{"type": "qubes"}'):
+            expect_fatal(lambda: bi.write_builder_executor(x),
+                         "reports type='qubes'")
+
+        # ---------------------------------------------------------------
+        # Wiring, not just the helper: setup_builder must fix the executor
+        # BEFORE it runs ./qb for anything. Testing the helper alone let
+        # deleting its call site go unnoticed.
+        x = ctx(td)
+        x.builder.mkdir(parents=True, exist_ok=True)
+        (x.builder / ".git").mkdir(exist_ok=True)
+        (x.builder / "dependencies-debian.txt").write_text("git curl\n")
+        bcfg = x.builder / "builder.yml"
+        bcfg.write_text("executor:\n  type: qubes\n  options:\n"
+                        '    dispvm: "@dispvm"\n')
+        # The fetch is mocked, so stand in for what it would have produced.
+        conf = bi.release_dir(x) / "conf"
+        conf.mkdir(parents=True, exist_ok=True)
+        (conf / "iso-online.ks").write_text("%include qubes-kickstart.cfg\n")
+
+        qb_calls = []
+
+        def record(*argv, **kw):
+            cmd = [str(a) for a in argv]
+            if cmd and cmd[0] == "./qb":
+                # What did builder.yml say at the moment ./qb was invoked?
+                try:
+                    live = yaml.safe_load(bcfg.read_text()) or {}
+                except Exception:
+                    live = {}
+                qb_calls.append((cmd, (live.get("executor") or {}).get("type")))
+                if cmd[1:3] == ["config", "get-var"]:
+                    return '{"type": "docker", "options": ' \
+                           '{"image": "qubes-builder-fedora:latest"}}'
+                return ""
+            if cmd[:3] == ["git", "-C", str(x.builder)] and "rev-parse" in cmd:
+                return x.c["builder_branch"]
+            return ""
+
+        with mock.patch.object(x, "run", side_effect=record), \
+                mock.patch.object(bi, "verify_builder", return_value=None), \
+                mock.patch.object(bi, "host_family", return_value="debian"), \
+                mock.patch.object(bi, "packages_available", return_value=None), \
+                mock.patch.object(bi, "install_packages", return_value=None), \
+                mock.patch.object(bi, "resolve_auto_values", return_value=None), \
+                mock.patch.object(bi.shutil, "which", return_value=None):
+            bi.setup_builder(x)
+
+        assert qb_calls, "setup_builder ran no ./qb commands at all"
+        for cmd, executor_type in qb_calls:
+            assert executor_type == "docker", (
+                f"./qb {' '.join(cmd[1:3])} ran while builder.yml still said "
+                f"executor={executor_type!r} — that call needs qrexec and "
+                f"cannot work on a Debian/Fedora build host")
+
+    print("  24/24 unattended orchestration checks pass")
     return 0
 
 
