@@ -4511,21 +4511,39 @@ if [ -n "$FPR" ] && [ -f "$ISO.asc" ]; then
     # baked into this script would prove nothing: the script travels with the
     # image, so whoever replaced one could replace the other.
     status=$(gpg --batch --status-fd 1 --verify "$ISO.asc" "$ISO" 2>/dev/null)
+    # Revocation is checked FIRST: a revoked key turns GOODSIG into REVKEYSIG,
+    # so the generic "does not verify" branch would otherwise catch it and tell
+    # the operator something materially different from what happened. gpg still
+    # exits 0 and still emits VALIDSIG here.
+    if echo "$status" | grep -qE '^\\[GNUPG:\\] (KEYREVOKED|REVKEYSIG)'; then
+        printf 'REVOKED\\n\\n  The signing key has been REVOKED by its owner.\\n'
+        printf '  Do not install this image.\\n\\n'
+        exit 1
+    fi
     if ! echo "$status" | grep -q '^\\[GNUPG:\\] GOODSIG'; then
         printf 'BAD\\n\\n  The signature does not verify. Do not install this image.\\n\\n'
         exit 1
     fi
     printf 'ok\\n'
-    signer=$(echo "$status" | sed -n 's/^\\[GNUPG:\\] VALIDSIG \\([0-9A-F]*\\).*/\\1/p' | head -1)
-    printf '\\n  Signed by:  %s\\n' "$signer"
-    if [ -n "$FPR" ] && [ "$signer" != "$FPR" ]; then
+    # VALIDSIG names the signing key FIRST and the primary key LAST. With a
+    # normal GnuPG key the signature is made by a signing SUBKEY, so comparing
+    # only the first field against the unit's primary fingerprint rejects a
+    # genuine image. Accept either.
+    validsig=$(echo "$status" | grep '^\\[GNUPG:\\] VALIDSIG ' | head -1)
+    signer=$(echo "$validsig" | awk '{{print $3}}')
+    primary=$(echo "$validsig" | awk '{{print $NF}}')
+    printf '\\n  Signed by:  %s\\n' "$primary"
+    if [ "$signer" != "$primary" ]; then
+        printf '  (signing subkey %s)\\n' "$signer"
+    fi
+    if [ -n "$FPR" ] && [ "$signer" != "$FPR" ] && [ "$primary" != "$FPR" ]; then
         printf '  Expected:   %s\\n' "$FPR"
         printf '\\n  *** The signer is NOT the key this image was built with. ***\\n'
         printf '  Stop. Do not install this image.\\n\\n'
         exit 1
     fi
     if [ -n "$EXPECT" ]; then
-        if [ "$signer" = "$EXPECT" ]; then
+        if [ "$signer" = "$EXPECT" ] || [ "$primary" = "$EXPECT" ]; then
             printf '  Matches the fingerprint you supplied.\\n\\n'
         else
             printf '  Expected:   %s\\n' "$EXPECT"
@@ -4685,6 +4703,13 @@ if (-not $gpg) {{
 & gpg.exe --quiet --import unit-signing-key.asc 2>$null
 Write-Host '  signature ... ' -NoNewline
 $status = & gpg.exe --batch --status-fd 1 --verify "$Iso.asc" $Iso 2>$null
+# Revocation first: a revoked key turns GOODSIG into REVKEYSIG, so the
+# generic branch would otherwise report the wrong reason.
+if ($status -match 'KEYREVOKED' -or $status -match 'REVKEYSIG') {{
+    Write-Host 'REVOKED' -f Red
+    Write-Host '  The signing key has been REVOKED by its owner. Stop.' -f Red
+    exit 1
+}}
 if (-not ($status -match 'GOODSIG')) {{
     Write-Host 'BAD' -f Red
     Write-Host '  The signature does not verify. Do not install this image.' -f Red
@@ -4692,17 +4717,23 @@ if (-not ($status -match 'GOODSIG')) {{
 }}
 Write-Host 'ok' -f Green
 
-$signer = ($status | Select-String 'VALIDSIG ([0-9A-F]{{40}})').Matches.Groups[1].Value
+# VALIDSIG names the signing key first and the primary key last. A normal
+# GnuPG key signs with a subkey, so accept either fingerprint.
+$validsig = ($status | Select-String '^\\[GNUPG:\\] VALIDSIG ' | Select-Object -First 1).Line
+$fields = $validsig -split '\\s+'
+$signer = $fields[2].ToUpper()
+$primary = $fields[-1].ToUpper()
 Write-Host ''
-Write-Host "  Signed by:  $signer"
-if ($Fpr -and $signer -ne $Fpr) {{
+Write-Host "  Signed by:  $primary"
+if ($signer -ne $primary) {{ Write-Host "  (signing subkey $signer)" }}
+if ($Fpr -and $signer -ne $Fpr -and $primary -ne $Fpr) {{
     Write-Host "  Expected:   $Fpr" -f Red
     Write-Host '  The signer is NOT the key this image was built with. Stop.' -f Red
     exit 1
 }}
 if ($Expect) {{
     $e = ($Expect -replace '\\s','').ToUpper()
-    if ($e -eq $signer) {{ Write-Host '  Matches the fingerprint you supplied.' -f Green }}
+    if ($e -eq $signer -or $e -eq $primary) {{ Write-Host '  Matches the fingerprint you supplied.' -f Green }}
     else {{
         Write-Host "  Expected:   $e" -f Red
         Write-Host '  MISMATCH. Do not install this image.' -f Red
@@ -4784,20 +4815,11 @@ def write_usb(x: Ctx) -> int:
         # signature from ANY key in the keyring, so reporting "verifies against
         # <the unit key>" after it asserted a binding that was never tested —
         # on the last checkpoint before an image reaches removable media.
-        out = x.run("gpg", "--batch", "--status-fd", "1", "--verify",
-                    str(asc), str(iso), check=False, capture=True)
-        signer = ""
-        for line in out.splitlines():
-            if line.startswith("[GNUPG:] VALIDSIG "):
-                signer = line.split()[2]
-                break
-        if not signer:
-            raise Fatal("the detached signature does not verify. Do not write "
-                        "this image to media.")
-        want = (x.c["iso_sign_key"] or "").upper()
-        if want and signer.upper() != want:
-            raise Fatal(f"the image is signed by {signer}, not by the configured "
-                        f"key {want}.\n     Do not write it to media.")
+        proc = subprocess.run(
+            ["gpg", "--batch", "--status-fd", "1", "--verify",
+             str(asc), str(iso)], capture_output=True, text=True)
+        signer = authenticate_signature(proc.stdout, proc.returncode,
+                                        x.c["iso_sign_key"])
         x.ok(f"signature verifies, signed by {signer}")
     else:
         raise Fatal("no detached signature beside the image — refusing destructive write")
@@ -5074,6 +5096,59 @@ def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
         finally:
             x.run(*_sudo(["umount", td]), check=False)
     x.ok(f"{OEM_LABEL} partition {part} carries ks.cfg, verified by readback")
+
+
+def authenticate_signature(status: str, returncode: int, expected: str) -> str:
+    """The fingerprint that signed, or raise Fatal. `expected` is the primary.
+
+    Two things measured against gpg 2.4 rather than assumed, both of which the
+    previous per-site checks got wrong:
+
+      * VALIDSIG names TWO fingerprints. Field 1 is the key that actually made
+        the signature — a SIGNING SUBKEY when the key has one — and the last
+        field is the primary. Comparing field 1 against the configured primary
+        rejects a perfectly good image whenever the signing key has a subkey,
+        which is the normal shape of a GnuPG key and what `gen-key --use-key`
+        adopts. Either fingerprint is accepted.
+
+      * A REVOKED key still emits VALIDSIG, and gpg still exits 0. The only
+        difference in the status output is that GOODSIG becomes REVKEYSIG and
+        KEYREVOKED appears. Accepting VALIDSIG alone therefore accepts a
+        signature from a key whose owner has published a revocation — on the
+        last checkpoint before an image reaches removable media.
+    """
+    expected = (expected or "").replace(" ", "").upper()
+    if not expected:
+        raise Fatal("no expected signing fingerprint configured, so the "
+                    "signature cannot be authenticated")
+    lines = status.splitlines()
+
+    def has(tag: str) -> bool:
+        return any(ln.startswith(f"[GNUPG:] {tag}") for ln in lines)
+
+    if returncode != 0:
+        raise Fatal("the detached signature does not verify. Do not write this "
+                    "image to media.")
+    if has("KEYREVOKED") or has("REVKEYSIG"):
+        raise Fatal("the signing key has been REVOKED by its owner. gpg still "
+                    "reports the signature as valid and still exits 0; this is "
+                    "refused deliberately.")
+    if has("EXPKEYSIG"):
+        raise Fatal("the signature was made by an expired key.")
+    if has("BADSIG") or not has("GOODSIG"):
+        raise Fatal("the signature is not good (no GOODSIG in gpg's status "
+                    "output). Do not write this image to media.")
+    for ln in lines:
+        if ln.startswith("[GNUPG:] VALIDSIG "):
+            parts = ln.split()
+            signer, primary = parts[2].upper(), parts[-1].upper()
+            if expected in (signer, primary):
+                return signer
+            raise Fatal(
+                f"the image is signed by {signer} (primary {primary}), not by "
+                f"the configured key {expected}.\n     Do not write it to media.")
+    raise Fatal("gpg produced no VALIDSIG line; the signature was not "
+                "authenticated.")
 
 
 def want_digest(x: Ctx) -> str:

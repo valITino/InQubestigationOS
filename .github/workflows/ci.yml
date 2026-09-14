@@ -54,6 +54,10 @@ jobs:
       # appending the QUBES_OEM partition leaves the isohybrid MBR intact.
       - name: Test the QUBES_OEM partition against real media
         run: sudo ./tests/oem_media_checks.py
+      # Real GnuPG keys: a subkey-signed image must authenticate, and a
+      # revoked key must not — gpg exits 0 and still emits VALIDSIG for it.
+      - name: Test signature authentication against real keys
+        run: ./tests/signature_checks.py
       # Also run standalone so a failure names itself in the job summary.
       - name: The build-host support holds up
         if: always()

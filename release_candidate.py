@@ -43,12 +43,38 @@ def git(*args: str) -> str:
 
 
 def verify_signature(iso: Path, signature: Path, expected: str) -> None:
+    """Authenticate the signature against the approved primary fingerprint.
+
+    VALIDSIG names the key that made the signature FIRST — a signing subkey
+    when the key has one — and the primary LAST, so comparing only the first
+    field rejects a genuine image signed by an approved key that has a signing
+    subkey. And a revoked key still produces VALIDSIG with gpg exiting 0; only
+    GOODSIG turning into REVKEYSIG, plus KEYREVOKED, distinguishes it.
+    """
     p = run(["gpg", "--batch", "--status-fd", "1", "--verify",
              str(signature), str(iso)], capture_output=True)
-    valid = [line.split()[2].upper() for line in p.stdout.splitlines()
-             if line.startswith("[GNUPG:] VALIDSIG ")]
-    if p.returncode or valid != [expected.upper()]:
-        raise Gate(f"signature signer mismatch: expected {expected}, got {valid}")
+    lines = p.stdout.splitlines()
+
+    def has(tag: str) -> bool:
+        return any(line.startswith(f"[GNUPG:] {tag}") for line in lines)
+
+    if p.returncode:
+        raise Gate("signature does not verify")
+    if has("KEYREVOKED") or has("REVKEYSIG"):
+        raise Gate("the approved signing key has been revoked by its owner")
+    if has("EXPKEYSIG"):
+        raise Gate("the signature was made by an expired key")
+    if has("BADSIG") or not has("GOODSIG"):
+        raise Gate("signature is not good (no GOODSIG in gpg status output)")
+    accepted = expected.replace(" ", "").upper()
+    for line in lines:
+        if line.startswith("[GNUPG:] VALIDSIG "):
+            parts = line.split()
+            if accepted in (parts[2].upper(), parts[-1].upper()):
+                return
+            raise Gate(f"signature signer mismatch: expected {expected}, got "
+                       f"{parts[2]} (primary {parts[-1]})")
+    raise Gate("gpg produced no VALIDSIG line")
 
 
 def sha256(path: Path) -> str:

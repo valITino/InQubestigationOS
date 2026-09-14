@@ -87,6 +87,7 @@ check:  ## run the whole test suite (no Qubes machine needed)
 	./tests/release_checks.py
 	./tests/acceptance_checks.py
 	sudo ./tests/oem_media_checks.py
+	./tests/signature_checks.py
 
 .PHONY: lint
 lint:  ## lint all Python code (requires requirements-dev.txt)
@@ -148,6 +149,7 @@ ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
 	./tests/release_checks.py
 	./tests/acceptance_checks.py
 	sudo ./tests/oem_media_checks.py
+	./tests/signature_checks.py
 	./tests/host_checks.py
 	./tests/config_checks.py
 	./tests/doc_checks.py
