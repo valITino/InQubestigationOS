@@ -58,6 +58,8 @@ jobs:
       # revoked key must not — gpg exits 0 and still emits VALIDSIG for it.
       - name: Test signature authentication against real keys
         run: ./tests/signature_checks.py
+      - name: Test the one-command quickstart ordering and gates
+        run: ./tests/quickstart_checks.py
       # Also run standalone so a failure names itself in the job summary.
       - name: The build-host support holds up
         if: always()

@@ -108,6 +108,11 @@ class BootstrapWorkflow:
 
     def prepare_mount(self, role: str) -> tuple[Path, dict]:
         """Mount an explicitly selected, preformatted block/share resource."""
+        if self.cfg.get(f"{role}_kind") == "local-directory":
+            # Nothing to mount: this is a plain directory on this host. The
+            # trade it makes is stated in _validate and warned about at the
+            # moment the key is written.
+            return self._validate(role, minimum_mb=0, prepare_data=True)
         path = Path(self.cfg[f"{role}_path"])
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError(f"{role}: mountpoint must be an absolute normalized path")
@@ -327,6 +332,24 @@ class BootstrapWorkflow:
         kind = self.cfg.get(f"{role}_kind", "")
         if not str(path) or str(path) == ".":
             raise ValueError(f"{role}: guest-visible path is not configured")
+        if kind == "local-directory":
+            # A plain directory on this host, deliberately NOT independent
+            # media: it does not survive losing this disk. It exists so a first
+            # build does not require a USB stick to be plugged in before
+            # anything can be built at all. Accepted for the key backup only,
+            # and warned about again at the moment the key is written.
+            if role != "backup":
+                raise ValueError(f"{role}: local-directory is accepted only for "
+                                 "the signing-key backup")
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o700)
+            data = path / ".inqubestigation" / role
+            data.mkdir(parents=True, exist_ok=True)
+            data.chmod(0o700)
+            if shutil.disk_usage(data).free < minimum_mb * 1024**2:
+                raise ValueError(f"{role}: less than {minimum_mb} MiB is available")
+            return path, {"target": str(path), "source": "local-directory",
+                          "fstype": "directory", "options": "rw"}
         if not path.is_dir():
             raise ValueError(f"{role}: configured path is unavailable: {path}")
         mount = self._mount(path)

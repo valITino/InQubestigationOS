@@ -1572,6 +1572,176 @@ def merge_builder_config(x: Ctx, updates: dict, what: str,
                "the merge automatically")
 
 
+def quickstart(x: Ctx, args) -> int:
+    """One command: check everything, then build and sign an ISO.
+
+    `bootstrap` is the production release path, and it asks for production
+    things before it will build: a signing identity, two separate passphrases,
+    a separately-mounted medium for the key backup, and a second mounted
+    destination for the finished image. Every one of those is the right demand
+    to make of a release you are going to hand to someone else. None of them
+    should stand between a first build and an ISO.
+
+    So this does the same work with defaults that hold up:
+
+      * every check that can be made runs FIRST, in seconds, before any
+        multi-hour step — and anything this script can fix, it fixes;
+      * the signing key is reused if there is one and generated if not;
+      * one passphrase is asked for, once, and used for the key and its backup;
+      * the key backup goes next to the build unless you say otherwise, with a
+        warning saying exactly what that costs;
+      * the ISO lands in the output directory instead of needing a second
+        mounted destination;
+      * with --usb it writes the stick too.
+
+    Nothing here weakens a check. It removes ceremony, not verification.
+    """
+    lab = bool(getattr(args, "no_passphrase", False))
+    print(f"\n{B}{C}quickstart{RST} — build a signed, installable ISO")
+    print("  Everything that can be checked is checked first. The build only")
+    print("  starts once nothing is known to be wrong.\n")
+
+    # ---- 1. the host ---------------------------------------------------
+    x.phase("1/6", "check this build host, and fix what can be fixed")
+    # signing=False: the key is step 2's job, so its absence must not block
+    # step 1 — otherwise this command could never get as far as creating it.
+    rc = doctor(x, signing=False)
+    if rc != 0:
+        # Fixing is the point of this command, so it is not behind a flag.
+        # setup-host installs packages and needs sudo; doctor has just printed
+        # exactly what is missing, so nothing here is a surprise. Its return
+        # value IS the re-check (it ends by calling doctor again, allowing for
+        # docker group membership that only works through `sg` in this shell).
+        x.info("blocking findings above — running the fixes this script owns")
+        if setup_host(x) != 0:
+            raise Fatal(
+                "this host is still not ready after setup-host.\n"
+                "     The rows marked ✗ above say what is missing. Nothing has\n"
+                "     been built, so fixing them and re-running costs nothing.")
+    ce = x.c["container_engine"]
+    if (ce == "docker" and not x.quiet("docker", "ps")
+            and shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps")
+            and not os.environ.get("INQUBESTIGATION_SG")):
+        # Group membership granted just now does not apply to this process,
+        # and the build below drives docker directly. Rather than printing
+        # "prefix your command with sg docker -c", do it: re-run this exact
+        # command inside the group. The guard variable stops a loop. No secret
+        # has been collected yet, so nothing is carried across the exec.
+        x.info("docker group membership is not active in this shell; "
+               "re-running this command under `sg docker`")
+        os.environ["INQUBESTIGATION_SG"] = "1"
+        os.execvp("sg", ["sg", "docker", "-c",
+                         shlex.join([sys.executable, *sys.argv])])
+    x.ok("build host is ready")
+
+    # ---- 2. the signing key --------------------------------------------
+    x.phase("2/6", "signing key")
+    if not (x.c["iso_sign_key"] or "").strip():
+        existing = secret_key_fingerprints()
+        if len(existing) == 1 and not getattr(args, "uid", None):
+            args.use_key = existing[0][0]
+            x.info(f"adopting the one secret key in this keyring: {existing[0][1]}")
+        elif not getattr(args, "uid", None):
+            args.uid = default_signing_uid()
+            x.info(f"no signing key configured; creating one for {args.uid!r}")
+            x.info("pass --uid to name it yourself")
+        if not lab and not args.passphrase_file and not args.dry_run:
+            args.passphrase_file = str(prompt_secret(
+                "passphrase for the signing key (also encrypts its backup)"))
+        gen_key(x)
+        x.c = load_config(dry_run=args.dry_run)
+    else:
+        x.ok(f"signing key already configured: {x.c['iso_sign_key']}")
+        if not lab and not args.passphrase_file and not args.dry_run:
+            args.passphrase_file = str(prompt_secret(
+                "passphrase for the signing key (also encrypts its backup)"))
+
+    # ---- 3. the key backup ---------------------------------------------
+    x.phase("3/6", "signing-key backup")
+    if lab:
+        x.warn("--no-passphrase: this is a LAB key with no passphrase, and no")
+        x.warn("  backup is being made. Do not sign anything you will hand out.")
+    elif args.dry_run and not (x.c["iso_sign_key"] or "").strip():
+        # A dry-run gen-key creates nothing, so there is nothing to back up yet.
+        x.info(f"[dry-run] back up the new key to {x.work / 'key-backup'}")
+    else:
+        if not getattr(args, "to", None):
+            args.to = str(x.work / "key-backup")
+            args.allow_local_key_backup = True
+        backup_key(x)
+
+    # ---- 4. supply chain -----------------------------------------------
+    x.phase("4/6", "supply chain")
+    if check_upstream(x) != 0:
+        raise Fatal("the supply-chain check did not pass. Nothing has been "
+                    "built.\n     Re-run when the findings above are resolved, "
+                    "or --allow-unreachable\n     if the sources are simply "
+                    "not reachable from here.")
+
+    # ---- 5. build -------------------------------------------------------
+    x.phase("5/6", "build and sign")
+    # The two preflight warnings (self-signed, goes stale) are printed in full
+    # but acknowledged here rather than by typing UNDERSTOOD: this command is
+    # the acknowledgement. The USB write below keeps its own "Write to
+    # /dev/sdX?" question unless --yes was given — that one erases a device.
+    ack = getattr(args, "assume_yes", False)
+    args.assume_yes = True
+    try:
+        payload = preflight(x, int(x.c["tier"]) == 2)
+    finally:
+        args.assume_yes = ack
+    resolve_auto_values(x)
+    if int(x.c["tier"]) == 2:
+        fetch_kali_key(x)
+        gen_component(x)
+        build_templates(x)
+    build_iso(x, payload)
+
+    # ---- 6. media -------------------------------------------------------
+    x.phase("6/6", "installation media")
+    iso = x.out_dir / x.c["iso_name"]
+    if getattr(args, "usb", False) or getattr(args, "device", None):
+        args.wait = args.wait or not getattr(args, "device", None)
+        return write_usb(x)
+    print(f"""
+  {G}Done.{RST}  {iso}
+
+  Write it to a USB stick (this also puts the installer's answer file on it,
+  which is what makes the install hands-off):
+
+      ./build_iso.py write-usb --wait
+
+  Then boot the stick on the target laptop.
+""")
+    return 0
+
+
+def default_signing_uid() -> str:
+    """A signing identity derived from this host, so none has to be invented."""
+    import getpass as _getpass
+    import socket
+    try:
+        user = _getpass.getuser()
+    except Exception:
+        user = "builder"
+    return f"InQubestigationOS Image Signing <{user}@{socket.gethostname()}>"
+
+
+def prompt_secret(label: str) -> Path:
+    """Ask once, confirm once, hold it in a mode-0600 runtime file."""
+    import getpass as _getpass
+    first = _getpass.getpass(f"\n  {label}\n  (hidden, held only for this run): ")
+    second = _getpass.getpass("  confirm: ")
+    if not first or first != second:
+        raise Fatal("the passphrase was empty or the two entries did not match")
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    fd, name = tempfile.mkstemp(prefix="inqubestigation-", dir=runtime)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(first)
+    return Path(name)
+
+
 def write_builder_executor(x: Ctx) -> None:
     """Point builder.yml at the container image setup-host actually built.
 
@@ -3911,8 +4081,16 @@ def backup_key(x: Ctx) -> int:
     while mount != mount.parent and not os.path.ismount(mount):
         mount = mount.parent
     if mount == Path("/"):
-        raise Fatal(f"backup destination {dest} is not on a separately mounted "
-                    "medium. Mount the intended backup disk and retry.")
+        if not getattr(x.args, "allow_local_key_backup", False):
+            raise Fatal(f"backup destination {dest} is not on a separately mounted "
+                        "medium. Mount the intended backup disk and retry, or "
+                        "pass --allow-local-key-backup to keep the backup on "
+                        "this host.")
+        x.warn("THIS KEY BACKUP IS ON THIS HOST'S OWN DISK.")
+        x.warn(f"  {dest}")
+        x.warn("  It does not survive losing this machine, and it sits next to")
+        x.warn("  the key it backs up. Copy it onto removable media you keep")
+        x.warn("  somewhere else BEFORE you ship an image signed with this key.")
     dest.mkdir(parents=True, exist_ok=True)
     dest.chmod(0o700)
     old_umask = os.umask(0o077)
@@ -5375,7 +5553,8 @@ lifecycle
   list-kickstarts  show what the fetched Qubes sources offer
 """)
     p.add_argument("action", nargs="?", default="iso",
-                   choices=["iso", "templates", "all", "list-kickstarts",
+                   choices=["quickstart", "iso", "templates", "all",
+                            "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
                             "write-usb", "config", "sign",
                             "backup-key", "restore-key", "bootstrap",
@@ -5417,6 +5596,11 @@ lifecycle
                    help=f"put the {OEM_LABEL} kickstart partition on this device "
                         f"instead of the image stick (leaves the image stick's "
                         f"media check intact)")
+    u.add_argument("--usb", action="store_true",
+                   help="quickstart: write the USB stick at the end too")
+    u.add_argument("--allow-local-key-backup", action="store_true",
+                   help="keep the signing-key backup on this host instead of "
+                        "requiring separately mounted media")
     u.add_argument("--no-oem", action="store_true",
                    help=f"do not write the {OEM_LABEL} partition; the installer "
                         f"will then find no kickstart and nothing provisions the "
@@ -5518,6 +5702,9 @@ lifecycle
                     if not isinstance(val, dict):
                         print(f"  {k} = {json.dumps(val)}")
             return rc
+
+        if args.action == "quickstart":
+            return quickstart(x, args)
 
         if args.action == "doctor":
             return doctor(x)

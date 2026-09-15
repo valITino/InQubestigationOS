@@ -54,16 +54,19 @@ templates, and Whonix.
 # On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~100 GB
 # free (~250 GB for tier=2) — nothing pre-installed
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
-# The wizard discovers approved preformatted storage, creates safe mountpoints,
-# mounts it, and collects the signing authorization with hidden input.
-./build_iso.py bootstrap
-./build_iso.py write-usb --wait   # plug the stick in when it asks
+./build_iso.py quickstart --usb   # one passphrase, then walk away
 ```
 
-`bootstrap` runs `setup-host`, `gen-key`, `backup-key`, `doctor`,
-`check-upstream`, the dry-run plan and the build, stopping at the first failure.
-Every step is idempotent, so fixing a cause and re-running skips what already
-succeeded. Each is also available on its own — `make` lists them.
+`quickstart` checks everything it can **first** — host, tools, disk, Docker,
+the pinned supply chain — and fixes what it can, so a problem stops it in
+seconds rather than hours in. Then it creates or reuses the signing key, backs
+it up, builds and signs the ISO, and with `--usb` waits for a stick and writes
+it. It asks for exactly one passphrase. Every step is idempotent: fix the cause
+and re-run, and what already succeeded is skipped.
+
+For a throwaway test build, `--no-passphrase` asks nothing at all. For the
+production release path with independent key-backup media and an audited
+export, use `bootstrap` instead — `make` lists every step on its own.
 
 Boot the USB and install. First boot provisions itself; there is nothing to do
 by hand, and the recurring maintenance installs itself as timers.

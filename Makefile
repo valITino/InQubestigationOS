@@ -17,8 +17,12 @@ help:  ## show this help
 	     END{print ""}' $(MAKEFILE_LIST)
 
 # --- build host ------------------------------------------------------------
+.PHONY: quickstart
+quickstart:  ## check everything first, then build, sign and write the USB (one passphrase)
+	./build_iso.py quickstart --usb
+
 .PHONY: bootstrap
-bootstrap:  ## host, key, key backup, checks, plan and build — in that order
+bootstrap:  ## production release path: independent key-backup media, audited export
 	./build_iso.py bootstrap $(if $(UID),--uid "$(UID)",)
 
 .PHONY: host
@@ -88,6 +92,7 @@ check:  ## run the whole test suite (no Qubes machine needed)
 	./tests/acceptance_checks.py
 	sudo ./tests/oem_media_checks.py
 	./tests/signature_checks.py
+	./tests/quickstart_checks.py
 
 .PHONY: lint
 lint:  ## lint all Python code (requires requirements-dev.txt)
@@ -150,6 +155,7 @@ ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
 	./tests/acceptance_checks.py
 	sudo ./tests/oem_media_checks.py
 	./tests/signature_checks.py
+	./tests/quickstart_checks.py
 	./tests/host_checks.py
 	./tests/config_checks.py
 	./tests/doc_checks.py

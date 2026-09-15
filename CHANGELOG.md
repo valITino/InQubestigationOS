@@ -7,6 +7,19 @@ design or the packages: qubes-builderv2 at `mm_db047c1c`, `qubes-release` at
 `release4.3`, and `qubes-lorax-templates` at `release4.3`, read rather than
 recalled. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
 
+**Added**
+
+- `./build_iso.py quickstart [--usb]`: one command from a clean host to a
+  written stick. Every check runs first and what can be fixed is fixed; then
+  the signing key is created or reused, backed up, the supply chain checked,
+  the ISO built and signed, and the USB written. One passphrase, asked once.
+  `--no-passphrase` for a lab build asks nothing. The key backup may stay on
+  the build host (`--allow-local-key-backup`, set by quickstart) with a
+  warning that says exactly what that costs; `bootstrap` remains the
+  production path that insists on independent media. If docker group
+  membership was granted during the run, quickstart re-executes itself under
+  `sg docker` instead of asking you to.
+
 **Fixed — would not have worked**
 
 - `builder.yml` kept upstream's `executor: type: qubes`, which drives qrexec

@@ -1,6 +1,6 @@
 # InQubestigationOS — the complete guide
 
-The current build quick start is the single `./build_iso.py bootstrap` workflow, not a manual mount/build/copy checklist. Complete the measured fields and read [BOOTSTRAP.md](BOOTSTRAP.md).
+The quick start is one command, `./build_iso.py quickstart --usb`. `./build_iso.py bootstrap` is the production release path with independent key-backup media and an audited export; its contract is in [BOOTSTRAP.md](BOOTSTRAP.md).
 
 From an empty build host to an issued investigator laptop. Follow it in order.
 
@@ -243,20 +243,32 @@ intend to issue.
 
 ## 2. Prepare the build host
 
-**The short version.** Sections 2 to 6 are one command:
+**The short version.** Sections 2 to 7 are one command:
 
 ```bash
 git clone <your-internal-url>/InQubestigationOS.git
 cd InQubestigationOS
-./build_iso.py bootstrap
+./build_iso.py quickstart --usb
 ```
 
-It runs `setup-host`, `gen-key`, `backup-key`, `doctor`, `check-upstream`, the
-dry-run plan and then the build, in that order, stopping at the first failure —
-and every step is idempotent, so after fixing a cause you run `bootstrap` again
-and the completed steps are skipped. It does not write the USB (you have to plug
-it in) and it does not distribute the fingerprint (that has to travel
-separately). Add `--yes` for an unattended run.
+It checks the host first and fixes what it can (`doctor`, then `setup-host` if
+anything was missing), creates or reuses the signing key, backs it up, checks
+the pinned supply chain, builds and signs the ISO, and then waits for a USB
+stick and writes it — installer answer file included. It asks for one
+passphrase, once. Everything that can fail fast does, before the multi-hour
+build starts; every step is idempotent, so after fixing a cause you run it
+again and the completed steps are skipped. Add `--yes` to also skip the
+"write to /dev/sdX?" confirmation, and `--no-passphrase` for a throwaway lab
+build that asks nothing at all.
+
+Two things it deliberately leaves to you: the key backup lands beside the
+build (it says so, loudly — copy it to removable media before you ship an
+image signed with that key), and the fingerprint still has to travel to
+recipients by a channel independent of the stick.
+
+`bootstrap` is the production release path: it insists on independent
+key-backup media and an audited export destination before it builds. Use it
+for a release you will hand to others.
 
 The rest of this section, and sections 3 to 6, explain what each of those steps
 does and how to run them individually.
