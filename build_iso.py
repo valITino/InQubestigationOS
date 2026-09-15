@@ -5277,8 +5277,7 @@ def write_usb(x: Ctx) -> int:
     else:
         target = getattr(x.args, "oem_device", None) or dev_path
         if target != dev_path:
-            x.info(f"writing the {OEM_LABEL} filesystem to {target} instead of "
-                   f"the image stick")
+            guard_second_device(x, target)
         write_oem_partition(x, target, ks)
 
     print(f"""
@@ -5303,8 +5302,14 @@ def oem_kickstart_path(x: Ctx) -> Path:
 
 
 def partition_node(dev_path: str, number: int) -> str:
-    """/dev/sdb + 3 -> /dev/sdb3;  /dev/nvme0n1 + 3 -> /dev/nvme0n1p3."""
-    return f"{dev_path}p{number}" if dev_path[-1:].isdigit() else f"{dev_path}{number}"
+    """/dev/sdb + 3 -> /dev/sdb3;  /dev/nvme0n1 + 3 -> /dev/nvme0n1p3.
+
+    Resolved first: an operator may name the stick as /dev/disk/by-id/usb-...,
+    whose partitions are ...-part3, not ...3. The kernel node is what carries
+    the pN / N suffix, so that is what the suffix is applied to.
+    """
+    real = os.path.realpath(dev_path)
+    return f"{real}p{number}" if real[-1:].isdigit() else f"{real}{number}"
 
 
 def _gpt_partition_numbers(x: Ctx, dev_path: str) -> set[int]:
@@ -5315,6 +5320,28 @@ def _gpt_partition_numbers(x: Ctx, dev_path: str) -> set[int]:
         if m:
             found.add(int(m.group(1)))
     return found
+
+
+def guard_second_device(x: Ctx, target: str) -> None:
+    """The guards a device gets before a partition is appended to it.
+
+    The image stick was just erased with the operator's consent. A device named
+    with --oem-device was not, so it gets the same three checks the image stick
+    got: removable (or --allow-fixed-disk), nothing mounted, and a question.
+    """
+    second = next((d for d in removable_devices() if d["dev"] == target), None)
+    if second is None and not getattr(x.args, "allow_fixed_disk", False):
+        raise Fatal(f"--oem-device {target} is not a removable device. "
+                    f"Refusing — a partition would be appended to it.\n"
+                    f"     If you are certain, pass --allow-fixed-disk.")
+    mounted = _mounted_partitions(target)
+    if mounted:
+        raise Fatal(f"{target} has mounted partitions "
+                    f"({', '.join(mounted)}). Unmount them first.")
+    x.warn(f"A {OEM_LABEL} partition will be APPENDED to {target}"
+           + (f"  ({second['size'] / 1e9:.1f} GB {second['model']})" if second else ""))
+    if not confirmed(x, f"Append a partition to {target}?"):
+        raise Fatal("aborted")
 
 
 def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:

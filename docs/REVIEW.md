@@ -142,7 +142,23 @@ ones needed a code change to pass; they were simply never asked.
 Neither script has been run end to end on real hardware, and that is the one
 thing no amount of tooling closes. What changed is that the failures waiting
 there are now hardware failures rather than failures that a careful reading of
-upstream would have predicted.
+upstream would have predicted. Specifically, the first real boot is what
+decides these, and each was chosen because it is what upstream's own code
+says — not because it was observed working:
+
+- GRUB selecting the `qubes-oem` entry by default when a `QUBES_OEM` label is
+  present, on both BIOS and UEFI, exactly as `grub2-bios.cfg` and
+  `grub2-efi.cfg` on `release4.3` say it will.
+- Anaconda accepting `user --name=investigator --groups=wheel --lock` with no
+  `rootpw` line as a complete user configuration (a locked administrator in
+  `wheel`), in both the unattended and the manual path.
+- `sgdisk -e` plus an appended partition on a stick written from a **real**
+  Qubes ISO leaving BIOS boot intact. It was measured on a synthetic hybrid
+  image with the same structure; the real image is larger and its GPT is
+  xorriso's, not sgdisk's.
+- The dom0 package set carried into the install-time kickstart from the
+  compose kickstart's `%packages` producing the same installed system as an
+  interactive install of the same ISO.
 
 ---
 

@@ -180,6 +180,51 @@ def main() -> int:
                   == "/dev/sdb3")
             check("partition_node handles nvme",
                   bi.partition_node("/dev/nvme0n1", 3) == "/dev/nvme0n1p3")
+            # An operator may name the stick by its stable id. The suffix
+            # belongs on the kernel node the link resolves to, not on the link:
+            # /dev/disk/by-id/usb-X3 does not exist, /dev/sdb3 does.
+            link = work / "usb-Vendor_Model_SERIAL-0:0"
+            link.symlink_to("/dev/sdb")
+            check("partition_node resolves a by-id style symlink first",
+                  bi.partition_node(str(link), 3) == "/dev/sdb3",
+                  bi.partition_node(str(link), 3))
+
+            # 5b. A second device named with --oem-device gets the guards the
+            #     image stick got: removable, nothing mounted, confirmed.
+            from unittest import mock
+            g = ctx(work, "ext4")
+            with mock.patch.object(bi, "removable_devices", return_value=[]), \
+                    mock.patch.object(bi, "_mounted_partitions", return_value=[]):
+                try:
+                    bi.guard_second_device(g, "/dev/sdz")
+                except bi.Fatal as exc:
+                    check("a non-removable --oem-device is refused",
+                          "not a removable device" in str(exc), str(exc))
+                else:
+                    raise AssertionError("fixed disk accepted as --oem-device")
+            stick = [{"dev": "/dev/sdz", "size": 8e9, "model": "Stick"}]
+            with mock.patch.object(bi, "removable_devices", return_value=stick), \
+                    mock.patch.object(bi, "_mounted_partitions", return_value=["/dev/sdz1"]):
+                try:
+                    bi.guard_second_device(g, "/dev/sdz")
+                except bi.Fatal as exc:
+                    check("a mounted --oem-device is refused", "mounted" in str(exc))
+                else:
+                    raise AssertionError("mounted device accepted as --oem-device")
+            with mock.patch.object(bi, "removable_devices", return_value=stick), \
+                    mock.patch.object(bi, "_mounted_partitions", return_value=[]), \
+                    mock.patch.object(bi, "confirmed", return_value=False):
+                try:
+                    bi.guard_second_device(g, "/dev/sdz")
+                except bi.Fatal as exc:
+                    check("declining the question aborts", "aborted" in str(exc))
+                else:
+                    raise AssertionError("append proceeded without confirmation")
+            with mock.patch.object(bi, "removable_devices", return_value=stick), \
+                    mock.patch.object(bi, "_mounted_partitions", return_value=[]), \
+                    mock.patch.object(bi, "confirmed", return_value=True):
+                bi.guard_second_device(g, "/dev/sdz")
+                check("a removable, unmounted, confirmed device passes", True)
 
             # 6. An unsupported filesystem is refused before anything is
             #    written, rather than producing a stick with no label.
