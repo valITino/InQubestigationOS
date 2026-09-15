@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import string
 import subprocess
 import sys
@@ -41,7 +42,7 @@ from typing import Callable
 # ===========================================================================
 DEFAULT_CONFIG: dict = {
     "image_name": "InQubestigationOS",
-    "image_version": "2.3",
+    "image_version": "2.4",
     "expect_qubes_release": "4.3",
 
     # Base templates. Verified against qubes-release release4.3 comps-dom0.xml,
@@ -247,6 +248,18 @@ CONF_PATH = Path(__file__).resolve().parent / "golden-image.json"
 # phases can be exercised end to end on a machine that is not Qubes — which is
 # what makes the acceptance claims in docs/REVIEW.md reproducible in CI.
 DOM0_ROOT = Path(os.environ.get("GOLDEN_IMAGE_DOM0_ROOT", "/"))
+# Where the installer leaves the template RPMs and the VM kernels; the
+# wizard's TEMPLATES_RPM_PATH and SetupDefaultKernel read the same two.
+TEMPLATE_RPM_DIR = DOM0_ROOT / "var/lib/qubes/template-packages"
+VM_KERNEL_DIR = DOM0_ROOT / "var/lib/qubes/vm-kernels"
+
+
+def version_key(text: str) -> list:
+    """Order like LooseVersion, which the wizard uses for kernel names: runs of
+    digits compare as numbers, everything else as text, and the two never
+    compare against each other (LooseVersion raises there; this does not)."""
+    return [(0, int(part)) if part.isdigit() else (1, part)
+            for part in re.findall(r"\d+|[^\d.\-]+", text)]
 TEST_ROOT = DOM0_ROOT != Path("/")
 
 
@@ -974,8 +987,8 @@ an escrow record that no longer matches.
                    "libreoffice libreoffice-l10n-de libreoffice-help-de "
                    "hunspell-de-ch hyphen-de thunderbird keepassxc gimp vlc "
                    "pdfarranger p7zip-full unzip curl ca-certificates gnupg "
-                   # dnsutils so acceptance group 7 can actually test the
-                   # enforced DNS path instead of warning that dig is absent.
+                   # dnsutils for the investigator; the acceptance probes no
+                   # longer depend on dig.
                    "dnsutils")
             o.ok(f"{self.t['personal']} payload installed")
 
@@ -1032,8 +1045,8 @@ an escrow record that no longer matches.
             o.warn("When that key expires you must re-add it manually — monthly checklist.")
             r.qwrite(self.t["ids"], "/etc/apt/sources.list.d/security:zeek.list",
                      z["repo_line"])
-            r.qrun(self.t["ids"],
-                   f"curl -fsSL {shlex.quote(z['key_url'])} | gpg --dearmor "
+            self._qrun_net(self.t["ids"],
+                   f"__CURL__ {shlex.quote(z['key_url'])} | gpg --dearmor "
                    f"> {shlex.quote(z['keyring_path'])} && chmod 644 {shlex.quote(z['keyring_path'])}")
             self._verify_keyring(self.t["ids"], z["keyring_path"],
                                  z.get("key_fpr", ""), "Zeek OBS")
@@ -1047,6 +1060,7 @@ an escrow record that no longer matches.
             o.skip(f"{self.t['kali']} payload (baked in)")
         else:
             self._install_kali()
+        self._commit_templates()
         self._mark(4)
 
     def _install_kali(self):
@@ -1055,8 +1069,8 @@ an escrow record that no longer matches.
         o.info(f"{tpl}: Kali archive keyring")
         r.qrun(tpl, "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                     "apt-get install -y curl ca-certificates gnupg")
-        r.qrun(tpl, f"curl -fsSL {shlex.quote(k['keyring_url'])} -o "
-                    f"{shlex.quote(k['keyring_path'])} && chmod 644 {shlex.quote(k['keyring_path'])}")
+        self._qrun_net(tpl, f"__CURL__ {shlex.quote(k['keyring_url'])} -o "
+                            f"{shlex.quote(k['keyring_path'])} && chmod 644 {shlex.quote(k['keyring_path'])}")
 
         if not self.args.dry_run:
             # --with-colons is the machine-readable form: one record per line,
@@ -1100,15 +1114,29 @@ an escrow record that no longer matches.
                     o.warn("This normally means the keyring file was regenerated "
                            "upstream. Re-verify and update kali.keyring_sha1.")
 
-        o.info(f"{tpl}: kali-rolling repository, pinned below Debian")
+        # The recipe of the upstream qubes-template-kali component
+        # (kali/04_install_qubes_post.sh, which builds `dist: trixie, flavor:
+        # kali`): add the repository, dist-upgrade so the template BECOMES
+        # Kali rolling, then pin Kali at 1001 and install with
+        # --allow-downgrades so the metapackage's dependencies can step down
+        # where trixie carries a newer build. The previous recipe pinned Kali
+        # at 100 below Debian and asked apt for `-t kali-rolling`, which is
+        # not what upstream does and is not a tree apt is expected to resolve
+        # for kali-linux-default. apt options as builder-debian's vars.sh
+        # (APT_GET_OPTIONS: --force-confnew --yes).
+        o.info(f"{tpl}: kali-rolling repository; dist-upgrade to Kali, as the "
+               "upstream template does")
         r.qwrite(tpl, "/etc/apt/sources.list.d/kali.list", k["repo_line"])
-        r.qwrite(tpl, "/etc/apt/preferences.d/99-kali-pin",
-                 "Package: *\nPin: release o=Debian\nPin-Priority: 900\n\n"
-                 "Package: *\nPin: release o=Kali\nPin-Priority: 100\n")
-        r.qrun(tpl, f"export DEBIAN_FRONTEND=noninteractive; apt-get update && "
-                    f"apt-get install -y -t kali-rolling "
-                    f"{shlex.quote(k['metapackage'])} maltego")
-        o.ok(f"{tpl}: {k['metapackage']} and Maltego installed")
+        r.qrun(tpl, "rm -f /etc/apt/preferences.d/99-kali-pin")
+        self._qrun_net(tpl, "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
+                            "apt-get -o Dpkg::Options::=--force-confnew -y dist-upgrade")
+        r.qwrite(tpl, "/etc/apt/preferences.d/allow-downgrade",
+                 "Package: *\nPin: release o=Kali\nPin-Priority: 1001\n")
+        self._qrun_net(tpl, "export DEBIAN_FRONTEND=noninteractive; "
+                            "apt-get install -o Dpkg::Options::=--force-confnew -y "
+                            f"--allow-downgrades kali-menu {shlex.quote(k['metapackage'])} "
+                            "maltego && apt-get -y autoremove")
+        o.ok(f"{tpl}: kali-menu, {k['metapackage']} and Maltego installed")
         o.info("Maltego licence activation is per-qube (lives in /home), not in the template")
 
     # =======================================================================
@@ -1120,9 +1148,9 @@ an escrow record that no longer matches.
                          "apt-get install -y gnupg apt-transport-https curl ca-certificates")
         # curl -f: an HTTP error page must abort, not get piped into gpg as if
         # it were a key. curl -s alone exits 0 on a 404.
-        self.r.qrun(tpl, f"curl -fsSL {shlex.quote(w['key_url'])} | gpg --no-default-keyring "
-                         f"--keyring gnupg-ring:{shlex.quote(w['keyring_path'])} --import && "
-                         f"chmod 644 {shlex.quote(w['keyring_path'])}")
+        self._qrun_net(tpl, f"__CURL__ {shlex.quote(w['key_url'])} | gpg --no-default-keyring "
+                            f"--keyring gnupg-ring:{shlex.quote(w['keyring_path'])} --import && "
+                            f"chmod 644 {shlex.quote(w['keyring_path'])}")
         self._verify_wazuh_key(tpl, w["keyring_path"])
         self.r.qwrite(tpl, "/etc/apt/sources.list.d/wazuh.list", w["apt_repo_line"])
         self.r.qrun(tpl, "apt-get update")
@@ -1167,7 +1195,10 @@ an escrow record that no longer matches.
                       f"gpgkey={w['key_url']}\nenabled=1\n"
                       "name=Wazuh repository\n"
                       f"baseurl={w['yum_baseurl']}\npriority=1\n")
-        self.r.qrun(tpl, f"rpm --import {shlex.quote(w['key_url'])}")
+        # rpm fetches a URL itself, without the update proxy, which a template
+        # cannot reach the network without. Fetch through the proxy, import the file.
+        self._qrun_net(tpl, f"__CURL__ {shlex.quote(w['key_url'])} -o /tmp/wazuh-key.gpg && "
+                            "rpm --import /tmp/wazuh-key.gpg && rm -f /tmp/wazuh-key.gpg")
         fpr = (w.get("key_fpr") or "").strip().upper()
         if fpr and not self.args.dry_run:
             # rpm stores imported keys as gpg-pubkey-<short id>-<release>.
@@ -1285,6 +1316,7 @@ an escrow record that no longer matches.
             o.info(f"agents pinned at {w['version']}. Upgrade order when the time comes:")
             o.info("  wazuh-srv FIRST, then release the holds and upgrade agents.")
             o.info("  An agent newer than the manager is unsupported and stops reporting.")
+        self._commit_templates()
         self._mark(5)
 
     # =======================================================================
@@ -1356,40 +1388,103 @@ an escrow record that no longer matches.
     # =======================================================================
     #  7 — chain configuration
     # =======================================================================
-    def _qrun_apt(self, tpl: str, script: str) -> None:
-        """Run an apt operation in a template, working around the update proxy.
+    # The Qubes update proxy as a template sees it. Templates have no netvm:
+    # apt reaches the network only because Qubes writes
+    #     Acquire::http::Proxy "http://127.0.0.1:8082/";
+    # into /etc/apt/apt.conf.d/01qubes-proxy at boot (qubes-core-agent-linux,
+    # network/update-proxy-configs). curl reads no such file, so a bare curl in
+    # a template fails with "could not resolve host" — every keyring fetch here
+    # used to be exactly that. tinyproxy relays CONNECT to ports 443 and 873
+    # (network/tinyproxy-updates.conf), which covers every URL fetched here.
+    UPDATES_PROXY = "http://127.0.0.1:8082"
+    CURL = f"curl --proxy {UPDATES_PROXY} -fsSL"
 
-        Templates reach the network through the Qubes update proxy over qrexec,
-        and some HTTPS repositories fail through it with a CONNECT error. The
-        documented workaround is to give the template a netvm for the duration
-        and clear it afterwards. That was a note telling the operator to do it
-        by hand; this does it, and always puts the netvm back.
+    def _qrun_net(self, tpl: str, script: str) -> None:
+        """Run a network-using command in a template, through the update proxy.
+
+        `__CURL__` in the script expands to a curl that goes through the proxy;
+        apt already does. If that fails, one retry the documented way: a
+        temporary netvm. A netvm alone is not enough, because 01qubes-proxy is
+        regenerated at every boot while the updates-proxy-setup service is on
+        and apt would still be forced through the proxy, so the service is
+        disabled for the duration as well, the template restarted, and both
+        put back — always, whether or not the retry worked. sys-proxy is the
+        netvm of choice; before phase 6 has created it, the stock sys-firewall.
         """
         o, r = self.out, self.r
         try:
-            r.qrun(tpl, script)
+            r.qrun(tpl, script.replace("__CURL__", self.CURL))
             return
         except Fatal:
             pass
-        o.warn(f"{tpl}: apt failed through the update proxy — retrying with a "
-               f"temporary netvm")
-        before = r.run("qvm-prefs", tpl, "netvm", check=False, capture=True).strip()
+        netvm = self.q["proxy"] if r.vm_exists(self.q["proxy"]) else self.q["firewall"]
+        if not r.vm_exists(netvm):
+            raise Fatal(f"{tpl}: network command failed through the update proxy "
+                        f"and no netvm exists to retry with\n     see {o.log_path}")
+        o.warn(f"{tpl}: failed through the update proxy — retrying once with a "
+               f"temporary netvm ({netvm}) and the proxy setup disabled")
+        before_net = r.run("qvm-prefs", tpl, "netvm", check=False, capture=True).strip()
+        had_svc = r.quiet("qvm-features", tpl, "service.updates-proxy-setup")
+        before_svc = r.run("qvm-features", tpl, "service.updates-proxy-setup",
+                           check=False, capture=True).strip() if had_svc else ""
         try:
-            r.run("qvm-prefs", tpl, "netvm", self.q["proxy"])
-            r.shutdown(tpl)
+            r.run("qvm-service", "--disable", tpl, "updates-proxy-setup")
+            r.run("qvm-prefs", tpl, "netvm", netvm)
+            if not r.shutdown(tpl):
+                raise Fatal(f"{tpl} did not shut down for the retry")
             r.ensure_running(tpl)
-            r.qrun(tpl, script)
+            r.qrun(tpl, script.replace("__CURL__", "curl -fsSL"))
             o.ok(f"{tpl}: succeeded with a temporary netvm")
         finally:
-            # Always. A template left attached to the network is a template that
-            # is no longer isolated, and that must not depend on the retry
+            # Always. A template left on the network, or with its proxy setup
+            # off, is no longer isolated, and that must not depend on the retry
             # having worked.
             r.run("qvm-prefs", tpl, "netvm",
-                  before if before and before.lower() not in ("", "none") else "none",
+                  before_net if before_net and before_net.lower() != "none" else "none",
                   check=False)
+            if had_svc:
+                r.run("qvm-features", tpl, "service.updates-proxy-setup", before_svc,
+                      check=False)
+            else:
+                r.run("qvm-features", "--delete", tpl, "service.updates-proxy-setup",
+                      check=False)
             r.shutdown(tpl)
-            o.info(f"{tpl}: netvm restored to "
-                   f"{before or 'none'}")
+            o.info(f"{tpl}: netvm restored to {before_net or 'none'}, "
+                   f"update-proxy setup restored")
+
+    _qrun_apt = _qrun_net
+
+    def _commit_templates(self) -> None:
+        """Shut every template down so what was just installed is what the
+        qubes based on it will boot.
+
+        A template-based qube boots from the template's root volume as it was
+        at the template's last shutdown, not as it is while the template runs.
+        Phases 4 and 5 install into running templates and used to leave them
+        running, so the chain qubes phase 6 created started from a root that
+        had none of it — no Squid, no Suricata, no agent — and phase 12 then
+        tested that.
+        """
+        o, r = self.out, self.r
+        names = [self.t[k] for k in ("sys", "proxy", "ids", "kali", "personal", "wazuh")]
+        names.append(self.c["base_debian"])
+        if self.c["use_fedora_template"]:
+            names.append(self.c["base_fedora"])
+        names = [n for n in dict.fromkeys(names) if r.vm_exists(n)]
+        if self.args.dry_run:
+            o.info(f"[dry-run] shut down {', '.join(names)} so what was installed "
+                   "is committed for the qubes based on them")
+            return
+        # Unconditionally, not only for templates seen running: qvm-shutdown
+        # of a halted qube is a no-op, and shutdown() answers with whether the
+        # qube is stopped afterwards, which is the fact that matters.
+        stuck = [n for n in names if not r.shutdown(n)]
+        if stuck:
+            raise Fatal(f"still running after qvm-shutdown --wait: {', '.join(stuck)}\n"
+                        "     Qubes based on them would boot the OLD root. Stop them "
+                        "(qvm-shutdown --wait --force <template>) and re-run.")
+        o.ok("templates shut down — their changes are committed for the qubes "
+             "based on them")
 
     def _install_timer(self, tpl: str, name: str, description: str,
                        script_path: str, oncalendar: str, body: str,
@@ -1860,6 +1955,8 @@ WantedBy=multi-user.target
         # was already up never re-read any of it — and phase 12 then tested an
         # unconfigured system and passed it. Cycle the chain here so what the
         # acceptance tests measure is what will actually be running.
+        # The timers above were installed into TEMPLATES; commit those first.
+        self._commit_templates()
         self._restart_chain()
         self._mark(7)
 
@@ -2721,18 +2818,27 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         r.ensure_running(vm)
         r.qwrite(vm, "/rw/config/qubes-bind-dirs.d/50_golden_wazuh.conf",
                  "binds+=( '/var/ossec' )\n")
-        # bind-dirs copies the template's copy into /rw/bind-dirs on first use.
-        # If the path does not already exist there, that copy fails and the
-        # agent silently loses its identity on every reboot. Seed it explicitly.
-        r.qrun(vm, "mkdir -p /rw/bind-dirs/var && "
-                   "if [ ! -d /rw/bind-dirs/var/ossec ] && [ -d /var/ossec ]; then "
-                   "  cp -a /var/ossec /rw/bind-dirs/var/ossec; fi", check=False)
         if self.args.dry_run:
             o.info(f"[dry-run] enroll {vm} via {via} -> {target}")
             return
         if not r.qtest(vm, "test -d /var/ossec"):
             o.warn(f"{vm}: agent not present — enroll later")
             return
+        # Apply the bind NOW, before anything is written under /var/ossec, the
+        # way Qubes' own bind-dirs.sh does it at boot (qubes-core-agent-linux
+        # vm-systemd/bind-dirs.sh): copy /var/ossec to /rw/bind-dirs/var/ossec
+        # if that does not exist yet, then bind-mount it over /var/ossec. The
+        # old code only seeded the copy and then wrote the key and the manager
+        # address into the UNMOUNTED /var/ossec — the volatile root — so every
+        # reboot came back with the pristine, never-enrolled copy.
+        r.qrun(vm, "set -e; systemctl stop wazuh-agent 2>/dev/null || true; "
+                   "if [ ! -d /rw/bind-dirs/var/ossec ]; then "
+                   "mkdir -p /rw/bind-dirs/var && cp -a /var/ossec /rw/bind-dirs/var/ossec; "
+                   "fi; mountpoint -q /var/ossec || "
+                   "mount --bind -o x-gvfs-hide /rw/bind-dirs/var/ossec /var/ossec")
+        if not r.qtest(vm, "mountpoint -q /var/ossec"):
+            raise Fatal(f"{vm}: /var/ossec is not a bind mount from /rw — the agent's "
+                        f"enrollment would not survive a reboot\n     see {o.log_path}")
         # Over stdin, not on the command line: qvm-run puts its argument in the
         # argv of a process INSIDE the target qube, and /proc/<pid>/cmdline is
         # world-readable there. The enrollment secret would have been visible to
@@ -2749,12 +2855,21 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         # boot, on every qube, silently. /rw/config/rc.local is the persistent
         # place, so the agent is started from there instead. (The unit itself
         # lives in the template, where it belongs.)
+        # Sourced by rc.local, so no `exit` in here. The marker is what
+        # --case-mode anonymous leaves behind: the `systemctl mask` it also
+        # applies lives in the volatile root and is gone at the next boot,
+        # and without this check the agent came back — silently, mid-case.
         self._rc_hook(vm, "golden-image-agent.sh",
                       "#!/bin/sh\n"
-                      "# Golden image — start the SIEM agent.\n"
+                      "# Golden image — start the SIEM agent, unless a case has silenced it.\n"
                       "# 'systemctl enable' does not survive an AppVM reboot; this does.\n"
-                      "systemctl start wazuh-agent\n")
-        r.qrun(vm, "systemctl start wazuh-agent", check=False)
+                      "if [ -e /rw/config/golden-agent-masked ]; then\n"
+                      "    systemctl mask wazuh-agent 2>/dev/null\n"
+                      "else\n"
+                      "    systemctl start wazuh-agent\n"
+                      "fi\n")
+        r.qrun(vm, "[ -e /rw/config/golden-agent-masked ] || systemctl start wazuh-agent",
+               check=False)
         o.ok(f"{vm} enrolled via {via} -> {target}")
 
     def p11(self):
@@ -2804,6 +2919,20 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
     # =======================================================================
     #  12 — acceptance tests
     # =======================================================================
+    @staticmethod
+    def _dns_probe(resolver: str) -> str:
+        """One A query for example.com to `resolver`, exit 0 only if a DNS
+        response carrying the same ID comes back within three seconds."""
+        code = (
+            "import socket,sys\n"
+            "q=b'\\x5a\\x5a\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00'"
+            "+b'\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01'\n"
+            "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(3)\n"
+            f"s.sendto(q,({resolver!r},53))\n"
+            "d,_=s.recvfrom(512)\n"
+            "sys.exit(0 if d[:2]==q[:2] and d[2]&0x80 else 1)\n")
+        return f"timeout 8 python3 -c {shlex.quote(code)}"
+
     def _t(self, kind: str, msg: str):
         sym = {"pass": (Out.G, "\u2713 PASS"), "fail": (Out.R, "\u2717 FAIL"),
                "warn": (Out.Y, "~ WARN")}[kind]
@@ -2959,38 +3088,43 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if getattr(self.args, "offline_checks", False):
             self._t("warn", "PENDING ONLINE: DNS resolution and interception require network")
         else:
+            # The interception probes run from a qube WITHOUT the phase-9
+            # egress rules. personal and work carry `accept specialtarget=dns`
+            # then drop, and Qubes enforces those in the qube's netvm: a query
+            # from them to any resolver but their own is dropped in sys-proxy
+            # before it can reach the dnat in sys-firewall, so probing from
+            # personal failed a working chain. kali-clear and untrusted sit on
+            # the same chain with no per-qube rules — which is also where a
+            # tool with a hardcoded resolver would actually be running.
+            probe_vm = next((v for v in (q["kali_clear"], "untrusted")
+                             if r.vm_exists(v)), None)
+            if probe_vm is None:
+                self._t("fail", "neither kali-clear nor untrusted exists, so DNS "
+                                "interception cannot be probed from an unrestricted qube")
+            else:
+                r.ensure_running(probe_vm)
+                # A raw query from python3, which every Qubes template carries,
+                # rather than dig, which only some do. A WORKING intercept
+                # answers a query to an unrouted resolver locally: 192.0.2.1 is
+                # TEST-NET-1, guaranteed unrouted, so an answer from it can only
+                # have come from the redirect.
+                captured = r.qtest(probe_vm, self._dns_probe("192.0.2.1"),
+                                   dry_default=False)
+                self._t("pass" if captured else "fail",
+                        f"every port-53 query from {probe_vm} is captured, whatever "
+                        "resolver the client asks for" if captured else
+                        f"a query from {probe_vm} to an unrouted resolver was not "
+                        "intercepted — a client with a hardcoded resolver escapes "
+                        "the enforced path")
+                answered = r.qtest(probe_vm, self._dns_probe("8.8.8.8"),
+                                   dry_default=False)
+                self._t("pass" if answered else "warn",
+                        "8.8.8.8 is answered by the enforced resolver, not by Google"
+                        if answered else
+                        "queries addressed to 8.8.8.8 get no answer at all — "
+                        "check unbound in " + q["firewall"])
             if r.vm_exists("personal"):
                 r.ensure_running("personal")
-                if not r.qtest("personal", "command -v dig >/dev/null"):
-                    # dnsutils is in the office template's package list precisely so
-                    # this cannot happen; if it is missing, the group proves nothing
-                    # and saying so as a warning would let it pass.
-                    self._t("fail", "dig is not installed in personal, so DNS "
-                                    "enforcement cannot be tested at all — install "
-                                    "dnsutils in " + self.t["personal"])
-                else:
-                    # The old test read 'dig @8.8.8.8 exited 0' as 'the packet
-                    # reached Google'. It does not: a WORKING intercept answers that
-                    # query locally, so correct enforcement scored FAIL and a missing
-                    # dig scored PASS. Assert capture directly instead — 192.0.2.1 is
-                    # TEST-NET-1, guaranteed unrouted, so an answer from it can only
-                    # have come from the local redirect.
-                    captured = r.quiet(
-                        "qvm-run", "--no-gui", "personal",
-                        "timeout 8 dig +short +time=3 +tries=1 @192.0.2.1 example.com")
-                    self._t("pass" if captured else "fail",
-                            "every port-53 query is captured, whatever resolver the "
-                            "client asks for" if captured else
-                            "a query to an unrouted resolver was not intercepted — "
-                            "a client with a hardcoded resolver escapes the enforced path")
-                    answered = r.quiet(
-                        "qvm-run", "--no-gui", "personal",
-                        "timeout 8 dig +short +time=3 +tries=1 @8.8.8.8 example.com")
-                    self._t("pass" if answered else "warn",
-                            "8.8.8.8 is answered by the enforced resolver, not by Google"
-                            if answered else
-                            "queries addressed to 8.8.8.8 get no answer at all — "
-                            "check unbound in " + q["firewall"])
                 # A fail, not a warn: warnings never block, and this is the only
                 # end-to-end check that the enforced DNS path works at all. A
                 # workstation that resolves nothing used to pass phase 12.
@@ -3806,17 +3940,39 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                         "from the GUI, then re-run the provisioner.")
         wanted = list(self.c["initial_setup_states"])
         if self.args.dry_run:
+            o.info(f"[dry-run] qvm-template install --nogpgcheck each RPM in "
+                   f"{TEMPLATE_RPM_DIR}; qubes-prefs default-kernel, default-template")
+            o.info("[dry-run] qubesctl saltutil.clear_cache; saltutil.sync_all")
             for st in wanted:
-                o.info(f"[dry-run] qubesctl state.sls {st}")
+                o.info(f"[dry-run] qubesctl top.enable {st}")
+            o.info("[dry-run] qubesctl --all state.highstate; top.disable each; "
+                   "qubes-prefs default-netvm/updatevm sys-firewall, clockvm sys-net")
             return 0
 
-        # Which of them this release actually ships. Applying a state that does
-        # not exist fails in a way that reads like a broken machine.
+        # The wizard's own order (qubes-anaconda-addon,
+        # org_qubes_os_initial_setup/service/tasks.py): install the template
+        # RPMs the installer left in /var/lib/qubes/template-packages, pick the
+        # newest VM kernel, set the default template, THEN the salt states.
+        # Without the templates there is nothing to base sys-net on and every
+        # state fails; the old code went straight to the states.
+        self._install_shipped_templates()
+        self._set_default_kernel()
+        base = self.c["base_debian"]
+        if not r.vm_exists(base):
+            raise Fatal(f"template {base} is not installed and no RPM for it was in "
+                        f"{TEMPLATE_RPM_DIR}. Complete initial setup from the GUI, "
+                        "or install it with qvm-template, then re-run.")
+        r.run("qubes-prefs", "default-template", base)
+        o.ok(f"default-template {base}")
+
+        # Refresh the minion so every installed formula is seen, then enable
+        # the top files. Enabling one this release does not ship fails, and is
+        # skipped, rather than being applied blind.
+        r.run("qubesctl", "saltutil.clear_cache", check=False)
+        r.run("qubesctl", "saltutil.sync_all", check=False)
         available = []
         for st in wanted:
-            if r.quiet("qubesctl", "top.enable", st, "--show-output"):
-                available.append(st)
-            elif r.quiet("qubesctl", "state.show_sls", st):
+            if r.quiet("qubesctl", "top.enable", st):
                 available.append(st)
             else:
                 o.warn(f"salt state {st} not present on this release — skipping")
@@ -3824,12 +3980,20 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             raise Fatal("none of the configured initial-setup states exist on "
                         "this machine. Complete initial setup from the GUI.")
 
+        # One highstate over everything enabled, exactly as the wizard runs
+        # it, then the top files are disabled again so they do not interfere
+        # with later changes (the wizard's own reasoning).
+        o.info(f"applying {', '.join(available)} with one highstate — this starts "
+               "qubes and takes a while")
         failed = []
+        try:
+            r.run("qubesctl", "--all", "state.highstate", timeout=r.timeout_long)
+        except Fatal:
+            failed.extend(available)
+            o.warn("qubesctl --all state.highstate reported failures — "
+                   "see /var/log/salt/minion")
         for st in available:
-            o.info(f"applying {st}")
-            if not r.quiet("qubesctl", "--show-output", "state.sls", st):
-                failed.append(st)
-                o.warn(f"{st} did not apply cleanly")
+            r.run("qubesctl", "top.disable", st, check=False)
         # Trust qvm-check, not salt's exit code.
         expect = {"qvm.sys-net": self.q["net"], "qvm.sys-firewall": self.q["firewall"],
                   "qvm.sys-usb": self.q["usb"], "qvm.personal": "personal",
@@ -3848,8 +4012,65 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                         "Complete it from the GUI and re-run.")
         if failed:
             o.warn(f"states with problems: {', '.join(sorted(set(failed)))}")
+
+        # The wizard's last task: wire the defaults and start the network.
+        # Without these qubes-prefs still says none and every qube created
+        # afterwards is offline.
+        r.run("qvm-prefs", self.q["firewall"], "netvm", self.q["net"], check=False)
+        r.run("qubes-prefs", "default-netvm", self.q["firewall"])
+        r.run("qubes-prefs", "updatevm", self.q["firewall"])
+        r.run("qubes-prefs", "clockvm", self.q["net"])
+        if r.vm_exists("default-dvm"):
+            r.run("qubes-prefs", "default-dispvm", "default-dvm", check=False)
+        r.run("qvm-start", "--skip-if-running", self.q["firewall"], check=False)
+        o.ok(f"default-netvm and updatevm {self.q['firewall']}, clockvm {self.q['net']}")
         o.ok("initial setup complete — the provisioner can run now")
         return 0
+
+    def _install_shipped_templates(self) -> None:
+        """Install every template RPM the installer left behind, the way the
+        wizard's InstallTemplateTask does: `qvm-template install --nogpgcheck
+        <rpm>`. The RPMs came off the verified ISO, which is why the wizard
+        skips the gpg check for them too. Idempotent: an installed template
+        is skipped, so a retried first boot does not fail here."""
+        o, r = self.out, self.r
+        rpms = sorted(TEMPLATE_RPM_DIR.glob("*.rpm"))
+        if not rpms:
+            o.info(f"no template RPMs in {TEMPLATE_RPM_DIR} — the wizard already "
+                   "installed them, or the ISO shipped none")
+            return
+        for rpm in rpms:
+            name = r.run("rpm", "-qp", "--qf", "%{NAME}", str(rpm), capture=True).strip()
+            tpl = name[len("qubes-template-"):] if name.startswith("qubes-template-") else name
+            if not tpl:
+                raise Fatal(f"could not read the package name of {rpm}")
+            if r.vm_exists(tpl):
+                o.skip(f"template {tpl} — already installed")
+                continue
+            o.info(f"installing template {tpl} from {rpm.name}")
+            r.run("qvm-template", "install", "--nogpgcheck", str(rpm),
+                  timeout=r.timeout_long)
+            if not r.vm_exists(tpl):
+                raise Fatal(f"qvm-template install returned success but {tpl} "
+                            "does not exist")
+            o.ok(f"template {tpl} installed")
+        # The wizard's CleanTemplatePkgsTask: the RPMs are gigabytes and have
+        # done their job. Only once every one of them is installed.
+        shutil.rmtree(TEMPLATE_RPM_DIR)
+        o.info(f"removed {TEMPLATE_RPM_DIR}")
+
+    def _set_default_kernel(self) -> None:
+        """The wizard's SetupDefaultKernel task: the newest entry in
+        /var/lib/qubes/vm-kernels, compared as a version."""
+        o, r = self.out, self.r
+        names = [p.name for p in VM_KERNEL_DIR.iterdir()] if VM_KERNEL_DIR.is_dir() else []
+        names = [n for n in names if n[:1].isdigit()]
+        if not names:
+            o.warn(f"no VM kernels in {VM_KERNEL_DIR} — default-kernel left as it is")
+            return
+        newest = max(names, key=version_key)
+        r.run("qubes-prefs", "default-kernel", newest)
+        o.ok(f"default-kernel {newest}")
 
     def case_mode(self, mode: str) -> int:
         """Stop, or restart, SIEM telemetry from the Tor branch.
@@ -3877,14 +4098,20 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         for vm in targets:
             r.ensure_running(vm)
             if anon:
+                # The marker is what persists. `systemctl mask` writes into
+                # /etc/systemd/system, which an AppVM discards at shutdown,
+                # after which the rc.local hook used to start the agent again
+                # at the next boot, silently, in the middle of the case. The
+                # hook installed by phase 11 honours the marker.
+                r.qrun(vm, "touch /rw/config/golden-agent-masked")
                 r.qrun(vm, "systemctl stop wazuh-agent 2>/dev/null; "
                            "systemctl mask wazuh-agent", check=False)
-                # rc.local starts the agent on every boot; mask survives that.
-                o.ok(f"{vm}: agent stopped and masked")
+                o.ok(f"{vm}: agent stopped and masked, and stays off across reboots")
             else:
+                r.qrun(vm, "rm -f /rw/config/golden-agent-masked")
                 r.qrun(vm, "systemctl unmask wazuh-agent 2>/dev/null; "
-                           "systemctl start wazuh-agent", check=False)
-                o.ok(f"{vm}: agent unmasked and started")
+                           "[ -d /var/ossec ] && systemctl start wazuh-agent", check=False)
+                o.ok(f"{vm}: agent unmasked and started; the reboot marker is gone")
         rec = self.build_dir / "case-mode.log"
         case = getattr(self.args, "case", None) or ""
         with rec.open("a") as fh:
@@ -3930,13 +4157,13 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                 continue
             r.ensure_running(tpl)
             if how == "dearmor":
-                cmd = (f"curl -fsSL {shlex.quote(url)} | gpg --dearmor "
+                cmd = (f"__CURL__ {shlex.quote(url)} | gpg --dearmor "
                        f"> {shlex.quote(path)} && chmod 644 {shlex.quote(path)}")
             elif how == "raw":
-                cmd = (f"curl -fsSL {shlex.quote(url)} -o {shlex.quote(path)} && "
+                cmd = (f"__CURL__ {shlex.quote(url)} -o {shlex.quote(path)} && "
                        f"chmod 644 {shlex.quote(path)}")
             else:
-                cmd = (f"rm -f {shlex.quote(path)} && curl -fsSL {shlex.quote(url)} "
+                cmd = (f"rm -f {shlex.quote(path)} && __CURL__ {shlex.quote(url)} "
                        f"| gpg --no-default-keyring "
                        f"--keyring gnupg-ring:{shlex.quote(path)} --import && "
                        f"chmod 644 {shlex.quote(path)}")
@@ -3945,7 +4172,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             r.qrun(tpl, f"cp -a {shlex.quote(path)} {shlex.quote(path)}.prev "
                         f"2>/dev/null || true", check=False)
             try:
-                r.qrun(tpl, cmd)
+                self._qrun_net(tpl, cmd)
                 self._verify_keyring(tpl, path, fpr, label)
             except Fatal as e:
                 r.qrun(tpl, f"mv -f {shlex.quote(path)}.prev {shlex.quote(path)} "

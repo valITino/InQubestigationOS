@@ -1,5 +1,79 @@
 # Changelog
 
+## 2.4 — 2026-09-15
+
+A fourth pass, over the **whole codebase** rather than the quickstart: both
+tiers, all twelve provisioner phases and the lifecycle commands, read against
+the upstream code they depend on — qubes-core-agent-linux (the update proxy,
+bind-dirs), qubes-anaconda-addon (what initial setup actually does),
+fepitre/qubes-template-kali (how a Kali template is really built) and
+qubes-builderv2's template plugin. Detail in [docs/REVIEW.md](docs/REVIEW.md).
+
+**Fixed — would not have worked on the target (tier 1)**
+
+- Every repository key was fetched with a bare `curl` inside a template.
+  Templates have no netvm; apt only reaches the network because Qubes writes
+  the update-proxy address into apt's configuration, which curl never reads.
+  All fetches (Kali, Zeek, Wazuh, `--refresh-repo-keys`, the Fedora
+  `rpm --import`) now go through `http://127.0.0.1:8082`, and the temporary-
+  netvm retry that used to name a qube that does not exist yet also disables
+  the proxy setup for its duration and restores both.
+- Templates were left running after phases 4, 5 and 7 installed into them. A
+  qube boots the template's root as of the template's last shutdown, so the
+  chain qubes phase 6 created started with no Squid, no Suricata and no agent.
+  Every template is now shut down at the end of each of those phases, and
+  refusing to stop is fatal.
+- The Kali recipe pinned Kali below Debian and asked for `-t kali-rolling`.
+  Upstream's own template dist-upgrades the Debian template to Kali and pins
+  Kali at 1001 with `--allow-downgrades`; the provisioner now does the same,
+  and so does the tier-2 hook.
+- The agent's `/var/ossec` was seeded into `/rw/bind-dirs` but never mounted
+  before enrollment wrote into it, so every reboot came back with the
+  never-enrolled copy. The bind is applied first now, the way bind-dirs.sh
+  applies it at boot, and a missing mount is fatal.
+- `--initial-setup` applied salt states to a machine with no templates. It now
+  does what the wizard does, in the wizard's order: install the template RPMs
+  the ISO left behind, set the default kernel and template, one highstate,
+  then default-netvm/updatevm/clockvm.
+- Acceptance group 7 probed DNS interception from `personal`, whose own
+  firewall drops a query to any resolver but its own before the intercept can
+  see it — a working chain failed the test. The probe now runs from
+  `kali-clear` or `untrusted`, with a raw query from python3 rather than dig.
+- `--case-mode anonymous` masked the agent in the volatile root; the boot hook
+  restarted it at the next reboot, silently, mid-case. A marker in `/rw`
+  persists, the hook honours it, and `normal` removes it.
+
+**Fixed — would not have worked on the build host (tier 2)**
+
+- The generated flavor hooks were never placed where qubes-builderv2 looks
+  (`builder-debian/template_debian/<flavor>/`), so a tier-2 build produced
+  stock Debian under investigator names. They are copied there before the
+  build, with the keyring beside them and the appmenus lists in the content
+  directory, and the check now looks for the hook file, not the directory.
+- The hook's `FLAVORS_DIR` fallback expanded to `/`: builderv2 sets that
+  variable only for whonix, kicksecure and kali flavors and passes no
+  `BUILDER_DIR`/`SRC_DIR`. It is now the directory the hook lives in.
+- Three `|| error` guards in the hooks did not stop anything — builderv2's
+  `error()` only prints — so a missing keyring or a wrong fingerprint baked an
+  unverified template. They exit now, and the test runs the guard.
+- `all` at tier 1 spent hours building templates that nothing packed into the
+  ISO. It builds the ISO only; `templates` still builds them on request.
+- The release gate refused tier 1, the default; RELEASE.md's example lacked
+  the backup passphrase file the entry point requires.
+
+**Tests and docs**
+
+- The fake-dom0 harness now asserts on the recorded in-qube actions: proxied
+  fetches, template shutdown before chain configuration, the Kali sequence,
+  the bind mount before enrollment, case-mode markers, and a full
+  `--initial-setup` on a world with no templates. Orchestration checks run the
+  installed hook to prove where it finds its keys and that its guard exits.
+- docs/GUIDE.md had a table row where the gen-key command should have been, a
+  bash block spliced into a PowerShell fence and a section-8 paragraph cut
+  into section 7 since 2.1; repaired, and a document-structure check added so
+  it cannot recur. Timer count corrected to eight; `make` refuses a numeric
+  signing UID.
+
 ## 2.3 — 2026-09-14
 
 A third verification pass, this one against the **builder** rather than the

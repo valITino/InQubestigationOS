@@ -147,8 +147,9 @@ def main() -> int:
         raise Gate(f"approved release config missing: {a.config}")
     cfg = json.loads(a.config.read_text())
     fingerprint = a.signing_fingerprint.replace(" ", "").upper()
-    if cfg.get("tier") != 2 or cfg.get("iso_sign_key", "").upper() != fingerprint:
-        raise Gate("release config must set tier=2 and the approved signing fingerprint")
+    if cfg.get("tier") not in (1, 2) or cfg.get("iso_sign_key", "").upper() != fingerprint:
+        raise Gate("release config must set tier to 1 or 2 and the approved signing "
+                   "fingerprint")
     if str(cfg.get("work_dir")) != str(a.work_dir):
         raise Gate("release config work_dir does not match --work-dir")
     remote = str(cfg.get("component_remote", ""))

@@ -10,6 +10,12 @@ UID ?= Investigator Image Signing <cyber@example.invalid>
 DEVICE ?=
 RC_ARGS ?=
 
+# Some shells export UID as the numeric user id. A key whose identity is "1000"
+# would be created and backed up before anyone noticed, so refuse it here.
+ifeq ($(shell printf '%s' '$(UID)' | grep -Ec '^[0-9]+$$'),1)
+$(error UID is numeric ("$(UID)"); pass the signing identity, e.g. make key UID="Unit Image Signing <cyber@example.ch>")
+endif
+
 .PHONY: help
 help:  ## show this help
 	@awk 'BEGIN{FS=":.*##"; printf "\n  \033[1mInQubestigationOS\033[0m\n\n"} \

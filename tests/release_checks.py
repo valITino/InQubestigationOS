@@ -106,7 +106,16 @@ def main():
     # would mean the backup is protected by the signing passphrase.
     assert ("a.passphrase_file.resolve() == a.backup_passphrase_file.resolve()"
             in source), "the two passphrase files must be rejected if identical"
-    print("  30/30 release-candidate policy checks pass")
+    # Tier 1 is the default and the documented path; a release gate that only
+    # accepted tier 2 refused every default configuration, and RELEASE.md said
+    # so as if it were policy.
+    assert 'cfg.get("tier") not in (1, 2)' in source, "tier 1 must pass the release gate"
+    assert 'tier=2' not in source
+    assert "`tier` to `1` or `2`" in (ROOT / "docs/RELEASE.md").read_text()
+    # The documented RC_ARGS must carry every flag the parser requires.
+    release_doc = (ROOT / "docs/RELEASE.md").read_text()
+    assert "--backup-passphrase-file /run/user/$UID/iq-backup-session" in release_doc
+    print("  34/34 release-candidate policy checks pass")
     return 0
 
 

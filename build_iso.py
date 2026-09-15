@@ -801,7 +801,8 @@ def bootstrap(x: Ctx, args) -> int:
             ("check-upstream", "confirm the pinned keys and versions are current",
              ["check-upstream"]),
             ("plan", "print the whole build plan", ["--dry-run", "all"]),
-            ("build", "build the templates and the ISO", ["all"]),
+            ("build", "build the templates and the ISO" if int(x.c["tier"]) == 2
+             else "build the ISO", ["all"]),
         ]
         key_args: list[str] = []
         for option, value in (("--uid", args.uid), ("--use-key", args.use_key),
@@ -1070,11 +1071,15 @@ if [ "${VERBOSE:-0}" -ge 2 ] || [ "${DEBUG:-0}" == "1" ]; then
 fi
 
 if [ -z "${FLAVORS_DIR}" ]; then
-    # SRC_DIR already resolves to this component's source directory — keys/ and
-    # the flavor directories live directly under it. Appending the component
-    # name again named a directory that is never created, so the Kali keyring
-    # the build had just downloaded and verified could not be found.
-    FLAVORS_DIR="${BUILDER_DIR}/${SRC_DIR}"
+    # qubes-builderv2 sets FLAVORS_DIR only for the whonix, kicksecure and kali
+    # flavors (qubesbuilder/plugins/template/__init__.py); for any other Debian
+    # flavor it is unset, and BUILDER_DIR/SRC_DIR are not in the template
+    # Makefile's environment whitelist either, so the old fallback expanded to
+    # "/". This hook is installed at
+    # <builder-debian>/template_debian/<flavor>/04_install_qubes_post.sh with
+    # keys/ beside it (build_iso.py materialize_flavors), so the directory this
+    # file lives in is the answer.
+    FLAVORS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 [ -n "${SCRIPTSDIR}" ] && TEMPLATE_CONTENT_DIR="${SCRIPTSDIR}"
 [ -n "${INSTALLDIR}" ] && INSTALL_DIR="${INSTALLDIR}"
@@ -1103,7 +1108,7 @@ chroot_cmd bash -c "curl -fsSL '@WAZUH_KEY@' | gpg --no-default-keyring --keyrin
 # SIEM that watches the whole workstation; importing whatever came back from the
 # network and trusting it via signed-by= is not a check.
 chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{print toupper(\\$10)}' | grep -qxF '@WAZUH_KEY_FPR@'" \\
-    || error 'Wazuh signing key is not @WAZUH_KEY_FPR@ — refusing to bake an unverified key into the image'
+    || { error 'Wazuh signing key is not @WAZUH_KEY_FPR@ — refusing to bake an unverified key into the image'; exit 1; }
 echo '@WAZUH_REPO@' > "${INSTALL_DIR}/etc/apt/sources.list.d/wazuh.list"
 aptUpdate
 aptInstall wazuh-agent
@@ -1207,7 +1212,8 @@ aptInstall apt-transport-https ca-certificates curl gnupg
 installQubesRepo
 
 kali_signing_key_file="${{FLAVORS_DIR}}/keys/kali-archive-keyring.gpg"
-test -f "$kali_signing_key_file" || error "Kali keyring missing from the component"
+# error() in builderv2's functions.sh only prints; the exit is ours to do.
+test -f "$kali_signing_key_file" || {{ error "Kali keyring missing at $kali_signing_key_file"; exit 1; }}
 # /usr/share/keyrings, NOT /etc/apt/trusted.gpg.d: a key in trusted.gpg.d is a
 # GLOBAL anchor and apt will accept any repository signed by it, which defeats
 # the signed-by= scoping on the very next line.
@@ -1268,7 +1274,7 @@ echo '{z['repo_line']}' > "${{INSTALL_DIR}}/etc/apt/sources.list.d/security:zeek
 chroot_cmd mkdir -p /usr/share/keyrings
 chroot_cmd bash -c "curl -fsSL '{z['key_url']}' | gpg --dearmor > /usr/share/keyrings/security_zeek.gpg && chmod 644 /usr/share/keyrings/security_zeek.gpg"
 chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/security_zeek.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{{print toupper(\\$10)}}' | grep -qxF '{z['key_fpr']}'" \\
-    || error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'
+    || {{ error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'; exit 1; }}
 aptUpdate
 aptInstall {z['package']}
 uninstallQubesRepo
@@ -1843,12 +1849,15 @@ def verify_template_flavors(x: Ctx, names: list[str], strict: bool) -> None:
         x.info("builder-debian sources are not fetched yet; flavor content "
                "will be confirmed after the first template build")
         return
-    missing = [n for n in names if not template_flavor_content_dir(x, n).is_dir()]
+    # The hook itself, not the directory: an empty directory on the search
+    # path is exactly as stock as no directory.
+    missing = [n for n in names
+               if not (template_flavor_content_dir(x, n) / HOOK_NAME).is_file()]
     if not missing:
         x.ok(f"flavor content present for all {len(names)} templates "
              f"({base})")
         return
-    detail = "\n".join(f"       {template_flavor_content_dir(x, n)}"
+    detail = "\n".join(f"       {template_flavor_content_dir(x, n) / HOOK_NAME}"
                        for n in missing)
     message = (
         f"no flavor content for: {', '.join(missing)}\n"
@@ -1866,6 +1875,59 @@ def verify_template_flavors(x: Ctx, names: list[str], strict: bool) -> None:
     if strict:
         raise Fatal(message)
     x.warn(message)
+
+
+HOOK_NAME = "04_install_qubes_post.sh"
+
+
+def build_templates_locally(action: str, tier2: bool) -> bool:
+    """`templates` always builds them here; `all` only at tier 2. At tier 1 the
+    investigator templates are built on the target at first boot, so a local
+    build would spend hours producing RPMs that nothing packs into the ISO."""
+    return action == "templates" or (action == "all" and tier2)
+
+
+def materialize_flavors(x: Ctx, names: list[str]) -> None:
+    """Put the generated flavor content where qubes-builderv2 will look.
+
+    The template plugin searches TEMPLATE_FLAVOR_DIR, which for a Debian flavor
+    it sets to <sources>/builder-debian/template_debian/<flavor> and nothing
+    else (see template_flavor_content_dir). templateFile() in
+    plugins/template/scripts/functions.sh then finds
+    <that dir>/04_install_qubes_post.sh — the same lookup that finds
+    builder-debian's own xfce/02_install_groups_packages_installed.sh.
+    qubeize-image resolves appmenus from
+    ${APPMENUS_DIR:-$TEMPLATE_CONTENT_DIR}/appmenus_<dist>_<flavor>, and
+    APPMENUS_DIR is unset for these flavors. The component directory under
+    work_dir stays as the reviewable record; this copies it into place after
+    fetching builder-debian, which the template build depends on anyway.
+    """
+    x.info("fetching builder-debian sources (the template scripts live there)")
+    x.run("./qb", "-c", "builder-debian", "package", "fetch", cwd=x.builder, live=True)
+    base = template_flavor_content_dir(x, "flavor").parent
+    if not base.is_dir():
+        raise Fatal(f"{base} does not exist after fetching builder-debian — see {x.log}")
+    keys = x.component / "keys"
+    if not (keys / "kali-archive-keyring.gpg").is_file():
+        raise Fatal(f"{keys / 'kali-archive-keyring.gpg'} is missing — the Kali key "
+                    "fetch did not run")
+    dist = x.c["dist_codename"]
+    for n in names:
+        src_hook = x.component / n / HOOK_NAME
+        menus_src = x.component / f"appmenus_{dist}_{n}"
+        if not src_hook.is_file() or not menus_src.is_dir():
+            raise Fatal(f"generated component is incomplete for {n}: expected "
+                        f"{src_hook} and {menus_src}")
+        dst = template_flavor_content_dir(x, n)
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_hook, dst / HOOK_NAME)
+        (dst / HOOK_NAME).chmod(0o755)
+        shutil.rmtree(dst / "keys", ignore_errors=True)
+        shutil.copytree(keys, dst / "keys")
+        menus_dst = base / f"appmenus_{dist}_{n}"
+        shutil.rmtree(menus_dst, ignore_errors=True)
+        shutil.copytree(menus_src, menus_dst)
+    x.ok(f"flavor content installed under {base} for {', '.join(names)}")
 
 
 def build_templates(x: Ctx):
@@ -1887,10 +1949,14 @@ def build_templates(x: Ctx):
             (False, *component_source(x))))}],
     }, "investigator templates")
 
-    # Fail fast when the sources are already there; otherwise this is
-    # re-checked strictly below, once the first build has fetched them.
-    if not x.args.dry_run:
-        verify_template_flavors(x, names, strict=False)
+    # The generated hooks go onto the builder's search path now, and their
+    # presence there is confirmed strictly before the long build starts.
+    if x.args.dry_run:
+        x.info("[dry-run] fetch builder-debian and install the flavor hooks under "
+               f"{template_flavor_content_dir(x, 'flavor').parent}")
+    else:
+        materialize_flavors(x, names)
+        verify_template_flavors(x, names, strict=True)
 
     x.warn(f"the long one: {len(names)} templates, each a full debootstrap. "
            f"Kali dominates.")
@@ -5837,7 +5903,11 @@ lifecycle
         else:
             x.skip("builder setup")
 
-        if args.action in ("templates", "all"):
+        if args.action == "all" and not tier2:
+            x.info("tier 1: the investigator templates are built on the target at "
+                   "first boot, so 'all' builds the ISO only (set tier=2 to bake "
+                   "them in)")
+        if build_templates_locally(args.action, tier2):
             if not tier2:
                 x.warn("tier is 1 — building templates anyway, but set tier=2 in "
                        "iso-build.json to bake them into the ISO")

@@ -1,13 +1,48 @@
 # Review and fixes
 
-Three verification passes against primary sources, and what they found. Defects
+Four verification passes against primary sources, and what they found. Defects
 are recorded here rather than quietly patched, so nobody reintroduces them.
 
+- [Pass 4 — 2026-09-15](#pass-4--2026-09-15)
 - [Pass 3 — 2026-09-14](#pass-3--2026-09-14)
 - [Pass 2 — v2.2, 2026-09-08](#pass-2--v22-2026-09-08)
 - [Pass 1 — v2.1, 2026-09-01](#pass-1--v21-2026-09-01)
 - [What is actually tested](#what-is-actually-tested)
 - [Still not verified](#still-not-verified--requires-real-hardware)
+
+---
+
+## Pass 4 — 2026-09-15
+
+Pass 3 verified the build path. Pass 4 read the **whole** codebase — the tier-1
+provisioner phase by phase, the tier-2 hooks, the lifecycle commands — against
+the upstream code each part depends on: qubes-core-agent-linux
+(`network/update-proxy-configs`, `network/tinyproxy-updates.conf`,
+`vm-systemd/bind-dirs.sh`), qubes-anaconda-addon
+(`org_qubes_os_initial_setup/service/tasks.py`), fepitre/qubes-template-kali
+(`kali/04_install_qubes_post.sh`) and qubes-builderv2's template plugin and
+`scripts/functions.sh`. Each finding is a place where this repository assumed
+what upstream does and upstream does something else.
+
+| # | Where | Defect | What upstream actually does | Fix |
+|---|---|---|---|---|
+| 1 | phases 4, 5, `--refresh-repo-keys` | keys fetched with a bare `curl` in a template | templates have no netvm; apt works only because `update-proxy-configs` writes `Acquire::http::Proxy "http://127.0.0.1:8082/"`, which curl does not read; tinyproxy relays CONNECT to 443 | `curl --proxy http://127.0.0.1:8082` everywhere; the retry names `sys-firewall` before `sys-proxy` exists and disables `updates-proxy-setup` for its duration |
+| 2 | phases 4, 5, 7 | templates left running after installs | a qube boots the template's root as of its last shutdown | `_commit_templates()` before each phase mark; a template that will not stop is fatal |
+| 3 | `_install_kali`, tier-2 hook | Kali pinned at 100 below Debian, `-t kali-rolling` | template-kali adds the repo, `aptDistUpgrade`, pins `o=Kali` 1001, `aptInstall --allow-downgrades kali-menu kali-linux-default` | the same sequence, in both tiers |
+| 4 | `_enroll` | `/rw/bind-dirs/var/ossec` seeded by hand, never mounted; enrollment written into the volatile root | bind-dirs.sh copies once, then `mount --bind`s over the path | the bind is applied before anything is written; `mountpoint -q` afterwards or fatal |
+| 5 | `--initial-setup` | salt states applied to a machine with no templates | the wizard installs the RPMs from `/var/lib/qubes/template-packages` with `qvm-template install --nogpgcheck`, sets default-kernel and default-template, runs one `qubesctl --all state.highstate`, then sets default-netvm/updatevm/clockvm | the same, in the same order; RPMs removed afterwards as the wizard does |
+| 6 | acceptance group 7 | interception probed from `personal` | Qubes enforces `accept specialtarget=dns` + drop in the qube's netvm, before the intercept in sys-firewall | probe from `kali-clear`/`untrusted`, raw query via python3 |
+| 7 | `--case-mode` | `systemctl mask` in an AppVM | `/etc/systemd/system` is volatile; the rc.local hook restarted the agent | marker in `/rw/config`, honoured by the hook |
+| 8 | `build_templates` | hooks never placed on builderv2's search path | `TEMPLATE_FLAVOR_DIR` is `template_debian/<flavor>` and nothing else; `templateFile()` looks for `<dir>/04_install_qubes_post.sh` | `materialize_flavors()` copies hook, keys and appmenus into place; the check wants the hook file |
+| 9 | hook header | `FLAVORS_DIR="${BUILDER_DIR}/${SRC_DIR}"` | builderv2 sets `FLAVORS_DIR` only for whonix/kicksecure/kali; neither variable is whitelisted | `$(dirname "${BASH_SOURCE[0]}")` |
+| 10 | three hook guards | `\|\| error "…"` | `error()` in functions.sh prints and returns | `\|\| { error …; exit 1; }` |
+| 11 | `all`, bootstrap, release gate | templates built at tier 1; tier 1 refused for release | — | `all` builds the ISO only at tier 1; gate accepts 1 or 2 |
+| 12 | GUIDE.md | fences and sections spliced since 2.1 | — | repaired; structure check added |
+
+Every fix has a test that fails with the fix reverted: the harness reads the
+recorded in-qube actions (defects 1–7), the orchestration checks execute the
+installed hook and its guard (8–10), and the document check parses the guide
+for what it is (12).
 
 ---
 
@@ -541,7 +576,14 @@ Qubes 4.3.1 install and a decision:
 
 - an end-to-end run on real hardware — neither script has had one. This is the
   one thing on this page that no amount of tooling closes.
-- whether the Kali apt pin priorities suit your unit's tool set in practice
-- whether `pykickstart` merges two `%packages` sections as expected (standard
-  Anaconda behaviour, not confirmed against a Qubes-specific source; the build
-  prints `[VERIFY]` at the moment it matters)
+- the Kali dist-upgrade of a live Qubes Debian 13 template: upstream runs the
+  same sequence in a build chroot; whether it completes cleanly in a running
+  template, and how long `kali-linux-default` takes through the update proxy,
+  is a hardware answer
+- `qubesctl --all state.highstate` from the first-boot runner: the wizard runs
+  it from a logged-in session; the sequence is the wizard's, the timing under
+  systemd at first boot is not measured
+- the update-proxy path for `curl`: derived from core-agent's proxy
+  configuration and tinyproxy's `ConnectPort 443`, not exercised
+- the bind mount of `/var/ossec` in a Whonix qube, where bind-dirs carries
+  Whonix's own entries

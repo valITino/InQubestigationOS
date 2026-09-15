@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -393,6 +396,12 @@ def main():
 
         for n in names:
             bi.template_flavor_content_dir(x, n).mkdir()
+        # A directory alone is as stock as none: the hook is what builderv2
+        # runs, so an empty directory on the search path must still be refused.
+        expect_fatal(lambda: bi.verify_template_flavors(x, names, strict=True),
+                     bi.HOOK_NAME)
+        for n in names:
+            (bi.template_flavor_content_dir(x, n) / bi.HOOK_NAME).write_text("#!/bin/bash\n")
         bi.verify_template_flavors(x, names, strict=True)
 
         # One missing out of two is still a refusal.
@@ -401,7 +410,78 @@ def main():
         expect_fatal(lambda: bi.verify_template_flavors(x, names, strict=True),
                      "investigator-ids")
 
-    print("  48/48 unattended orchestration checks pass")
+    # -------------------------------------------------------------------
+    # Tier 2: the generated component has to land where qubes-builderv2 looks
+    # — <sources>/builder-debian/template_debian/<flavor>/04_install_qubes_post.sh
+    # with keys/ beside it — because nothing else puts it there. And the hook
+    # has to find its keys from where it was installed: builderv2 sets
+    # FLAVORS_DIR only for whonix/kicksecure/kali and passes no BUILDER_DIR or
+    # SRC_DIR, so the old fallback expanded to "/".
+    with tempfile.TemporaryDirectory() as td2:
+        x2 = ctx(td2)
+        (x2.component / "keys").mkdir(parents=True)
+        (x2.component / "keys" / "kali-archive-keyring.gpg").write_bytes(b"\x99fake-keyring")
+        bi.gen_component(x2)
+        names2 = list(x2.c["tier2_templates"])
+        for name in names2:
+            hook = x2.component / name / bi.HOOK_NAME
+            parsed = subprocess.run(["bash", "-n", str(hook)], capture_output=True, text=True)
+            assert parsed.returncode == 0, (name, parsed.stderr[-300:])
+        base2 = bi.template_flavor_content_dir(x2, "flavor").parent
+        runs = []
+        with mock.patch.object(x2, "run", side_effect=lambda *a, **k: runs.append(a)):
+            # builder-debian is fetched first; a tree still absent afterwards
+            # is fatal rather than silently producing stock Debian.
+            expect_fatal(lambda: bi.materialize_flavors(x2, names2),
+                         "does not exist after fetching builder-debian")
+            assert runs and runs[0][:5] == ("./qb", "-c", "builder-debian", "package", "fetch"), runs
+            base2.mkdir(parents=True)
+            bi.materialize_flavors(x2, names2)
+        for name in names2:
+            hook = bi.template_flavor_content_dir(x2, name) / bi.HOOK_NAME
+            assert hook.is_file() and hook.stat().st_mode & 0o111, hook
+            assert (hook.parent / "keys" / "kali-archive-keyring.gpg").read_bytes() == b"\x99fake-keyring"
+            menus = base2 / f"appmenus_{x2.c['dist_codename']}_{name}"
+            assert (menus / "whitelisted-appmenus.list").is_file(), menus
+        bi.verify_template_flavors(x2, names2, strict=True)
+
+        # Run the REAL installed hook up to the point it sources builder-debian's
+        # vars.sh, with a vars.sh that reports FLAVORS_DIR and stops.
+        kali_hook = bi.template_flavor_content_dir(x2, "investigator-kali") / bi.HOOK_NAME
+        content = Path(td2) / "content"
+        content.mkdir()
+        (content / "vars.sh").write_text('printf "%s" "$FLAVORS_DIR"; exit 0\n')
+        probe = subprocess.run([str(kali_hook)], capture_output=True, text=True,
+                               env={"PATH": os.environ["PATH"],
+                                    "TEMPLATE_CONTENT_DIR": str(content)})
+        assert probe.returncode == 0, probe.stderr[-300:]
+        assert Path(probe.stdout) == kali_hook.parent.resolve(), probe.stdout
+        assert (Path(probe.stdout) / "keys" / "kali-archive-keyring.gpg").is_file()
+
+        # The keyring guard stops the build. builderv2's error() only prints,
+        # so `|| error` alone let a build without the key carry on and bake a
+        # template whose apt trusts nothing — this used to pass.
+        text = kali_hook.read_text()
+        guard = text[text.index("kali_signing_key_file="):]
+        guard = guard[:guard.index("\n", guard.index("exit 1; }")) + 1]
+        nokeys = Path(td2) / "nokeys"
+        nokeys.mkdir()
+        g = subprocess.run(["bash", "-c", 'error() { echo "$@" >&2; }\nFLAVORS_DIR='
+                            + shlex.quote(str(nokeys)) + "\n" + guard],
+                           capture_output=True, text=True)
+        assert g.returncode == 1 and "Kali keyring missing" in g.stderr, (g.returncode, g.stderr)
+        assert "|| error" not in text, "a guard that only prints is not a guard"
+
+    # `all` at tier 1 builds no templates: they are built on the target.
+    for action, tier2, want in (("templates", False, True), ("templates", True, True),
+                                ("all", False, False), ("all", True, True),
+                                ("iso", False, False), ("iso", True, False)):
+        assert bi.build_templates_locally(action, tier2) is want, (action, tier2)
+    main_src = source[source.index("def main()"):]
+    assert "build_templates_locally(args.action, tier2)" in main_src, \
+        "main must take the tier decision from build_templates_locally"
+
+    print("  63/63 unattended orchestration checks pass")
     return 0
 
 

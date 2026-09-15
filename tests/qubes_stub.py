@@ -73,6 +73,9 @@ def record_installs(w: dict, name: str, script: str) -> None:
         save(w)
 
 
+TEMPLATE_RPM_RE = re.compile(r"^(qubes-template-.+?)-\d[^-]*-[^-]+\.noarch\.rpm$")
+
+
 def answer(w: dict, name: str, script: str) -> int:
     """Exit code the fake qube returns for a shell snippet."""
     # Package state first: it changes as the run proceeds, so it outranks the
@@ -80,6 +83,16 @@ def answer(w: dict, name: str, script: str) -> int:
     m = re.search(r"dpkg -s (\S+)", script)
     if m:
         return 0 if m.group(1) in vm(w, name).get("pkgs", []) else 1
+    # A template-based qube has whatever its template has: the agent lands in
+    # /var/ossec of every qube based on a template that installed it. Without
+    # this the fake qubes said "no agent" forever and phase 11 never enrolled
+    # anything, so nothing the enrollment does was ever exercised.
+    if "test -d /var/ossec" in script:
+        here = vm(w, name)
+        tpl = here.get("prefs", {}).get("template", "")
+        if "wazuh-agent" in here.get("pkgs", []) or (
+                tpl and "wazuh-agent" in vm(w, tpl).get("pkgs", [])):
+            return 0
     for rule in w.get("qtest", []):
         if rule.get("vm") not in (None, name):
             continue
@@ -246,6 +259,29 @@ def main() -> int:
         return cmd_qvm_run(w, argv)
 
     if prog == "qvm-volume":
+        return 0
+
+    if prog == "rpm":
+        # rpm -qp --qf %{NAME} <file>: the name the installer stamped on the
+        # template package, read off the file name the way dom0 would read it
+        # off the header.
+        if "-qp" in argv:
+            m = TEMPLATE_RPM_RE.match(Path(argv[-1]).name)
+            if not m:
+                return 1
+            print(m.group(1), end="")
+        return 0
+
+    if prog == "qvm-template":
+        if argv[:1] == ["install"]:
+            for a in argv[1:]:
+                m = TEMPLATE_RPM_RE.match(Path(a).name)
+                if a.endswith(".rpm") and m:
+                    name = m.group(1)[len("qubes-template-"):]
+                    v = vm(w, name)
+                    v.update({"class": "TemplateVM", "running": False,
+                              "prefs": {"netvm": "", "label": "black"}})
+            save(w)
         return 0
 
     if prog == "qvm-features":

@@ -353,6 +353,30 @@ def check_docs_do_not_contradict() -> None:
               "the chain does not exist in Qubes")
 
 
+def check_markdown_structure() -> None:
+    """Every fenced block closes, and no table row sits inside one.
+
+    GUIDE.md shipped for two releases with a table row where the gen-key
+    command should have been, a bash block spliced into a PowerShell fence,
+    and a paragraph of section 8 cut into section 7 — none of which any check
+    noticed, because every check read the file for what it contained rather
+    than for whether it was still a document.
+    """
+    for path in sorted((ROOT / "docs").glob("*.md")) + [ROOT / "README.md"]:
+        in_fence = False
+        bad_rows = []
+        for no, line in enumerate(path.read_text().splitlines(), 1):
+            if line.startswith("```"):
+                in_fence = not in_fence
+            elif in_fence and line.startswith("| `"):
+                bad_rows.append(no)
+        rel = path.relative_to(ROOT)
+        check(f"{rel}: every code fence is closed", not in_fence,
+              "an unclosed ``` swallows everything after it")
+        check(f"{rel}: no table row inside a code fence", not bad_rows,
+              f"lines {bad_rows}")
+
+
 def check_stdlib_claim() -> None:
     """A script the docs call "standard library only" must actually be one.
 
@@ -436,6 +460,7 @@ def main() -> int:
     check_product_name()
     check_supply_chain()
     check_docs_do_not_contradict()
+    check_markdown_structure()
     check_stdlib_claim()
     check_no_secrets()
 
