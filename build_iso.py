@@ -1109,6 +1109,20 @@ trap cleanup ERR
 trap cleanup EXIT
 prepareChroot
 mount --bind /dev "${INSTALL_DIR}/dev"
+
+# The keyring must carry EXACTLY the pinned key(s). apt trusts every key in a
+# signed-by= keyring, so a response carrying the genuine key plus another
+# would pass a presence check and hand that other key the same trust. Primary
+# fingerprints only: the fpr record after pub, not the ones after sub.
+require_exact_keys() {
+    local file="$1"; shift
+    local want got
+    want="$(printf '%s\n' "$@" | tr 'a-f' 'A-F' | sort -u)"
+    got="$(chroot_cmd bash -c "gpg --batch --with-colons --show-keys '$file' 2>/dev/null" \
+        | awk -F: '$1=="pub"{p=1;next} $1=="sub"{p=0} p&&$1=="fpr"{print toupper($10);p=0}' \
+        | sort -u)"
+    [ -n "$got" ] && [ "$got" = "$want" ]
+}
 """
 
 HOOK_FOOTER = """
@@ -1123,7 +1137,7 @@ chroot_cmd bash -c "curl -fsSL '@WAZUH_KEY@' | gpg --no-default-keyring --keyrin
 # Pin it, exactly as the Kali key is pinned. This key signs every package in the
 # SIEM that watches the whole workstation; importing whatever came back from the
 # network and trusting it via signed-by= is not a check.
-chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{print toupper(\\$10)}' | grep -qxF '@WAZUH_KEY_FPR@'" \\
+require_exact_keys /usr/share/keyrings/wazuh.gpg '@WAZUH_KEY_FPR@' \\
     || { error 'Wazuh signing key is not @WAZUH_KEY_FPR@ — refusing to bake an unverified key into the image'; exit 1; }
 echo '@WAZUH_REPO@' > "${INSTALL_DIR}/etc/apt/sources.list.d/wazuh.list"
 aptUpdate
@@ -1190,8 +1204,14 @@ def fetch_kali_key(x: Ctx):
         x.warn("legacy key absent — fine if it has aged out")
     unexpected = fprs - {k["key_fpr"].upper(), k["key_fpr_legacy"].upper()}
     if unexpected:
-        x.warn(f"keyring also carries {', '.join(sorted(unexpected))} — confirm at "
-               "kali.org before baking this into an image")
+        # Fatal, not a warning: apt trusts every key in this file, so an
+        # unexpected one would sign packages the image installs as root.
+        keyfile.unlink(missing_ok=True)
+        raise Fatal(
+            f"Kali keyring also carries {', '.join(sorted(unexpected))}.\n"
+            "     Only the pinned key (and the retired one) may be in it — apt\n"
+            "     trusts every key in the file. The download has been removed;\n"
+            "     confirm at kali.org before pinning anything new.")
 
 
 def gen_component(x: Ctx):
@@ -1236,6 +1256,11 @@ test -f "$kali_signing_key_file" || {{ error "Kali keyring missing at $kali_sign
 mkdir -p "${{INSTALL_DIR}}/usr/share/keyrings"
 cp "$kali_signing_key_file" "${{INSTALL_DIR}}/usr/share/keyrings/kali-archive-keyring.gpg"
 chmod 644 "${{INSTALL_DIR}}/usr/share/keyrings/kali-archive-keyring.gpg"
+# Verified on the build host already; verified again here against what was
+# actually copied in. The retired key may or may not still be shipped.
+require_exact_keys /usr/share/keyrings/kali-archive-keyring.gpg '{k['key_fpr']}' \\
+    || require_exact_keys /usr/share/keyrings/kali-archive-keyring.gpg '{k['key_fpr']}' '{k['key_fpr_legacy']}' \\
+    || {{ error 'Kali keyring does not carry exactly the pinned key(s) — refusing to bake it into the image'; exit 1; }}
 echo 'deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] https://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware' \\
     > "${{INSTALL_DIR}}/etc/apt/sources.list.d/kali.list"
 
@@ -1289,7 +1314,7 @@ echo '{z['repo_line']}' > "${{INSTALL_DIR}}/etc/apt/sources.list.d/security:zeek
 # openSUSE Build Service is outside the Zeek project's control.
 chroot_cmd mkdir -p /usr/share/keyrings
 chroot_cmd bash -c "curl -fsSL '{z['key_url']}' | gpg --dearmor > /usr/share/keyrings/security_zeek.gpg && chmod 644 /usr/share/keyrings/security_zeek.gpg"
-chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/security_zeek.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{{print toupper(\\$10)}}' | grep -qxF '{z['key_fpr']}'" \\
+require_exact_keys /usr/share/keyrings/security_zeek.gpg '{z['key_fpr']}' \\
     || {{ error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'; exit 1; }}
 aptUpdate
 aptInstall {z['package']}

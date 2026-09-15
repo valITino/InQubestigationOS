@@ -83,6 +83,13 @@ qubes-builderv2's template plugin. Detail in [docs/REVIEW.md](docs/REVIEW.md).
   unverified run as the date the supply chain was last checked.
 - `bootstrap` forwards `--allow-local-key-backup` to `backup-key`, and refuses
   a `local-directory` backup before creating a key when the flag is absent.
+- Every repository keyring check is now **exact**: the file must carry the
+  pinned key (plus, for Kali, the retired one while it is still shipped) and
+  nothing else, on the target (phases 4 and 5, `--refresh-repo-keys`, the
+  Fedora `rpm --import`), in the tier-2 hooks, and on the build host. apt
+  trusts every key in a signed-by= keyring, so a response carrying the
+  genuine key plus another used to pass a presence check and hand the other
+  key the same trust. A failing keyring is removed rather than left in place.
 
 **Tests and docs**
 

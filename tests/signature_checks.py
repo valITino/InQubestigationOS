@@ -36,6 +36,10 @@ rc_spec = importlib.util.spec_from_file_location(
 rcm = importlib.util.module_from_spec(rc_spec)
 rc_spec.loader.exec_module(rcm)
 
+gi_spec = importlib.util.spec_from_file_location("golden_image", ROOT / "golden_image.py")
+gi = importlib.util.module_from_spec(gi_spec)
+gi_spec.loader.exec_module(gi)
+
 CHECKS = 0
 
 
@@ -218,6 +222,64 @@ def main() -> int:
                       "the tampered payload verified")
         finally:
             del os.environ["GNUPGHOME"]
+    # Keyring checks are EXACT: apt trusts every key in a signed-by= file, so
+    # a keyring carrying the pinned key plus another must be refused, in the
+    # provisioner's predicate and in the tier-2 hook's helper alike. Real
+    # keys, each with a signing subkey the primary-only listing has to skip.
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        home = work / "gnupg"
+        home.mkdir(mode=0o700)
+        key_a = make_key(home)
+        gpg(home, "--passphrase", "", "--pinentry-mode", "loopback",
+            "--quick-generate-key", "Second Signer <s@example.invalid>", "rsa2048", "sign", "never")
+        listing = gpg(home, "--list-secret-keys", "--with-colons").stdout
+        primaries = []
+        after_sec = False
+        for line in listing.splitlines():
+            if line.startswith("sec:"):
+                after_sec = True
+            elif line.startswith("fpr:") and after_sec:
+                primaries.append(line.split(":")[9].upper())
+                after_sec = False
+        key_b = next(f for f in primaries if f != key_a.upper())
+        one = work / "one.gpg"
+        two = work / "two.gpg"
+        gpg(home, "--export", "--output", str(one), key_a)
+        gpg(home, "--export", "--output", str(two), key_a, key_b)
+        env = dict(os.environ, GNUPGHOME=str(home))
+
+        def sh(script: str) -> int:
+            return subprocess.run(["bash", "-c", script], env=env,
+                                  capture_output=True).returncode
+
+        check("exact: a keyring with only the pinned key passes",
+              sh(gi.keyring_exact_check(str(one), [key_a])) == 0)
+        check("exact: subkeys do not count as extra keys",
+              sh(gi.keyring_exact_check(str(one), [key_a], [key_b])) == 0)
+        check("exact: the pinned key plus another is refused",
+              sh(gi.keyring_exact_check(str(two), [key_a])) != 0)
+        check("exact: an optional (retired) key is accepted when present",
+              sh(gi.keyring_exact_check(str(two), [key_a], [key_b])) == 0)
+        check("exact: the pinned key missing is refused",
+              sh(gi.keyring_exact_check(str(one), [key_b])) != 0)
+        check("exact: an unreadable file is refused, not passed",
+              sh(gi.keyring_exact_check(str(work / "absent.gpg"), [key_a])) != 0)
+
+        # The tier-2 hook's helper, extracted from the real header and run
+        # with chroot_cmd standing in for the chroot.
+        header = bi.HOOK_HEADER
+        helper = header[header.index("require_exact_keys() {"):]
+        helper = helper[:helper.index("\n}\n") + 3]
+        prelude = 'chroot_cmd() { "$@"; }\n' + helper + "\n"
+        check("hook helper: exactly the pinned key passes",
+              sh(prelude + f"require_exact_keys {one} {key_a}") == 0)
+        check("hook helper: an extra key is refused",
+              sh(prelude + f"require_exact_keys {two} {key_a}") != 0)
+        check("hook helper: both expected keys pass",
+              sh(prelude + f"require_exact_keys {two} {key_a} {key_b}") == 0)
+        check("hook helper: a lower-case pin still matches",
+              sh(prelude + f"require_exact_keys {one} {key_a.lower()}") == 0)
     print(f"  {CHECKS}/{CHECKS} signature authentication checks pass")
     return 0
 

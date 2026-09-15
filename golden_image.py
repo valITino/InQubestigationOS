@@ -23,6 +23,7 @@ Items printed as [VERIFY] are upstream details to confirm.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -252,6 +253,31 @@ DOM0_ROOT = Path(os.environ.get("GOLDEN_IMAGE_DOM0_ROOT", "/"))
 # wizard's TEMPLATES_RPM_PATH and SetupDefaultKernel read the same two.
 TEMPLATE_RPM_DIR = DOM0_ROOT / "var/lib/qubes/template-packages"
 VM_KERNEL_DIR = DOM0_ROOT / "var/lib/qubes/vm-kernels"
+
+
+def keyring_exact_check(path: str, required, optional=()) -> str:
+    """A shell predicate: the PRIMARY fingerprints in the key file at `path`
+    are exactly `required`, plus any subset of `optional`, and nothing else.
+
+    apt trusts EVERY key in a signed-by= keyring. A check that only asked
+    whether the pinned key was present accepted a response carrying the
+    genuine key plus another, and handed that other key the same trust —
+    packages it signed would have installed as root in shared templates.
+    The listing is `--show-keys --with-colons`, which reads binary and
+    armoured files alike; the fpr record after a pub record is the primary's,
+    the ones after sub records belong to subkeys and are skipped. An empty
+    listing (no gpg, unreadable file) fails, never passes.
+    """
+    req = {f.replace(" ", "").upper() for f in required if f}
+    opt = [f.replace(" ", "").upper() for f in optional if f]
+    allowed = ["\n".join(sorted(req | set(combo)))
+               for k in range(len(opt) + 1)
+               for combo in itertools.combinations(opt, k)]
+    listing = (f"gpg --batch --with-colons --show-keys {shlex.quote(path)} 2>/dev/null | "
+               "awk -F: '$1==\"pub\"{p=1;next} $1==\"sub\"{p=0} "
+               "p&&$1==\"fpr\"{print toupper($10);p=0}' | sort -u")
+    tests = " || ".join(f'[ "$k" = {shlex.quote(a)} ]' for a in allowed)
+    return f'k="$({listing})"; [ -n "$k" ] && {{ {tests}; }}'
 
 
 def version_key(text: str) -> list:
@@ -1072,33 +1098,14 @@ an escrow record that no longer matches.
         self._qrun_net(tpl, f"__CURL__ {shlex.quote(k['keyring_url'])} -o "
                             f"{shlex.quote(k['keyring_path'])} && chmod 644 {shlex.quote(k['keyring_path'])}")
 
+        # Exactly the current key, with or without the retired one Kali still
+        # ships — and nothing else (see keyring_exact_check).
+        self._verify_keyring(tpl, k["keyring_path"], k["key_fpr"], "Kali",
+                             optional=[k["key_fpr_legacy"]], crosscheck=k["keyserver_url"])
         if not self.args.dry_run:
-            # --with-colons is the machine-readable form: one record per line,
-            # 'fpr' records carry the fingerprint in field 10 and nothing else.
-            # The previous check stripped ALL whitespace from the human-readable
-            # output and looked for the fingerprint as a substring, so a key's
-            # own attacker-controlled UID text could satisfy it.
-            fpr_check = (
-                f"gpg --no-default-keyring --keyring {shlex.quote(k['keyring_path'])} "
-                f"--with-colons --fingerprint 2>/dev/null "
-                f"| awk -F: '$1==\"fpr\"{{print toupper($10)}}' "
-                f"| grep -qxF {shlex.quote(k['key_fpr'].upper())}")
-            if not r.qtest(tpl, fpr_check, dry_default=False):
-                r.qrun(tpl, f"gpg --no-default-keyring --keyring "
-                            f"{shlex.quote(k['keyring_path'])} --fingerprint", check=False)
-                raise Fatal(
-                    f"Kali keyring does NOT contain the expected fingerprint {k['key_fpr']}.\n"
-                    "     Do not proceed. Either Kali rolled the key again (check\n"
-                    "     kali.org/blog and update kali.key_fpr) or the download was\n"
-                    f"     tampered with. Cross-check at:\n     {k['keyserver_url']}\n"
-                    f"     Fingerprints actually found are in {self.out.log_path}")
-            o.ok(f"key fingerprint verified: {k['key_fpr']}")
-            legacy_check = (
-                f"gpg --no-default-keyring --keyring {shlex.quote(k['keyring_path'])} "
-                f"--with-colons --fingerprint 2>/dev/null "
-                f"| awk -F: '$1==\"fpr\"{{print toupper($10)}}' "
-                f"| grep -qxF {shlex.quote(k['key_fpr_legacy'].upper())}")
-            if r.qtest(tpl, legacy_check, dry_default=False):
+            if r.qtest(tpl, keyring_exact_check(k["keyring_path"],
+                                                [k["key_fpr"], k["key_fpr_legacy"]]),
+                       dry_default=False):
                 o.ok("legacy Kali key also present")
             else:
                 o.warn(f"legacy key {k['key_fpr_legacy']} absent — expected if it aged out")
@@ -1155,10 +1162,13 @@ an escrow record that no longer matches.
         self.r.qwrite(tpl, "/etc/apt/sources.list.d/wazuh.list", w["apt_repo_line"])
         self.r.qrun(tpl, "apt-get update")
 
-    def _verify_keyring(self, tpl: str, keyring: str, fpr: str, label: str) -> None:
+    def _verify_keyring(self, tpl: str, keyring: str, fpr: str, label: str,
+                        optional=(), crosscheck: str = "") -> None:
         """A key fetched over the network signs packages for a police
-        workstation. Every one of them is compared against a pinned
-        fingerprint, exactly as the Kali key is."""
+        workstation. The keyring must carry EXACTLY the pinned key (plus, for
+        Kali, the retired one while it is still shipped) — not merely contain
+        it, because apt trusts every key in the file. A keyring that fails is
+        removed: nothing may keep trusting it."""
         o, r = self.out, self.r
         fpr = (fpr or "").strip().upper()
         if not fpr:
@@ -1167,22 +1177,22 @@ an escrow record that no longer matches.
                    f"packages this image trusts.")
             return
         if self.args.dry_run:
-            o.info(f"[dry-run] verify {label} key {fpr} in {tpl}")
+            o.info(f"[dry-run] verify {label} keyring in {tpl} carries exactly {fpr}")
             return
-        check = (f"gpg --no-default-keyring --keyring {shlex.quote(keyring)} "
-                 f"--with-colons --fingerprint 2>/dev/null "
-                 f"| awk -F: '$1==\"fpr\"{{print toupper($10)}}' "
-                 f"| grep -qxF {shlex.quote(fpr)}")
-        if not r.qtest(tpl, check, dry_default=False):
-            r.qrun(tpl, f"gpg --no-default-keyring --keyring {shlex.quote(keyring)} "
-                        f"--fingerprint", check=False)
+        if not r.qtest(tpl, keyring_exact_check(keyring, [fpr], optional), dry_default=False):
+            r.qrun(tpl, f"gpg --batch --with-colons --show-keys {shlex.quote(keyring)} "
+                        f"| grep -E '^(pub|fpr|uid):'", check=False)
+            r.qrun(tpl, f"rm -f {shlex.quote(keyring)}", check=False)
             raise Fatal(
-                f"the {label} signing key in {tpl} is not {fpr}.\n"
-                "     Either upstream rolled the key — confirm the new fingerprint\n"
-                "     at the vendor's own site and update the config — or the\n"
-                f"     download was tampered with. What was found is in\n"
-                f"     {self.out.log_path}")
-        o.ok(f"{tpl}: {label} signing key verified ({fpr[-8:]})")
+                f"the {label} keyring in {tpl} does not carry exactly the pinned key "
+                f"{fpr}.\n"
+                "     A missing key means upstream rolled it — confirm the new\n"
+                "     fingerprint at the vendor's own site and update the config. An\n"
+                "     EXTRA key means the download was tampered with: apt would have\n"
+                "     trusted whatever it signs. The keyring has been removed. What\n"
+                f"     was found is in {self.out.log_path}"
+                + (f"\n     Cross-check independently at:\n     {crosscheck}" if crosscheck else ""))
+        o.ok(f"{tpl}: {label} keyring carries exactly the pinned key ({fpr[-8:]})")
 
     def _verify_wazuh_key(self, tpl: str, keyring: str) -> None:
         self._verify_keyring(tpl, keyring, self.c["wazuh"].get("key_fpr", ""),
@@ -1196,10 +1206,17 @@ an escrow record that no longer matches.
                       "name=Wazuh repository\n"
                       f"baseurl={w['yum_baseurl']}\npriority=1\n")
         # rpm fetches a URL itself, without the update proxy, which a template
-        # cannot reach the network without. Fetch through the proxy, import the file.
-        self._qrun_net(tpl, f"__CURL__ {shlex.quote(w['key_url'])} -o /tmp/wazuh-key.gpg && "
-                            "rpm --import /tmp/wazuh-key.gpg && rm -f /tmp/wazuh-key.gpg")
+        # cannot reach the network without. Fetch through the proxy, verify the
+        # file carries exactly the pinned key (rpm --import would trust every
+        # key in it), then import.
+        self._qrun_net(tpl, f"__CURL__ {shlex.quote(w['key_url'])} -o /tmp/wazuh-key.gpg")
         fpr = (w.get("key_fpr") or "").strip().upper()
+        if fpr and not self.args.dry_run and not self.r.qtest(
+                tpl, keyring_exact_check("/tmp/wazuh-key.gpg", [fpr]), dry_default=False):
+            self.r.qrun(tpl, "rm -f /tmp/wazuh-key.gpg", check=False)
+            raise Fatal(f"the downloaded Wazuh key file in {tpl} does not carry exactly "
+                        f"{fpr} — not imported")
+        self.r.qrun(tpl, "rpm --import /tmp/wazuh-key.gpg && rm -f /tmp/wazuh-key.gpg")
         if fpr and not self.args.dry_run:
             # rpm stores imported keys as gpg-pubkey-<short id>-<release>.
             short = fpr[-8:].lower()
@@ -4146,19 +4163,19 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         jobs = [
             (self.t["ids"], self.c["zeek"]["key_url"],
              self.c["zeek"]["keyring_path"], self.c["zeek"].get("key_fpr", ""),
-             "Zeek OBS", "dearmor"),
+             "Zeek OBS", "dearmor", []),
             (self.t["kali"], self.c["kali"]["keyring_url"],
              self.c["kali"]["keyring_path"], self.c["kali"]["key_fpr"],
-             "Kali", "raw"),
+             "Kali", "raw", [self.c["kali"]["key_fpr_legacy"]]),
         ]
         for tpl in (self.t["proxy"], self.t["ids"], self.t["kali"],
                     self.t["personal"], self.t["wazuh"]):
             jobs.append((tpl, self.c["wazuh"]["key_url"],
                          self.c["wazuh"]["keyring_path"],
-                         self.c["wazuh"].get("key_fpr", ""), "Wazuh", "import"))
+                         self.c["wazuh"].get("key_fpr", ""), "Wazuh", "import", []))
 
         failures = 0
-        for tpl, url, path, fpr, label, how in jobs:
+        for tpl, url, path, fpr, label, how, optional in jobs:
             if not r.vm_exists(tpl):
                 continue
             if self.args.dry_run:
@@ -4182,7 +4199,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                         f"2>/dev/null || true", check=False)
             try:
                 self._qrun_net(tpl, cmd)
-                self._verify_keyring(tpl, path, fpr, label)
+                self._verify_keyring(tpl, path, fpr, label, optional=optional)
             except Fatal as e:
                 r.qrun(tpl, f"mv -f {shlex.quote(path)}.prev {shlex.quote(path)} "
                             f"2>/dev/null || true", check=False)
