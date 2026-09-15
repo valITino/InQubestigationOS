@@ -228,7 +228,23 @@ def main() -> int:
             capture_output=True, env={**os.environ, "INQUBESTIGATION_CONFIG": str(profile)})
         assert rejected.returncode == 1
         assert "cannot be classified as physical-host distribution" in rejected.stderr
-    print("  15/15 bootstrap workflow checks pass")
+    # The backup-key step bootstrap runs gets the local-backup authorization
+    # when the operator gave it; without it, backup-key would refuse the
+    # directory onboarding had just validated for backup_kind local-directory.
+    granted = SimpleNamespace(use_key=None, passphrase_file="/run/p", backup_passphrase_file="/run/b",
+                              allow_local_key_backup=True)
+    argv = bi.bootstrap_backup_args(granted, Path("/home/u/key-backup"))
+    assert "--allow-local-key-backup" in argv, argv
+    assert argv[:2] == ["--to", "/home/u/key-backup"]
+    assert argv[argv.index("--passphrase-file") + 1] == "/run/p"
+    assert argv[argv.index("--backup-passphrase-file") + 1] == "/run/b"
+    withheld = SimpleNamespace(use_key=None, passphrase_file="/run/p",
+                               backup_passphrase_file="/run/b", allow_local_key_backup=False)
+    assert "--allow-local-key-backup" not in bi.bootstrap_backup_args(withheld, Path("/mnt/b"))
+    # And bootstrap says so before gen-key runs, not after.
+    source = Path(bi.__file__).read_text()
+    assert "--allow-local-key-backup to authorize that deliberately" in source
+    print("  18/18 bootstrap workflow checks pass")
     return 0
 
 

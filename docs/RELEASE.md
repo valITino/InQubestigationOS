@@ -23,7 +23,7 @@ targets the `inqubestigation-trusted-build` label. A full build is opt-in throug
    `TRUSTED_BUILD_REF` (the reviewed full 40-character commit SHA),
    `IQ_RC_CONFIG` (absolute path to the reviewed non-secret `iso-build.json`),
    `IQ_WORK_DIR`, `IQ_BACKUP_DIR`, `IQ_CANDIDATE_DIR`, `IQ_SIGNING_FPR`, and
-   `IQ_MAX_ARTIFACT_GB`. The config must set `tier` to `2`, the same work path,
+   `IQ_MAX_ARTIFACT_GB`. The config must set `tier` to `1` or `2`, the same work path,
    and the same signer. Both destination paths must be separately mounted.
 4. Import the protected key into the runner account's GPG keyring. Configure
    `IQ_GPG_SESSION_SECRET` as an environment secret delivered only after
@@ -65,6 +65,7 @@ make release-candidate RC_ARGS='\
   --backup-dir /mnt/key-backup/inqubestigation \
   --candidate-dir /mnt/release-candidates/inqubestigation \
   --passphrase-file /run/user/$UID/iq-gpg-session \
+  --backup-passphrase-file /run/user/$UID/iq-backup-session \
   --signing-fingerprint A1B2C3D4E5F6071829394A5B6C7D8E9FA0B1C2D3'
 ```
 
@@ -88,6 +89,9 @@ Only these files are copied to a new internal `rc-<commit>` directory:
 * `unit-signing-key.asc`, `FINGERPRINT.txt`
 * `verify-iso.sh`, `verify-iso.ps1`
 * `BUILD-RECORD.txt`
+* `oem/ks.cfg` and `oem/ks.cfg.asc` — the install-time kickstart `write-usb`
+  puts on the `QUBES_OEM` partition, signed with the release key; the gate
+  verifies that signature and `write-usb` refuses an unsigned one
 
 Unexpected output files fail the allowlist. Work trees, logs, passphrase files,
 key backups and provisioning credentials are never recursively copied or

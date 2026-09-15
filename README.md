@@ -39,7 +39,7 @@ with no network and configures itself on first boot.
 | **Separate Tor branch** | Joins at the firewall; never inspected, never logged against your identity |
 | **Forced DNS** | All clearnet DNS captured and sent to Quad9 over TLS; Whonix exempt by design |
 | **SIEM in every compartment** | Wazuh agent in all nine templates in service, version-held, per-qube identity |
-| **Investigator tooling** | Kali + Maltego, LibreOffice, Suricata, Zeek, Squid — all baked into the ISO |
+| **Investigator tooling** | Kali + Maltego, LibreOffice, Suricata, Zeek, Squid — built on the target at first boot (`tier=1`, the default), or baked into the ISO with `tier=2` |
 | **Weekly encrypted backups** | Profile-mode `qvm-backup` on a timer, with monthly restore verification |
 | **Acceptance tests** | Thirteen groups, re-runnable, that prove the design is actually in force |
 | **Runs itself afterwards** | Updates, rule refreshes, key-expiry watch, self-checks and staleness warnings are all timers, not a checklist |
@@ -51,22 +51,28 @@ templates, and Whonix.
 ## Quick start
 
 ```bash
-# On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~250 GB
-# free — nothing pre-installed
+# On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~100 GB
+# free (~250 GB for tier=2) — nothing pre-installed
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
-# The wizard discovers approved preformatted storage, creates safe mountpoints,
-# mounts it, and collects the signing authorization with hidden input.
-./build_iso.py bootstrap
-./build_iso.py write-usb --wait   # plug the stick in when it asks
+./build_iso.py quickstart --usb   # one passphrase, then walk away
 ```
 
-`bootstrap` runs `setup-host`, `gen-key`, `backup-key`, `doctor`,
-`check-upstream`, the dry-run plan and the build, stopping at the first failure.
-Every step is idempotent, so fixing a cause and re-running skips what already
-succeeded. Each is also available on its own — `make` lists them.
+`quickstart` checks everything it can **first** — host, tools, disk, Docker,
+the pinned supply chain — and fixes what it can, so a problem stops it in
+seconds rather than hours in. Then it creates or reuses the signing key, backs
+it up, builds and signs the ISO, and with `--usb` waits for a stick and writes
+it. It asks for exactly one passphrase. Every step is idempotent: fix the cause
+and re-run, and what already succeeded is skipped.
 
-Boot the USB and install. First boot provisions itself; there is nothing to do
-by hand, and the recurring maintenance installs itself as timers.
+For a throwaway test build, `--no-passphrase` asks nothing at all. For the
+production release path with independent key-backup media and an audited
+export, use `bootstrap` instead — `make` lists every step on its own.
+
+Boot the USB and install. First boot provisions itself with nobody at the
+keyboard. The one thing only a person can supply — the login password — is
+asked for at the console and never holds provisioning up: unanswered, it is
+asked again at every boot and every 30 minutes until someone sets it. The
+recurring maintenance installs itself as timers.
 
 Full walkthrough: **[docs/GUIDE.md](docs/GUIDE.md)**.
 Trusted release-candidate runner setup: **[docs/RELEASE.md](docs/RELEASE.md)**.
@@ -104,7 +110,7 @@ the installer kickstart.
 
 | Script | Runs on | Does |
 |---|---|---|
-| `build_iso.py` | Build host (Debian-family — Debian 13, Kali, Ubuntu — or Fedora; Docker; ~250 GB) | Builds five investigator templates, then a signed bootable ISO |
+| `build_iso.py` | Build host (Debian-family — Debian 13, Kali, Ubuntu — or Fedora; Docker; ~100 GB, ~250 GB for tier=2) | Builds a signed bootable ISO, and with `tier=2` the five investigator templates too |
 | `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests |
 
 `golden_image.py` is standard-library Python 3 — no `pip install`, which
@@ -154,7 +160,7 @@ Most of those steps are now commands or timers.
 | `dd` to a device you hope is the right one | `./build_iso.py write-usb` — verifies the signature, refuses fixed disks, reads the stick back (elevating if it must) |
 | "Build unsigned and sign afterwards on the machine that holds the key" | `./build_iso.py sign` — re-checksums, signs, and regenerates everything that travels with the signature |
 | Compare the printed fingerprint against the one you were given, by eye | `./verify-iso.sh <fingerprint>` compares them and exits non-zero |
-| Pick a `work_dir` "somewhere with 250 GB free" | `--set work_dir=auto` |
+| Pick a `work_dir` "somewhere with enough free space" | `--set work_dir=auto` |
 | "Verify the builder itself — nothing verifies the builder for you" | `verify_builder` checks the signed tag against the Qubes master signing key's web of trust; one pinned fingerprint, developer keys derived from it |
 | Keep the signing key safe by remembering to | `backup-key` / `restore-key` — encrypted key, revocation certificate, public key |
 | `mkfs.ext4 -L GOLDEN-BACKUP /dev/sdX1` against a device you identified by eye | `--prepare-backup-media` |
@@ -179,7 +185,7 @@ Most of those steps are now commands or timers.
 | Re-add an expired repository key by hand in the template | `--refresh-repo-keys`, re-verified against the pinned fingerprint, rolled back if it does not match |
 | "Do this cross-check on first build rather than trusting the blog post alone" | `check-upstream` asks an independent keyserver about the Kali key, every run |
 | `qvm-connect-tcp 8443:wazuh-srv:443` from memory | a "SIEM dashboard" launcher in `work` |
-| Weekly template updates, weekly `suricata-update`, monthly key-expiry check, monthly restore test | seven timers, installed by phase 10, that raise a login banner when they fail |
+| Weekly template updates, weekly `suricata-update`, monthly key-expiry check, monthly restore test | eight timers, installed by phases 7 and 10, that raise a login banner when they fail |
 | Upgrade Wazuh in the right order and remember which order that is | `--upgrade-wazuh` |
 
 What is deliberately still yours: reading the fingerprint out over an

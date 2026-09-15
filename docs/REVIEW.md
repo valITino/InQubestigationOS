@@ -1,12 +1,202 @@
 # Review and fixes
 
-Two verification passes against primary sources, and what they found. Defects
+Four verification passes against primary sources, and what they found. Defects
 are recorded here rather than quietly patched, so nobody reintroduces them.
 
+- [Pass 4 — 2026-09-15](#pass-4--2026-09-15)
+- [Pass 3 — 2026-09-14](#pass-3--2026-09-14)
 - [Pass 2 — v2.2, 2026-09-08](#pass-2--v22-2026-09-08)
 - [Pass 1 — v2.1, 2026-09-01](#pass-1--v21-2026-09-01)
 - [What is actually tested](#what-is-actually-tested)
 - [Still not verified](#still-not-verified--requires-real-hardware)
+
+---
+
+## Pass 4 — 2026-09-15
+
+Pass 3 verified the build path. Pass 4 read the **whole** codebase — the tier-1
+provisioner phase by phase, the tier-2 hooks, the lifecycle commands — against
+the upstream code each part depends on: qubes-core-agent-linux
+(`network/update-proxy-configs`, `network/tinyproxy-updates.conf`,
+`vm-systemd/bind-dirs.sh`), qubes-anaconda-addon
+(`org_qubes_os_initial_setup/service/tasks.py`), fepitre/qubes-template-kali
+(`kali/04_install_qubes_post.sh`) and qubes-builderv2's template plugin and
+`scripts/functions.sh`. Each finding is a place where this repository assumed
+what upstream does and upstream does something else.
+
+| # | Where | Defect | What upstream actually does | Fix |
+|---|---|---|---|---|
+| 1 | phases 4, 5, `--refresh-repo-keys` | keys fetched with a bare `curl` in a template | templates have no netvm; apt works only because `update-proxy-configs` writes `Acquire::http::Proxy "http://127.0.0.1:8082/"`, which curl does not read; tinyproxy relays CONNECT to 443 | `curl --proxy http://127.0.0.1:8082` everywhere; the retry names `sys-firewall` before `sys-proxy` exists and disables `updates-proxy-setup` for its duration |
+| 2 | phases 4, 5, 7 | templates left running after installs | a qube boots the template's root as of its last shutdown | `_commit_templates()` before each phase mark; a template that will not stop is fatal |
+| 3 | `_install_kali`, tier-2 hook | Kali pinned at 100 below Debian, `-t kali-rolling` | template-kali adds the repo, `aptDistUpgrade`, pins `o=Kali` 1001, `aptInstall --allow-downgrades kali-menu kali-linux-default` | the same sequence, in both tiers |
+| 4 | `_enroll` | `/rw/bind-dirs/var/ossec` seeded by hand, never mounted; enrollment written into the volatile root | bind-dirs.sh copies once, then `mount --bind`s over the path | the bind is applied before anything is written; `mountpoint -q` afterwards or fatal |
+| 5 | `--initial-setup` | salt states applied to a machine with no templates | the wizard installs the RPMs from `/var/lib/qubes/template-packages` with `qvm-template install --nogpgcheck`, sets default-kernel and default-template, runs one `qubesctl --all state.highstate`, then sets default-netvm/updatevm/clockvm | the same, in the same order; RPMs removed afterwards as the wizard does |
+| 6 | acceptance group 7 | interception probed from `personal` | Qubes enforces `accept specialtarget=dns` + drop in the qube's netvm, before the intercept in sys-firewall | probe from `kali-clear`/`untrusted`, raw query via python3 |
+| 7 | `--case-mode` | `systemctl mask` in an AppVM | `/etc/systemd/system` is volatile; the rc.local hook restarted the agent | marker in `/rw/config`, honoured by the hook |
+| 8 | `build_templates` | hooks never placed on builderv2's search path | `TEMPLATE_FLAVOR_DIR` is `template_debian/<flavor>` and nothing else; `templateFile()` looks for `<dir>/04_install_qubes_post.sh` | `materialize_flavors()` copies hook, keys and appmenus into place; the check wants the hook file |
+| 9 | hook header | `FLAVORS_DIR="${BUILDER_DIR}/${SRC_DIR}"` | builderv2 sets `FLAVORS_DIR` only for whonix/kicksecure/kali; neither variable is whitelisted | `$(dirname "${BASH_SOURCE[0]}")` |
+| 10 | three hook guards | `\|\| error "…"` | `error()` in functions.sh prints and returns | `\|\| { error …; exit 1; }` |
+| 11 | `all`, bootstrap, release gate | templates built at tier 1; tier 1 refused for release | — | `all` builds the ISO only at tier 1; gate accepts 1 or 2 |
+| 12 | GUIDE.md | fences and sections spliced since 2.1 | — | repaired; structure check added |
+| 13 | `write-usb`, release gate (review of this pass) | `oem/ks.cfg` executed as root by the installer, signed by nothing | Anaconda reads the QUBES_OEM kickstart as is; the image's signature does not cover it | signed beside the image; write-usb and the release gate authenticate it; staged with the candidate |
+| 14 | release gate (review of this pass) | passphrase files compared by path only | — | values compared too |
+| 15 | `quickstart`, `doctor`, `check-upstream`, `bootstrap` (review of this pass) | `--dry-run --usb` aborted on the missing image; `doctor` demanded `mkfs.vfat` under `oem_fstype=ext4`; `--update --allow-unreachable` recorded an unverified run as fresh; `--allow-local-key-backup` never reached `backup-key` | — | the dry run plans the media step; the doctor checks the configured formatter; an unverified run leaves the freshness date alone; bootstrap forwards the flag and refuses early without it |
+
+Every fix has a test that fails with the fix reverted: the harness reads the
+recorded in-qube actions (defects 1–7), the orchestration checks execute the
+installed hook and its guard (8–10), and the document check parses the guide
+for what it is (12).
+
+---
+
+## Pass 3 — 2026-09-14
+
+Passes 1 and 2 read this repository against the design it implements, and
+against the upstream *packages* it installs. Pass 3 read it against the
+**builder it drives** — qubes-builderv2 at `mm_db047c1c`, the `qubes-release`
+component at `release4.3`, and `qubes-lorax-templates` at `release4.3`, all
+checked out and read rather than recalled. Most of what it found could not have
+been caught by reading this repository alone, because the defect was always an
+assumption about what upstream does with what we hand it.
+
+Every finding below was reproduced before it was fixed, and every fix was
+checked by reverting it and confirming the suite fails.
+
+### Would not have worked
+
+**1. The build could not start.** `builder.yml` is seeded verbatim from
+upstream's `example-configs/qubes-os-r4.3.yml`, which ships the container
+executor commented out and `executor: {type: qubes, options: {dispvm: "@dispvm"}}`
+live. That executor drives qrexec into a disposable qube. On the Debian/Fedora
+build host this project documents — and that `doctor` explicitly checks for, by
+refusing to run in dom0 — the very first `./qb` call could not run. Nothing in
+the repository ever wrote an `executor` key.
+
+**2. Nothing the installer needs ever reached the installer.** The `%post`
+provisioning payload, the first-boot service and timer, and the unattended
+Anaconda answers were written into `qubes-release/conf/investigator.ks`, and
+`builder.yml`'s `iso: kickstart:` pointed at it. That file is a *compose*
+manifest: `qubesbuilder/plugins/installer/Makefile:116` feeds it to
+`scripts/ksparser`, which extracts `repo` lines and the package list and
+discards everything else. `LORAX_OPTS` carries no kickstart, and `inst.ks`
+appears nowhere in qubes-builderv2. An install would have produced stock Qubes
+with no provisioner on it.
+
+The route Qubes actually provides was found in its own lorax templates: both
+`grub2-bios.cfg` and `grub2-efi.cfg` on `release4.3` end with
+`if search --set=oem -l QUBES_OEM` … `inst.ks=hd:LABEL=QUBES_OEM` and
+`set default="qubes-oem"`. The install-time kickstart now goes on a
+QUBES_OEM-labelled filesystem, which `write-usb` creates. The signed ISO is not
+modified.
+
+**3. The default build aborted before producing an ISO.**
+`validate_install_contract` required `lang`, `keyboard`, `timezone`,
+`user --name=`, `autopart --encrypted` and `reboot` of the stock kickstart plus
+ours. The real `conf/iso-online.ks` and `conf/qubes-kickstart.cfg` on
+`release4.3` contain nothing but `repo` lines and a `%packages` block — none of
+those six. The contract could never be satisfied, so the default,
+non-unattended build failed every time.
+
+**4. Five "investigator" templates that were stock Debian.**
+qubes-builderv2 finds a Debian flavor's content at
+`<sources>/builder-debian/template_debian/<flavor>`; the template plugin builds
+that list itself (`template_flavor_dir` starts empty) and hardcodes extra
+directories only for `whonix-*`, `kicksecure` and names starting with `kali`.
+There is no configuration hook, and `builder-debian/template_debian` holds only
+gnome, xfce, minimal, firmware and flash. A flavor with no directory there does
+not fail — the plugin falls back to the distribution defaults. The build
+succeeded, produced `qubes-template-investigator-kali-*.rpm` containing stock
+Debian trixie, and both checks this script made (the RPMs exist, the ISO lists
+them) passed. The build now verifies the flavor directories on that exact search
+path and refuses; `tier` defaults to 1, where `golden_image.py` builds the
+investigator templates on the target.
+
+**5. The documented release path always failed.** `release_candidate.py` never
+passed `--backup-passphrase-file`, but bootstrap onboarding requires a
+backup-encryption secret on any non-interactive run and a trusted runner has no
+terminal to prompt at. It failed at onboarding, before anything was built.
+
+**6. `bootstrap` gave `backup-key` the wrong secret.** Unlocking the signing key
+to export it and encrypting the resulting backup are two different passphrases —
+the code's own prompt says "They may differ" — and both were taken from
+`--passphrase-file`, which bootstrap filled with the backup secret.
+
+### Would have been accepted when it should not have been
+
+**7. A revoked signing key passed every check.** Measured against gpg 2.4: a
+revoked key still emits `VALIDSIG` and gpg still exits 0. Only `GOODSIG`
+becoming `REVKEYSIG`, plus a `KEYREVOKED` line, distinguishes it. `write-usb` —
+the last checkpoint before an image reaches removable media — and the
+release-candidate gate both rested on `VALIDSIG` alone.
+
+**8. A genuine image was rejected by its own tooling.** `VALIDSIG` names the key
+that made the signature *first* and the primary *last*. A normal GnuPG key signs
+with a signing subkey, which is the shape `gen-key --use-key` adopts, so
+comparing the first field against the unit's primary fingerprint rejected a
+perfectly good image — in `write-usb`, in the release gate, and in the
+`verify-iso.sh` shipped to recipients. `bootstrap_workflow.py` read both fields
+and was already correct.
+
+**9. An unchecked supply chain reported as a checked one.** Every upstream fetch
+failure in `check-upstream` was a WARN, and only FAIL was blocking, so with no
+network it printed its findings and exited 0 having verified nothing — and exit
+0 is what the bootstrap step, the pre-build gate, the release gate and the
+scheduled CI job all read as "current". Unreachable sources are now a distinct
+state, and blocking.
+
+**10. One documented command bricked the configuration.** The `--set` line
+printed in GUIDE §8 wrote `install.disk=/dev/nvme0n1`; both writes reported
+success, and every later invocation then died in `load_config`'s cross-field
+gate before doing anything — including the `--set` needed to correct it. Only
+hand-editing the JSON recovered it.
+
+### The tests were the problem too
+
+Rewiring `sys-proxy` straight to `sys-firewall` — removing the IPS and the DPI
+recorder from the traffic path entirely — left the whole suite green. Everything
+asserted that the provisioner *ran*; nothing asserted what it *built*, and the
+stub answers every in-qube command 0.
+
+- The chain topology is now read back off the world the run produced, including
+  a sweep over every qube for anything attached above `sys-proxy`.
+- `--verify` executes 83 checks and nothing asserted that. There is now a floor
+  and a list of the groups by name — the floor alone is too blunt, because
+  deleting one group stays above any threshold loose enough not to be brittle.
+- Generated shell scripts are handed to `bash -n`. Writing that check exposed
+  its own blind spot: keying on the shebang alone meant a script that *lost*
+  its `#!` line stopped being checked rather than failing.
+- `check_unbound` was called against `sys-proxy`, but phase 7 writes
+  `unbound-quad9.conf` into `sys-firewall`, so six DNS-over-TLS assertions never
+  ran.
+- The Tor-gateway check read `"sys-whonix" not in [line for line in … if
+  "sys-whonix" in line]` — a list of whole lines tested for membership of the
+  bare string, which no line can equal. It could not fail.
+
+Static checks went from 59 to 106 on the same generated output. None of the new
+ones needed a code change to pass; they were simply never asked.
+
+### Still true after this pass
+
+Neither script has been run end to end on real hardware, and that is the one
+thing no amount of tooling closes. What changed is that the failures waiting
+there are now hardware failures rather than failures that a careful reading of
+upstream would have predicted. Specifically, the first real boot is what
+decides these, and each was chosen because it is what upstream's own code
+says — not because it was observed working:
+
+- GRUB selecting the `qubes-oem` entry by default when a `QUBES_OEM` label is
+  present, on both BIOS and UEFI, exactly as `grub2-bios.cfg` and
+  `grub2-efi.cfg` on `release4.3` say it will.
+- Anaconda accepting `user --name=investigator --groups=wheel --lock` with no
+  `rootpw` line as a complete user configuration (a locked administrator in
+  `wheel`), in both the unattended and the manual path.
+- `sgdisk -e` plus an appended partition on a stick written from a **real**
+  Qubes ISO leaving BIOS boot intact. It was measured on a synthetic hybrid
+  image with the same structure; the real image is larger and its GPT is
+  xorriso's, not sgdisk's.
+- The dom0 package set carried into the install-time kickstart from the
+  compose kickstart's `%packages` producing the same installed system as an
+  interactive install of the same ISO.
 
 ---
 
@@ -389,7 +579,14 @@ Qubes 4.3.1 install and a decision:
 
 - an end-to-end run on real hardware — neither script has had one. This is the
   one thing on this page that no amount of tooling closes.
-- whether the Kali apt pin priorities suit your unit's tool set in practice
-- whether `pykickstart` merges two `%packages` sections as expected (standard
-  Anaconda behaviour, not confirmed against a Qubes-specific source; the build
-  prints `[VERIFY]` at the moment it matters)
+- the Kali dist-upgrade of a live Qubes Debian 13 template: upstream runs the
+  same sequence in a build chroot; whether it completes cleanly in a running
+  template, and how long `kali-linux-default` takes through the update proxy,
+  is a hardware answer
+- `qubesctl --all state.highstate` from the first-boot runner: the wizard runs
+  it from a logged-in session; the sequence is the wizard's, the timing under
+  systemd at first boot is not measured
+- the update-proxy path for `curl`: derived from core-agent's proxy
+  configuration and tinyproxy's `ConnectPort 443`, not exercised
+- the bind mount of `/var/ossec` in a Whonix qube, where bind-dirs carries
+  Whonix's own entries

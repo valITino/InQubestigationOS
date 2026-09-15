@@ -2,3 +2,7 @@
 # dependency model; these packages are installed only by CI and contributors.
 bandit==1.9.4
 ruff==0.15.12
+# pykickstart parses the generated install-time kickstart in CI, so a
+# kickstart that Anaconda would reject fails a push rather than a laptop.
+# Pinned: this is the one third-party artefact the build validates with.
+pykickstart==3.78

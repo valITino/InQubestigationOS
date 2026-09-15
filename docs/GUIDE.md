@@ -1,6 +1,6 @@
 # InQubestigationOS — the complete guide
 
-The current build quick start is the single `./build_iso.py bootstrap` workflow, not a manual mount/build/copy checklist. Complete the measured fields and read [BOOTSTRAP.md](BOOTSTRAP.md).
+The quick start is one command, `./build_iso.py quickstart --usb`. `./build_iso.py bootstrap` is the production release path with independent key-backup media and an audited export; its contract is in [BOOTSTRAP.md](BOOTSTRAP.md).
 
 From an empty build host to an issued investigator laptop. Follow it in order.
 
@@ -31,7 +31,7 @@ and not the laptop you are building — it is a separate machine or VM.
 |---|---|---|
 | A Debian-family or Fedora-family Linux | qubes-builderv2 ships dependency lists for both families. Debian, Kali and Ubuntu all qualify — see the next table | you |
 | Docker, usable without `sudo` | Build cages. Podman cannot currently build DEB packages | `setup-host` |
-| ~250 GB free disk | Five templates plus the ISO. Tier 1 needs ~100 GB | you |
+| ~100 GB free disk | Tier 1, the default. Tier 2 builds five templates locally and needs ~250 GB | you |
 | 8 GB RAM minimum | Builds are slow and can OOM below this | you |
 | 4 CPU cores recommended | Nothing enforces it, but two cores roughly doubles an already long build | you |
 | Several hours | The Kali *template* dominates — and see the warning below about the two different things called "Kali" here | you |
@@ -111,7 +111,7 @@ it as follows:
 
 | | |
 |---|---|
-| **Virtual disk** | 250 GB for Tier 2, 100 GB for Tier 1. Prefer a dynamically-allocated disk so it only consumes what it uses, but **check the host has the space to grow into** — running the physical disk out mid-build is the most common way this fails. |
+| **Virtual disk** | 100 GB for Tier 1 (the default), 250 GB for Tier 2. Prefer a dynamically-allocated disk so it only consumes what it uses, but **check the host has the space to grow into** — running the physical disk out mid-build is the most common way this fails. |
 | **RAM** | 8 GB minimum, 12–16 GB if the physical machine allows. |
 | **CPUs** | 4 cores recommended, 2 workable. |
 | **Guest additions** | Not needed. Nothing here uses a GUI. |
@@ -192,38 +192,9 @@ a PowerShell script beside the ISO for exactly this:
 
 ```powershell
 .\verify-iso.ps1 <the fingerprint you were given out of band>
-erify-iso.ps1 <the fingerprint you were given out of band>
-# The administrator mounts the removable backup filesystem first. Merely
-# creating /mnt/image-key-backup is deliberately not sufficient.
-sudo mount LABEL=IMAGE-KEY-BACKUP /mnt/image-key-backup
-install -m 600 /dev/null /run/user/$UID/inqubestigation-gpg.pass
-# Write the passphrase into that runtime file without putting it in shell history.
-read -rsp 'Signing/backup passphrase: ' P; printf '%s' "$P" > /run/user/$UID/inqubestigation-gpg.pass; unset P; echo
-sudo -v
-./build_iso.py bootstrap --yes \
-  --uid "Kapo Cyber Image Signing <cyber@example.ch>" --expire 3y \
-  --passphrase-file /run/user/$UID/inqubestigation-gpg.pass \
-  --to /mnt/image-key-backup/inqubestigation
-For every repeat build, mount the same backup medium and use the same runtime
-secret file, then run the **same command**. The fingerprint already pinned in
-`iso-build.json` wins: bootstrap verifies and reuses that key even though
-`--uid` remains present, safely refreshes the encrypted backup, checks signing
-with an empty agent cache, and resumes only marks whose configuration and Git
-revision still match. `--yes` never creates a second identity. If the configured
-key is missing or selection is ambiguous, the command stops and tells you to
-restore it or pass its full fingerprint.
+```
 
-The runtime passphrase file must be owned by the build user and mode `0600` (a
-protected FIFO or inherited `/proc/self/fd/N` is also accepted). Delete it after
-the run. It is never copied into JSON, logs, artifacts, or the ISO. Run bootstrap
-as the ordinary build user, not via `sudo`; after `setup-host`, orchestration
-enters the new Docker group with `sg` while retaining that user's HOME and GPG
-keyring. For `--yes`, authenticate with `sudo -v` first; the script verifies
-non-interactive sudo readiness and does not edit sudo policy.
-
-./build_iso.py bootstrap
-non-interactive sudo readiness and does not edit sudo policy.
-
+It checks the SHA-256 with Windows' own tooling and the GPG signature via
 Gpg4win, and exits non-zero on any mismatch. Without a fingerprint argument it
 prints the signer for you to compare by eye. If Gpg4win is not installed it says
 so and exits 2 rather than implying the image is trustworthy.
@@ -243,20 +214,32 @@ intend to issue.
 
 ## 2. Prepare the build host
 
-**The short version.** Sections 2 to 6 are one command:
+**The short version.** Sections 2 to 7 are one command:
 
 ```bash
 git clone <your-internal-url>/InQubestigationOS.git
 cd InQubestigationOS
-./build_iso.py bootstrap
+./build_iso.py quickstart --usb
 ```
 
-It runs `setup-host`, `gen-key`, `backup-key`, `doctor`, `check-upstream`, the
-dry-run plan and then the build, in that order, stopping at the first failure —
-and every step is idempotent, so after fixing a cause you run `bootstrap` again
-and the completed steps are skipped. It does not write the USB (you have to plug
-it in) and it does not distribute the fingerprint (that has to travel
-separately). Add `--yes` for an unattended run.
+It checks the host first and fixes what it can (`doctor`, then `setup-host` if
+anything was missing), creates or reuses the signing key, backs it up, checks
+the pinned supply chain, builds and signs the ISO, and then waits for a USB
+stick and writes it — installer answer file included. It asks for one
+passphrase, once. Everything that can fail fast does, before the multi-hour
+build starts; every step is idempotent, so after fixing a cause you run it
+again and the completed steps are skipped. Add `--yes` to also skip the
+"write to /dev/sdX?" confirmation, and `--no-passphrase` for a throwaway lab
+build that asks nothing at all.
+
+Two things it deliberately leaves to you: the key backup lands beside the
+build (it says so, loudly — copy it to removable media before you ship an
+image signed with that key), and the fingerprint still has to travel to
+recipients by a channel independent of the stick.
+
+`bootstrap` is the production release path: it insists on independent
+key-backup media and an audited export destination before it builds. Use it
+for a release you will hand to others.
 
 The rest of this section, and sections 3 to 6, explain what each of those steps
 does and how to run them individually.
@@ -312,7 +295,7 @@ For an unattended run, `--yes` answers every prompt.
 ## 3. Create the signing key
 
 ```bash
-| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
+./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"
 ```
 
 That generates an rsa4096 signing key with a three-year expiry — deliberate: an
@@ -338,8 +321,48 @@ If your unit already has an image-signing key in this keyring, adopt it instead:
 > the fingerprint goes in `iso-build.json`. The private key stays in the build
 > host's keyring. The build script refuses to start if it finds a key block, and
 > validates the fingerprint format before anything else runs.
-| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
 > Details in [SIGNING.md](SIGNING.md).
+
+### Production path: `bootstrap`
+
+`quickstart` keeps the key backup on the build host. For an image you intend to
+issue, `bootstrap` insists on independent backup media and an audited export;
+it is what `make bootstrap` and the release workflow run. Full detail in
+[BOOTSTRAP.md](BOOTSTRAP.md); a first run looks like this:
+
+```bash
+# The administrator mounts the removable backup filesystem first. Merely
+# creating /mnt/image-key-backup is deliberately not sufficient.
+sudo mount LABEL=IMAGE-KEY-BACKUP /mnt/image-key-backup
+install -m 600 /dev/null /run/user/$UID/inqubestigation-gpg.pass
+# Write the passphrase into that runtime file without putting it in shell history.
+read -rsp 'Signing/backup passphrase: ' P; printf '%s' "$P" > /run/user/$UID/inqubestigation-gpg.pass; unset P; echo
+sudo -v
+./build_iso.py bootstrap --yes \
+  --uid "Kapo Cyber Image Signing <cyber@example.ch>" --expire 3y \
+  --passphrase-file /run/user/$UID/inqubestigation-gpg.pass \
+  --to /mnt/image-key-backup/inqubestigation
+```
+
+The backup-encryption passphrase is a second secret: on a terminal it is asked
+for, and `--backup-passphrase-file` supplies it where nobody is at the keyboard.
+
+For every repeat build, mount the same backup medium and use the same runtime
+secret file, then run the **same command**. The fingerprint already pinned in
+`iso-build.json` wins: bootstrap verifies and reuses that key even though
+`--uid` remains present, safely refreshes the encrypted backup, checks signing
+with an empty agent cache, and resumes only marks whose configuration and Git
+revision still match. `--yes` never creates a second identity. If the configured
+key is missing or selection is ambiguous, the command stops and tells you to
+restore it or pass its full fingerprint.
+
+The runtime passphrase file must be owned by the build user and mode `0600` (a
+protected FIFO or inherited `/proc/self/fd/N` is also accepted). Delete it after
+the run. It is never copied into JSON, logs, artifacts, or the ISO. Run bootstrap
+as the ordinary build user, not via `sudo`; after `setup-host`, orchestration
+enters the new Docker group with `sg` while retaining that user's HOME and GPG
+keyring. For `--yes`, authenticate with `sudo -v` first; the script verifies
+non-interactive sudo readiness and does not edit sudo policy.
 
 ---
 
@@ -350,7 +373,7 @@ sensible default. To change anything else, name it — no editor, and a typo is
 rejected rather than silently ignored:
 
 ```bash
-./build_iso.py --set work_dir=/srv/build --set tier=2
+./build_iso.py --set work_dir=/srv/build
 ./build_iso.py --get tier
 ./build_iso.py config                    # print every effective setting
 ```
@@ -360,11 +383,18 @@ The settings that matter:
 | Key | Set it to |
 |---|---|
 | `iso_sign_key` | set for you by `gen-key` |
-| `tier` | `2` (default) — templates baked in, installs with no network |
+| `tier` | `1` (default) — stock templates in the ISO; the investigator templates are built on the target at first boot, which needs network and 1-3 hours |
 | `qubes_release` | `r4.3` |
 | `mock_config` | `auto` (default) — derived from the fetched builder for your release |
-| `work_dir` | Somewhere with 250 GB free |
+| `work_dir` | Somewhere with 100 GB free, or 250 GB for tier 2 |
 | `auto_provision` | `true` — first boot configures itself |
+| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
+
+To transport provisioner settings, create a reviewed JSON file containing only
+non-secret overrides and set `provisioner_config=/path/to/golden-image.json`.
+The build rejects secret-looking populated fields and version mismatches, embeds
+the validated JSON beside `golden_image.py`, and the target loads that exact
+neighbor. Per-machine credentials are still generated only after installation.
 
 Before a first build, check that what the image trusts is still what upstream
 publishes:
@@ -393,6 +423,9 @@ save you hours.
 
 ## 5. Build the templates
 
+Tier 2 only. At tier 1, the default, skip this section: `all` builds the ISO
+alone and the investigator templates are built on the target at first boot.
+
 ```bash
 ./build_iso.py templates
 ```
@@ -411,7 +444,13 @@ What happens:
 4. **Generates the template component** at
    `~/investigator-iso/qubes-template-investigator`, structured like the upstream
    `qubes-template-kali` component.
-5. **Builds five templates**, each a full debootstrap:
+5. **Installs the flavor content where qubes-builderv2 looks** — it fetches
+   `builder-debian`, copies each hook to
+   `template_debian/<flavor>/04_install_qubes_post.sh` with the keyring beside
+   it, and refuses to build unless the hook is there. Nothing else puts it on
+   the builder's search path, and a flavor it cannot find builds as stock
+   Debian under the investigator name.
+6. **Builds five templates**, each a full debootstrap:
 
 | Template | Contents |
 |---|---|
@@ -497,6 +536,15 @@ Rather than a `dd` line you have to get right at four in the afternoon, this:
 - writes, syncs, then **reads the stick back** and compares it byte for byte. A
   stick that writes without error and reads back wrong is a failure you would
   otherwise discover at the install, on someone else's desk
+- verifies the signature on `oem/ks.cfg` — the install-time kickstart it then
+  puts on the stick's `QUBES_OEM` partition — against the same key, **before**
+  any of the above. That file runs as root inside the installer and the
+  image's signature does not cover it; the build signs it beside the image,
+  and an unsigned or altered one is refused. `verify-iso.sh` checks it too
+  when the bundle carries one. Nothing verifies the stick at boot, for the
+  image or for the kickstart: Qubes' installer has no such mechanism, so a
+  written stick is protected by custody, exactly as an image-only stick
+  always was
 
 With one removable device plugged in, `--device` can be omitted.
 
@@ -507,46 +555,17 @@ Colleagues verify before installing — one command, shipped beside the image:
 ```
 
 It checks the checksum, imports the key, verifies the signature, and then prints
-./build_iso.py --set install.unattended=true \
-  --set install.disk=/dev/disk/by-id/wwn-0x5002538d00000000
+the fingerprint it verified against so they can compare it with the one you gave
+them. By hand it is still:
+
+```bash
+sha256sum -c InQubestigationOS.iso.sha256
+gpg --import unit-signing-key.asc
+gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
 ```
 
-`wwn-0x5002538d00000000` is an example only. Record the actual stable identifier
-from the Qubes target machine and use that exact value for its image; never copy
-the example or derive the value from the build host.
-
-It is **off by default** on purpose. The disk value is a stable identity read
-from the laptop being installed (use the exact `/dev/disk/by-id/` or
-`/dev/disk/by-path/` link recorded for that machine), not `/dev/sda` or the
-builder VM's disk. At install time, before emitting any `clearpart`, `%pre`
-requires the identity to resolve uniquely to one whole disk and rejects missing,
-ambiguous, partition, and installation-media matches. Blank can never mean
-`clearpart --all`. A fleet whose disks have different identities needs a
-per-machine ISO/configuration; there is deliberately no "pick the only fixed
-disk" fallback.
-
-To transport provisioner settings, create a reviewed JSON file containing only
-non-secret overrides and set `provisioner_config=/path/to/golden-image.json`.
-The build rejects secret-looking populated fields and version mismatches, embeds
-the validated JSON beside `golden_image.py`, and the target loads that exact
-neighbor. Per-machine credentials are still generated only after installation.
-1. Boot the verified USB and deliberately select installation.
-2. Confirm that the stable disk identity shown for this machine is the intended
-   target; a mismatch stops before partitioning.
-3. Enroll the machine's unique LUKS passphrase when Anaconda asks. No shared
-   passphrase is embedded and encryption cannot be disabled in unattended mode.
-4. The installer completes and reboots. `install.auto_initial_setup` (on by
-   default) means the first-boot runner completes Qubes' own initial setup
-   non-interactively, and retries
-templates are already on disk, so installation and local provisioning do not
-need a repository download. This is **not** a claim that online acceptance has
-passed: first boot runs local/offline checks and records DNS resolution and Tor
-exit confirmation as `PENDING ONLINE`, never PASS. Run the full `--verify` after
-network enrollment; issuance remains blocked by real failures.
-
-   non-interactively, and retries every thirty minutes until the machine is
-   provisioned — so a laptop left alone overnight finishes by itself.
-phases and the offline-capable acceptance gate return success.
+> **The fingerprint must travel separately from the ISO.** A public key shipped
+> on the same USB stick as the image it signs proves nothing — anyone who can
 > replace the image can replace the key beside it. Read the fingerprint out over
 > the phone, or publish it somewhere colleagues already trust. `FINGERPRINT.txt`
 > is formatted for exactly that, and `write-usb` reminds you to carry it
@@ -562,8 +581,27 @@ the generated kickstart carries the language, keyboard, timezone and
 partitioning answers, so Anaconda stops asking them:
 
 ```bash
-./build_iso.py --set install.unattended=true --set install.disk=/dev/nvme0n1
+# Find the target's stable identity ON THE LAPTOP, not on the build host:
+ls -l /dev/disk/by-id/ | grep -v part
+
+./build_iso.py --set install.unattended=true \
+  --set install.disk=/dev/disk/by-id/nvme-SAMSUNG_MZVL2512HCJQ_S64ANS0T123456
 ```
+
+`install.disk` must be a `/dev/disk/by-id/...` or `/dev/disk/by-path/...` path.
+A kernel name like `/dev/nvme0n1` is refused: those are assigned in discovery
+order and the disk that answers to it on the build host is not the one that
+answers to it on the laptop — which, for a directive that erases the disk, is
+not a mistake worth being able to make. Both `--set`s go in **one command**:
+`unattended` without a target disk is not a configuration a build can use, so
+setting them separately is refused and nothing is written. The value shown is
+an example: record the actual identifier from the laptop being installed. At
+install time, before any `clearpart` is emitted, the kickstart's `%pre` requires
+that identity to resolve to exactly one whole disk on that machine and stops on
+a missing, ambiguous, partition or installation-media match. Blank can never
+mean `clearpart --all`, and there is deliberately no "pick the only fixed disk"
+fallback: a fleet whose disks have different identities needs a per-machine
+configuration.
 
 It is **off by default** on purpose: it names a disk and erases it, which is not
 a thing to turn on by accident. Turn it on once you have decided which disk, and
@@ -575,12 +613,17 @@ that has to stay human cannot be clicked past by someone in a hurry.
 
 Then the install is:
 
-1. Boot the USB.
-2. Answer the passphrase prompt. That is the only prompt.
-3. Reboot. `install.auto_initial_setup` (on by default) means the first-boot
-   runner completes Qubes' own initial setup non-interactively, and retries
-   every thirty minutes until the machine is provisioned — so a laptop left
-   alone overnight finishes by itself.
+1. Boot the verified USB. The installer starts by itself; `%pre` checks the
+   disk identity and stops before partitioning if it does not match.
+2. Enroll the machine's unique disk-encryption passphrase when Anaconda asks.
+   No shared passphrase is embedded and encryption cannot be disabled in
+   unattended mode. That is the only prompt.
+3. The installer completes and reboots. `install.auto_initial_setup` (on by
+   default) means the first-boot runner completes Qubes' own initial setup
+   non-interactively — the templates the ISO carries are installed, the
+   default kernel and template set, and the same salt states the wizard would
+   apply are applied — and retries every thirty minutes until the machine is
+   provisioned, so a laptop left alone overnight finishes by itself.
 
 **Without `install.unattended`** it is the ordinary Qubes install:
 
@@ -596,8 +639,26 @@ Then the install is:
 
 ## 9. First boot
 
-Provisioning starts automatically. On a Tier 2 image the templates are already
-on disk, so this wires the topology only — minutes, not hours.
+Provisioning starts automatically and needs nobody at the keyboard. On a
+Tier 1 image — the default — the investigator templates are built here, from
+the network: expect 1-3 hours and make sure the machine has connectivity. On a
+Tier 2 image the templates are already on disk, so this wires the topology
+only, in minutes. Either way the templates are shut down after each phase that
+installs into them, so every qube created afterwards boots with what was
+installed rather than the template's previous root.
+
+Local provisioning does not need a repository download, but that is **not** a
+claim that online acceptance has passed: first boot runs the offline checks and
+records DNS resolution and Tor exit confirmation as `PENDING ONLINE`, never
+PASS. Run the full `--verify` once the machine is on its network; issuance
+stays blocked by real failures.
+
+The console will ask, once per run, for the `investigator` login password —
+the one thing only a person can supply. It waits 90 seconds and then carries
+on without it; provisioning never depends on that answer. If you were not
+there, the question comes back at the next boot and every 30 minutes, and
+`sudo golden-image-firstboot` asks it right now. The machine counts as fully
+provisioned only once both halves are done.
 
 Watch it:
 
@@ -768,6 +829,7 @@ instead. Nothing below needs a calendar entry or a named owner.
 | Weekly | `suricata-update` + in-place `reload-rules` | `sys-ids` | `golden-suricata-update.timer` |
 | Monthly | **Restore verification** of the newest set | dom0 | `golden-restore-test.timer` |
 | Monthly | Zeek OBS, Kali and Wazuh key expiry watch | `sys-dpi` | `golden-key-expiry.timer` |
+| Weekly | Renew a repository key inside its expiry window — verified against the pinned fingerprint, rolled back otherwise | dom0 | `golden-key-refresh.timer` |
 | Daily | "Is this image too old to install safely?" | dom0 | `golden-staleness.timer` |
 | Weekly, in CI | Signing keys, versions and Qubes bulletins vs upstream | build host | `check-upstream` |
 

@@ -67,7 +67,8 @@ def main():
     assert rc.ALLOWLIST == (
         "InQubestigationOS.iso", "InQubestigationOS.iso.sha256",
         "InQubestigationOS.iso.asc", "unit-signing-key.asc", "verify-iso.sh",
-        "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt")
+        "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt",
+        "oem/ks.cfg", "oem/ks.cfg.asc")
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "x"
         p.write_bytes(b"release-candidate")
@@ -81,7 +82,52 @@ def main():
     for gate in ("min-work-gb", "min-docker-gb", "sudo", "docker", "list-secret-keys",
                  "check-upstream", "signature signer mismatch", "allowlist mismatch"):
         assert gate in source, gate
-    print("  23/23 release-candidate policy checks pass")
+
+    # bootstrap onboarding requires a backup-encryption secret on any
+    # non-interactive run (bootstrap_workflow.py), and a trusted runner has no
+    # terminal to prompt at. Without it this entry point failed at onboarding,
+    # before anything was built — so the documented release path never worked.
+    bootstrap_call = source[source.index('"bootstrap"'):]
+    bootstrap_call = bootstrap_call[:bootstrap_call.index("]") + 1]
+    assert "--passphrase-file" in bootstrap_call, bootstrap_call
+    assert "--backup-passphrase-file" in bootstrap_call, bootstrap_call
+    assert "a.backup_passphrase_file" in bootstrap_call, bootstrap_call
+    # Required, not optional: an unset one would reintroduce the same failure.
+    assert '"--backup-passphrase-file", required=True' in source
+
+    # The workflow has to materialise a second, distinct secret, and remove it.
+    assert "IQ_BACKUP_SESSION_SECRET" in workflow
+    assert "iq-backup-session" in workflow
+    assert '"$SESSION_SECRET" != "$BACKUP_SECRET"' in workflow
+    removal = workflow[workflow.index("- name: Remove the signing session"):]
+    assert "iq-backup-session" in removal[:removal.index("- name:", 10)], \
+        "the backup secret must be removed from the runner too"
+
+    # The two secrets are not interchangeable, and using one file for both
+    # would mean the backup is protected by the signing passphrase.
+    assert ("a.passphrase_file.resolve() == a.backup_passphrase_file.resolve()"
+            in source), "the two passphrase files must be rejected if identical"
+    # Tier 1 is the default and the documented path; a release gate that only
+    # accepted tier 2 refused every default configuration, and RELEASE.md said
+    # so as if it were policy.
+    assert 'cfg.get("tier") not in (1, 2)' in source, "tier 1 must pass the release gate"
+    assert 'tier=2' not in source
+    assert "`tier` to `1` or `2`" in (ROOT / "docs/RELEASE.md").read_text()
+    # The documented RC_ARGS must carry every flag the parser requires.
+    release_doc = (ROOT / "docs/RELEASE.md").read_text()
+    assert "--backup-passphrase-file /run/user/$UID/iq-backup-session" in release_doc
+    # Two files holding the same passphrase are the same secret; the gate
+    # compares values, not only paths.
+    assert ("a.passphrase_file.read_bytes().strip() == "
+            "a.backup_passphrase_file.read_bytes().strip()") in source
+    # The install-time kickstart is staged with the candidate, its signature
+    # is verified by the gate, and a stray file under oem/ fails the allowlist.
+    assert 'verify_signature(output / "oem/ks.cfg", output / "oem/ks.cfg.asc", fingerprint)' in source
+    assert 'present += [f"oem/{p.name}"' in source
+    assert "(candidate / name).parent.mkdir(parents=True, exist_ok=True)" in source
+    release_doc = (ROOT / "docs/RELEASE.md").read_text()
+    assert "`oem/ks.cfg`" in release_doc and "`oem/ks.cfg.asc`" in release_doc
+    print("  40/40 release-candidate policy checks pass")
     return 0
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ STUB_NAMES = [
     "qvm-check", "qvm-create", "qvm-clone", "qvm-prefs", "qvm-ls", "qvm-run",
     "qvm-start", "qvm-shutdown", "qvm-volume", "qvm-features", "qvm-firewall",
     "qvm-backup", "systemctl", "qubes-vm-update", "qubesctl", "logger",
+    "qubes-prefs", "qvm-template", "qvm-service", "rpm",
 ]
 
 # A stock Qubes 4.3 install, before provisioning.
@@ -40,6 +42,11 @@ BASE_VMS = [
 ]
 
 RESULTS: list[tuple[str, bool, str]] = []
+
+# How many acceptance checks --verify must actually execute. Not a target to
+# tune: it exists so that DELETING acceptance groups fails the suite. Raise it
+# when groups are added; never lower it to make a run pass.
+ACCEPTANCE_FLOOR = 75
 
 
 def stage(name: str, ok: bool, detail: str = "") -> None:
@@ -68,6 +75,13 @@ def build_world(path: Path) -> None:
         # model the parts that must answer "no" on a fresh install.
         "qtest": [
             {"match": "test -d /var/ossec", "rc": 1},
+            # A stock install carries none of the payloads: the tier-1 install
+            # path (phase 4) has to run, or the Kali recipe, the Zeek key fetch
+            # and the office payload are never exercised at all.
+            {"match": "command -v maltego", "rc": 1},
+            {"match": "command -v libreoffice", "rc": 1},
+            {"match": "command -v suricata", "rc": 1},
+            {"match": "command -v squid", "rc": 1},
             # The Tier 2 template bakes the vendor tools in; the SIEM packages
             # are modelled as absent so the Tier 1 install path is exercised,
             # and the stub records the install so the re-check afterwards passes.
@@ -176,6 +190,54 @@ def main() -> int:
     stage("phases recorded as complete", len(done) >= 11,
           f"only {len(done)} phases marked: {' '.join(done)}")
 
+    # ------------------------------------------------------------------
+    # The inspected chain, read back off the world the run actually built.
+    #
+    # Everything above this asserts that the provisioner RAN. None of it
+    # asserted WHAT IT BUILT, and the stub answers every in-qube command 0,
+    # so rewiring sys-proxy straight to sys-firewall — removing the Suricata
+    # IPS and the Zeek DPI recorder from the path entirely, which is the
+    # design's central claim — left the whole suite green.
+    world = json.loads((work / "world.json").read_text())
+    prefs = {name: vm.get("prefs", {}) for name, vm in world.get("vms", {}).items()}
+
+    def netvm_of(name: str) -> str:
+        return prefs.get(name, {}).get("netvm", "")
+
+    # qube -> sys-proxy -> sys-ids -> sys-dpi -> sys-firewall -> sys-net
+    CHAIN = [("sys-proxy", "sys-ids"), ("sys-ids", "sys-dpi"),
+             ("sys-dpi", "sys-firewall")]
+    for downstream, upstream in CHAIN:
+        stage(f"{downstream} routes through {upstream}",
+              netvm_of(downstream) == upstream,
+              f"{downstream} netvm is {netvm_of(downstream)!r}, not {upstream!r}"
+              " — traffic would skip an inspection hop")
+
+    # No clearnet qube may attach above sys-proxy. This is the property the
+    # whole topology exists to enforce, so it is asserted over every qube
+    # rather than over a list that could quietly stop including one.
+    chain_members = {"sys-proxy", "sys-ids", "sys-dpi", "sys-firewall",
+                     "sys-net", "sys-usb", "sys-whonix"}
+    bypassing = sorted(
+        name for name, p in prefs.items()
+        if name not in chain_members
+        and p.get("netvm") in ("sys-firewall", "sys-net"))
+    stage("no clearnet qube bypasses the inspected chain", not bypassing,
+          f"attached above sys-proxy: {', '.join(bypassing)}")
+
+    # The Tor branch joins at the firewall and is deliberately uninspected.
+    stage("sys-whonix joins at the firewall",
+          netvm_of("sys-whonix") in ("sys-firewall", ""),
+          f"sys-whonix netvm is {netvm_of('sys-whonix')!r}")
+
+    # Offline qubes must have no netvm at all. An offline qube reports 'none',
+    # not an empty string, so both spellings are accepted deliberately.
+    for offline in ("vault", "dvm-offline"):
+        if offline in prefs:
+            stage(f"{offline} has no netvm",
+                  netvm_of(offline) in ("", "none", "None"),
+                  f"{offline} netvm is {netvm_of(offline)!r}")
+
     creds = Path(env["HOME"]) / "golden-image" / "credentials.json"
     stage("credentials file created", creds.exists())
     if creds.exists():
@@ -196,6 +258,79 @@ def main() -> int:
         leaked = [k for k in ("dashboard", "api", "authd", "backup")
                   if c.get(k) and c[k] in log.read_text()]
         stage("no secret written into build.log", not leaked, f"leaked: {', '.join(leaked)}")
+
+    # ------------------------------------------------------------------
+    # What the provisioner did INSIDE the qubes, read back off the recorded
+    # actions. The stub answers every in-qube command 0, so nothing above can
+    # tell a keyring fetched through the update proxy from one that fails with
+    # "could not resolve host" on a real template, or a template committed
+    # before its qubes were created from one still running with the packages
+    # only in its live root.
+    actions = [json.loads(line) for line in
+               (work / "actions.jsonl").read_text().splitlines() if line.strip()]
+    templates = {"debian-13-xfce", "fedora-43-xfce"} | {
+        n for n in world["vms"] if n.startswith("tpl-")}
+    # An invocation (`curl -…`), not the package name in an apt-get line.
+    tpl_curl = [a for a in actions if a["kind"] == "qrun" and a["vm"] in templates
+                and re.search(r"(?<![\w-])curl\s+-", a["script"])]
+    bare = [a["vm"] + ": " + a["script"][:50] for a in tpl_curl
+            if "--proxy http://127.0.0.1:8082" not in a["script"]]
+    stage("templates fetch repository keys through the Qubes update proxy",
+          bool(tpl_curl) and not bare,
+          "templates have no netvm, so a bare curl fails there: " + "; ".join(bare))
+
+    def first(pred):
+        return next((i for i, a in enumerate(actions) if pred(a)), None)
+
+    def last(pred):
+        hits = [i for i, a in enumerate(actions) if pred(a)]
+        return hits[-1] if hits else None
+
+    def shutdown_of(vm):
+        return lambda a: a["kind"] == "exec" and a["prog"] == "qvm-shutdown" and vm in a["argv"]
+
+    def qrun_in(vm, needle):
+        return lambda a: a["kind"] == "qrun" and a["vm"] == vm and needle in a["script"]
+
+    last_install = last(qrun_in("tpl-proxy", "apt-get install"))
+    first_chain = first(qrun_in("sys-proxy", ""))
+    committed = next((i for i, a in enumerate(actions) if shutdown_of("tpl-proxy")(a)
+                      and last_install is not None and i > last_install), None)
+    stage("templates are shut down after their packages are installed and before "
+          "the chain qubes are configured",
+          None not in (last_install, first_chain, committed) and committed < first_chain,
+          f"install@{last_install} shutdown@{committed} sys-proxy@{first_chain} — a qube "
+          "created from a running template boots the template's OLD root")
+
+    kali = [a["script"] for a in actions if a["kind"] == "qrun" and a["vm"] == "tpl-kali"]
+    up = next((i for i, s in enumerate(kali) if "dist-upgrade" in s), None)
+    ins = next((i for i, s in enumerate(kali) if "--allow-downgrades" in s
+                and "kali-menu" in s and "kali-linux-default" in s), None)
+    stage("the Kali template is dist-upgraded to Kali before the toolset is "
+          "installed, as upstream's template does",
+          up is not None and ins is not None and up < ins, f"upgrade@{up} install@{ins}")
+    stage("no apt call asks for -t kali-rolling against a Debian-preferring pin",
+          not any("-t kali-rolling" in s for s in kali))
+    pin = work / "capture" / "tpl-kali" / "etc/apt/preferences.d/allow-downgrade"
+    stage("Kali is pinned at 1001 for the install, as upstream's template does",
+          pin.is_file() and "Pin-Priority: 1001" in pin.read_text()
+          and "o=Kali" in pin.read_text(), "no allow-downgrade pin captured")
+    stage("the old Debian-over-Kali pin is not written",
+          not (work / "capture" / "tpl-kali" / "etc/apt/preferences.d/99-kali-pin").exists())
+
+    pers = [a["script"] for a in actions if a["kind"] == "qrun" and a["vm"] == "personal"]
+    mnt = next((i for i, s in enumerate(pers) if "mount --bind" in s
+                and "/rw/bind-dirs/var/ossec" in s), None)
+    conf = next((i for i, s in enumerate(pers) if "ossec.conf" in s), None)
+    stage("the agent's /var/ossec is bind-mounted from /rw before it is enrolled",
+          mnt is not None and conf is not None and mnt < conf,
+          f"mount@{mnt} configure@{conf} — written into the volatile root, the "
+          "enrollment is gone at the next boot")
+    hook = work / "capture" / "personal" / "rw/config/golden-image-agent.sh"
+    stage("the agent boot hook honours the case-mode marker",
+          hook.is_file() and "golden-agent-masked" in hook.read_text()
+          and "exit" not in hook.read_text(),
+          "the hook is sourced by rc.local: no exit, and the marker must be checked")
 
     print("\nresume")
     p2 = run(gi, [], env, sandbox)
@@ -238,6 +373,128 @@ def main() -> int:
           (p3.returncode == 0) == ("0 failed" in p3.stdout.replace("\x1b[31m", "")
                                    .replace("\x1b[0m", "")),
           f"rc={p3.returncode} but the summary says otherwise")
+
+    # A floor on how much --verify actually checks. Without one, deleting whole
+    # acceptance groups from golden_image.py — chain order, clearnet bypass,
+    # offline netvm — left the suite completely green: every remaining stage
+    # only asked whether the command ran and whether its exit code agreed with
+    # its own summary, both of which stay true as the suite shrinks.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", p3.stdout)
+    counts = {word: int(n) for n, word in
+              re.findall(r"(\d+)\s+(passed|warnings|failed)", plain)}
+    executed = sum(counts.get(k, 0) for k in ("passed", "warnings", "failed"))
+    stage("--verify reports a countable result", bool(counts), plain[-300:])
+    stage(f"--verify runs at least {ACCEPTANCE_FLOOR} checks",
+          executed >= ACCEPTANCE_FLOOR,
+          f"only {executed} acceptance checks executed "
+          f"({counts}) — groups have been removed or are silently skipping")
+
+    # The count alone is too blunt: deleting one group costs only the handful
+    # of checks it contributed and stays above any floor loose enough not to be
+    # brittle. So the groups that carry the design's security claims are named.
+    # Deleting one has to fail, not merely lower a number.
+    REQUIRED_GROUPS = [
+        "every qube and template this design requires exists",
+        "chain order",
+        "no clearnet qube bypasses the inspection stack",
+        "offline qubes have no netvm",
+        "Wazuh agent present in every template",
+        "supply chain integrity",
+        "DNS enforcement",
+        "inspection services",
+        "proxy logs the originating qube",
+        "Tor branch",
+        "backup",
+        "credentials",
+    ]
+    absent = [g for g in REQUIRED_GROUPS if g not in plain]
+    stage("every acceptance group is still present", not absent,
+          f"--verify no longer runs: {'; '.join(absent)}")
+    # personal and work carry `accept specialtarget=dns` + drop, enforced in
+    # their netvm, so a probe from them never reaches the intercept and fails
+    # a working chain. The probe has to come from a qube without those rules.
+    stage("DNS interception is probed from a qube without the per-qube DNS rule",
+          re.search(r"every port-53 query from (kali-clear|untrusted) is captured",
+                    plain) is not None,
+          "group 7 does not probe from kali-clear or untrusted")
+
+    print("\ncase mode")
+    (work / "actions.jsonl").write_text("")
+    pa = run(gi, ["--case-mode", "anonymous", "--case", "T-1"], env, sandbox)
+    pn = run(gi, ["--case-mode", "normal", "--case", "T-1"], env, sandbox)
+    case_acts = [json.loads(line) for line in
+                 (work / "actions.jsonl").read_text().splitlines() if line.strip()]
+    tor = [a["script"] for a in case_acts if a["kind"] == "qrun" and a["vm"] == "kali-tor"]
+    on = next((i for i, s in enumerate(tor) if s.strip() == "touch /rw/config/golden-agent-masked"), None)
+    off = next((i for i, s in enumerate(tor) if s.strip() == "rm -f /rw/config/golden-agent-masked"), None)
+    stage("--case-mode anonymous/normal both run", pa.returncode == 0 and pn.returncode == 0,
+          pa.stderr[-300:] + pn.stderr[-300:])
+    stage("anonymous leaves a marker in /rw that survives a reboot, normal removes it",
+          on is not None and off is not None and on < off,
+          "systemctl mask alone lives in the volatile root and the boot hook "
+          "would have restarted the agent mid-case")
+
+    print("\ninitial setup (unattended first boot, before any wizard)")
+    build_world(work / "world.json")
+    fresh = json.loads((work / "world.json").read_text())
+    for tpl in ("debian-13-xfce", "fedora-43-xfce"):
+        fresh["vms"].pop(tpl, None)
+    (work / "world.json").write_text(json.dumps(fresh, indent=2) + "\n")
+    dom0 = Path(env["GOLDEN_IMAGE_DOM0_ROOT"])
+    pkgs = dom0 / "var/lib/qubes/template-packages"
+    pkgs.mkdir(parents=True, exist_ok=True)
+    shipped = ("qubes-template-debian-13-xfce-4.3.0-202609010000.noarch.rpm",
+               "qubes-template-fedora-43-xfce-4.3.0-202609010000.noarch.rpm")
+    for rpm in shipped:
+        (pkgs / rpm).write_bytes(b"rpm")
+    kernels = dom0 / "var/lib/qubes/vm-kernels"
+    for k in ("6.6.9-1.qubes.fc41.x86_64", "6.12.31-1.qubes.fc41.x86_64", "misc-1.0"):
+        (kernels / k).mkdir(parents=True, exist_ok=True)
+    (work / "actions.jsonl").write_text("")
+    pi = run(gi, ["--initial-setup"], env, sandbox)
+    stage("--initial-setup exits 0 on a fresh install with no templates yet",
+          pi.returncode == 0, pi.stderr[-400:] + pi.stdout[-400:])
+    setup_acts = [json.loads(line) for line in
+                  (work / "actions.jsonl").read_text().splitlines() if line.strip()]
+    execs = [(i, a["prog"], a["argv"]) for i, a in enumerate(setup_acts) if a["kind"] == "exec"]
+
+    def at(prog, *needles):
+        return next((i for i, p_, av in execs
+                     if p_ == prog and all(nd in av for nd in needles)), None)
+
+    i_tpl = at("qvm-template", "install", "--nogpgcheck")
+    i_kernel = at("qubes-prefs", "default-kernel", "6.12.31-1.qubes.fc41.x86_64")
+    i_deftpl = at("qubes-prefs", "default-template", "debian-13-xfce")
+    i_enable = at("qubesctl", "top.enable", "qvm.sys-net")
+    i_high = at("qubesctl", "--all", "state.highstate")
+    i_disable = at("qubesctl", "top.disable", "qvm.sys-net")
+    i_netvm = at("qubes-prefs", "default-netvm", "sys-firewall")
+    after = json.loads((work / "world.json").read_text())["vms"]
+    stage("the shipped template RPMs are installed with qvm-template --nogpgcheck",
+          i_tpl is not None and all(after.get(t, {}).get("class") == "TemplateVM"
+                                    for t in ("debian-13-xfce", "fedora-43-xfce")),
+          "without them qvm.sys-net has nothing to base sys-net on")
+    stage("the newest VM kernel becomes default-kernel (compared as a version, "
+          "so 6.12 beats 6.6)", i_kernel is not None)
+    stage("default-template is the Debian base", i_deftpl is not None)
+    stage("initial setup runs the wizard's sequence in the wizard's order",
+          None not in (i_tpl, i_deftpl, i_enable, i_high, i_disable, i_netvm)
+          and i_tpl < i_deftpl < i_enable < i_high < i_disable < i_netvm,
+          f"template@{i_tpl} default-template@{i_deftpl} enable@{i_enable} "
+          f"highstate@{i_high} disable@{i_disable} default-netvm@{i_netvm}")
+    stage("updatevm and clockvm are set like the wizard sets them",
+          at("qubes-prefs", "updatevm", "sys-firewall") is not None
+          and at("qubes-prefs", "clockvm", "sys-net") is not None)
+    stage("the template RPMs are removed once installed, as the wizard removes them",
+          not pkgs.exists())
+    (work / "actions.jsonl").write_text("")
+    pi2 = run(gi, ["--initial-setup"], env, sandbox)
+    again = [json.loads(line) for line in
+             (work / "actions.jsonl").read_text().splitlines() if line.strip()]
+    stage("--initial-setup is idempotent: a retry installs nothing twice",
+          pi2.returncode == 0 and not any(a["kind"] == "exec" and a["prog"] == "qvm-template"
+                                          for a in again),
+          pi2.stderr[-300:])
 
     print("\ngenerated configuration")
     p4 = subprocess.run([sys.executable, str(TESTS / "static_checks.py"),

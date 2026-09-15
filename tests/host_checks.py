@@ -412,6 +412,16 @@ def check_install_gate(bi) -> None:
         check("a host with everything reports no gaps",
               bi.host_gaps("docker", False) == [],
               str(bi.host_gaps("docker", False)))
+
+        # The formatter is the one install.oem_fstype selects: ext4 exists for
+        # a host without dosfstools, so that host must not be blocked on
+        # mkfs.vfat — and a vfat configuration must still be.
+        bi.shutil.which = lambda t: None if t == "mkfs.vfat" else f"/usr/bin/{t}"
+        check("an ext4 OEM partition does not require mkfs.vfat",
+              bi.host_gaps("docker", False, "ext4") == [],
+              str(bi.host_gaps("docker", False, "ext4")))
+        check("a vfat OEM partition still requires mkfs.vfat",
+              "mkfs.vfat" in bi.host_gaps("docker", False, "vfat"))
     finally:
         bi.shutil.which, bi._have_module = real_which, real_mod
 

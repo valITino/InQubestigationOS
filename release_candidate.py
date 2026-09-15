@@ -19,6 +19,10 @@ ALLOWLIST = (
     "InQubestigationOS.iso", "InQubestigationOS.iso.sha256",
     "InQubestigationOS.iso.asc", "unit-signing-key.asc", "verify-iso.sh",
     "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt",
+    # The install-time kickstart write-usb puts on the QUBES_OEM partition,
+    # and its signature. A candidate without them cannot produce the
+    # provisioning media; without the signature write-usb refuses to.
+    "oem/ks.cfg", "oem/ks.cfg.asc",
 )
 
 
@@ -43,12 +47,38 @@ def git(*args: str) -> str:
 
 
 def verify_signature(iso: Path, signature: Path, expected: str) -> None:
+    """Authenticate the signature against the approved primary fingerprint.
+
+    VALIDSIG names the key that made the signature FIRST — a signing subkey
+    when the key has one — and the primary LAST, so comparing only the first
+    field rejects a genuine image signed by an approved key that has a signing
+    subkey. And a revoked key still produces VALIDSIG with gpg exiting 0; only
+    GOODSIG turning into REVKEYSIG, plus KEYREVOKED, distinguishes it.
+    """
     p = run(["gpg", "--batch", "--status-fd", "1", "--verify",
              str(signature), str(iso)], capture_output=True)
-    valid = [line.split()[2].upper() for line in p.stdout.splitlines()
-             if line.startswith("[GNUPG:] VALIDSIG ")]
-    if p.returncode or valid != [expected.upper()]:
-        raise Gate(f"signature signer mismatch: expected {expected}, got {valid}")
+    lines = p.stdout.splitlines()
+
+    def has(tag: str) -> bool:
+        return any(line.startswith(f"[GNUPG:] {tag}") for line in lines)
+
+    if p.returncode:
+        raise Gate("signature does not verify")
+    if has("KEYREVOKED") or has("REVKEYSIG"):
+        raise Gate("the approved signing key has been revoked by its owner")
+    if has("EXPKEYSIG"):
+        raise Gate("the signature was made by an expired key")
+    if has("BADSIG") or not has("GOODSIG"):
+        raise Gate("signature is not good (no GOODSIG in gpg status output)")
+    accepted = expected.replace(" ", "").upper()
+    for line in lines:
+        if line.startswith("[GNUPG:] VALIDSIG "):
+            parts = line.split()
+            if accepted in (parts[2].upper(), parts[-1].upper()):
+                return
+            raise Gate(f"signature signer mismatch: expected {expected}, got "
+                       f"{parts[2]} (primary {parts[-1]})")
+    raise Gate("gpg produced no VALIDSIG line")
 
 
 def sha256(path: Path) -> str:
@@ -76,7 +106,15 @@ def main() -> int:
     p.add_argument("--work-dir", required=True, type=Path)
     p.add_argument("--backup-dir", required=True, type=Path)
     p.add_argument("--candidate-dir", required=True, type=Path)
-    p.add_argument("--passphrase-file", required=True, type=Path)
+    p.add_argument("--passphrase-file", required=True, type=Path,
+                   help="unlocks the approved signing key")
+    # bootstrap onboarding requires a backup-encryption secret on any
+    # non-interactive run, and a trusted runner has no terminal to prompt at.
+    # Without this the documented release path failed at onboarding, before
+    # anything was built.
+    p.add_argument("--backup-passphrase-file", required=True, type=Path,
+                   help="encrypts the signing-key backup (a DIFFERENT secret "
+                        "from --passphrase-file)")
     p.add_argument("--signing-fingerprint", required=True)
     p.add_argument("--min-work-gb", type=int, default=250)
     p.add_argument("--min-docker-gb", type=int, default=100)
@@ -113,8 +151,9 @@ def main() -> int:
         raise Gate(f"approved release config missing: {a.config}")
     cfg = json.loads(a.config.read_text())
     fingerprint = a.signing_fingerprint.replace(" ", "").upper()
-    if cfg.get("tier") != 2 or cfg.get("iso_sign_key", "").upper() != fingerprint:
-        raise Gate("release config must set tier=2 and the approved signing fingerprint")
+    if cfg.get("tier") not in (1, 2) or cfg.get("iso_sign_key", "").upper() != fingerprint:
+        raise Gate("release config must set tier to 1 or 2 and the approved signing "
+                   "fingerprint")
     if str(cfg.get("work_dir")) != str(a.work_dir):
         raise Gate("release config work_dir does not match --work-dir")
     remote = str(cfg.get("component_remote", ""))
@@ -122,9 +161,22 @@ def main() -> int:
     if parsed_remote.username or parsed_remote.password:
         raise Gate("component_remote must not embed credentials; use a protected "
                    "runner credential helper")
-    st = a.passphrase_file.stat()
-    if st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise Gate("runtime passphrase file must be owned by this user and mode 0600")
+    for label, secret in (("signing", a.passphrase_file),
+                          ("backup-encryption", a.backup_passphrase_file)):
+        st = secret.stat()
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise Gate(f"runtime {label} passphrase file must be owned by this "
+                       "user and mode 0600")
+    if a.passphrase_file.resolve() == a.backup_passphrase_file.resolve():
+        raise Gate("the signing and backup-encryption passphrase files must be "
+                   "distinct; a backup encrypted with the signing passphrase "
+                   "protects nothing the signing key does not already")
+    # The values too, not only the paths: two files holding the same secret
+    # are the same secret. The workflow compares them before writing the
+    # files, but this gate is usable on its own and claims the same thing.
+    if a.passphrase_file.read_bytes().strip() == a.backup_passphrase_file.read_bytes().strip():
+        raise Gate("the signing and backup-encryption passphrases are the same "
+                   "secret; the backup must be encrypted with a different one")
     if run(["gpg", "--batch", "--list-secret-keys", fingerprint],
            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
         raise Gate("approved secret signing key is unavailable")
@@ -142,12 +194,16 @@ def main() -> int:
                    check=True)
     command = [sys.executable, "build_iso.py", "bootstrap", "--yes",
                "--use-key", fingerprint, "--passphrase-file",
-               str(a.passphrase_file), "--to", str(a.backup_dir)]
+               str(a.passphrase_file), "--backup-passphrase-file",
+               str(a.backup_passphrase_file), "--to", str(a.backup_dir)]
     subprocess.run(command, cwd=ROOT, check=True)
 
     output = a.work_dir / "output"
     missing = [name for name in ALLOWLIST if not (output / name).is_file()]
-    extras = [p.name for p in output.iterdir() if p.is_file() and p.name not in ALLOWLIST]
+    present = [p.name for p in output.iterdir() if p.is_file()]
+    if (output / "oem").is_dir():
+        present += [f"oem/{p.name}" for p in (output / "oem").iterdir() if p.is_file()]
+    extras = [name for name in present if name not in ALLOWLIST]
     if missing or extras:
         raise Gate(f"release allowlist mismatch; missing={missing}, unexpected={extras}")
     iso = output / ALLOWLIST[0]
@@ -155,6 +211,7 @@ def main() -> int:
     if (output / ALLOWLIST[1]).read_text().split()[0].lower() != digest:
         raise Gate("ISO checksum does not match")
     verify_signature(iso, output / ALLOWLIST[2], fingerprint)
+    verify_signature(output / "oem/ks.cfg", output / "oem/ks.cfg.asc", fingerprint)
     size = sum((output / name).stat().st_size for name in ALLOWLIST)
     if size > a.max_artifact_gb * 1024**3:
         raise Gate(f"candidate is {size / 1024**3:.1f} GiB; owner limit is "
@@ -180,6 +237,7 @@ def main() -> int:
         raise Gate(f"candidate already exists: {candidate}")
     candidate.mkdir(mode=0o755)
     for name in ALLOWLIST:
+        (candidate / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(output / name, candidate / name)
     print(json.dumps(result, sort_keys=True))
     print(f"staged only {len(ALLOWLIST)} allowlisted files at {candidate}")

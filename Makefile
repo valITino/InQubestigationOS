@@ -10,6 +10,16 @@ UID ?= Investigator Image Signing <cyber@example.invalid>
 DEVICE ?=
 RC_ARGS ?=
 
+# Some shells export UID as the numeric user id. A key whose identity is "1000"
+# would be created and backed up before anyone noticed, so the targets that
+# consume the signing identity refuse it — only those, so `make help` or
+# `make check` under such a shell still work.
+.PHONY: check-uid
+check-uid:
+	@case '$(UID)' in ''|*[!0-9]*) ;; *) \
+	  echo 'UID is numeric ("$(UID)"): pass the signing identity, e.g. make key UID="Unit Image Signing <cyber@example.ch>"' >&2; \
+	  exit 1;; esac
+
 .PHONY: help
 help:  ## show this help
 	@awk 'BEGIN{FS=":.*##"; printf "\n  \033[1mInQubestigationOS\033[0m\n\n"} \
@@ -17,8 +27,12 @@ help:  ## show this help
 	     END{print ""}' $(MAKEFILE_LIST)
 
 # --- build host ------------------------------------------------------------
+.PHONY: quickstart
+quickstart:  ## check everything first, then build, sign and write the USB (one passphrase)
+	./build_iso.py quickstart --usb
+
 .PHONY: bootstrap
-bootstrap:  ## host, key, key backup, checks, plan and build — in that order
+bootstrap: check-uid  ## production release path: independent key-backup media, audited export
 	./build_iso.py bootstrap $(if $(UID),--uid "$(UID)",)
 
 .PHONY: host
@@ -26,7 +40,7 @@ host:  ## install and configure everything the build host needs
 	./build_iso.py setup-host
 
 .PHONY: key
-key:  ## create the ISO signing key and record its fingerprint (UID=...)
+key: check-uid  ## create the ISO signing key and record its fingerprint (UID=...)
 	./build_iso.py gen-key --uid "$(UID)"
 
 .PHONY: backup-key
@@ -86,6 +100,9 @@ check:  ## run the whole test suite (no Qubes machine needed)
 	./tests/install_path_checks.py
 	./tests/release_checks.py
 	./tests/acceptance_checks.py
+	sudo ./tests/oem_media_checks.py
+	./tests/signature_checks.py
+	./tests/quickstart_checks.py
 
 .PHONY: lint
 lint:  ## lint all Python code (requires requirements-dev.txt)
@@ -146,6 +163,9 @@ ci:  ## run every portable CI check locally (live Fedora runs in GitHub Actions)
 	./tests/install_path_checks.py
 	./tests/release_checks.py
 	./tests/acceptance_checks.py
+	sudo ./tests/oem_media_checks.py
+	./tests/signature_checks.py
+	./tests/quickstart_checks.py
 	./tests/host_checks.py
 	./tests/config_checks.py
 	./tests/doc_checks.py

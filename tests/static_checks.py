@@ -15,8 +15,15 @@ Input is a capture tree produced by tests/qubes_stub.py:
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+# How many generated shell scripts the capture must contain. Not a target to
+# tune: it exists so that a script vanishing from the capture fails rather than
+# silently reducing the number of things checked.
+SHELL_SCRIPT_FLOOR = 20
 
 FAILED: list[str] = []
 PASSED: list[str] = []
@@ -102,8 +109,24 @@ def checks_firewall(cap: Path, qube: str) -> None:
         check(f"{qube}: dnat-dns keeps the dstnat priority",
               "priority dstnat" in dns)
         check(f"{qube}: DNS script is executable", mode(cap, qube, "/rw/config/qubes-firewall.d/10-golden-dns") in ("0755", "755"))
+        # Was: `"sys-whonix" not in [line for line in ... if "sys-whonix" in line]`
+        # — a list of whole LINES, tested for membership of the bare string. A
+        # line containing sys-whonix is never equal to "sys-whonix", so this
+        # could not fail. Assert on the lines themselves.
+        tor_lines = [line for line in dns.splitlines()
+                     if "sys-whonix" in line and not line.lstrip().startswith("#")]
         check(f"{qube}: no DNS rule targets the Tor gateway",
-              "sys-whonix" not in [w for w in re.findall(r"^\s*(?!#)(.*)$", dns, re.M) if "sys-whonix" in w])
+              not tor_lines, "; ".join(tor_lines))
+
+    # The DoT resolver config is written into sys-firewall by phase 7, so it is
+    # read here. It used to be read in checks_proxy against sys-proxy, where it
+    # never exists — so six assertions about forward-tls-upstream, the absence
+    # of a cleartext fallback, port 853 pinning, the CA bundle and the
+    # open-resolver posture never ran at all.
+    ub = read(cap, qube, "/rw/config/unbound-quad9.conf")
+    check(f"{qube}: unbound DoT config written", ub is not None)
+    if ub is not None:
+        check_unbound(f"{qube}/unbound", ub)
 
     us = read(cap, qube, "/rw/config/qubes-firewall-user-script")
     check(f"{qube}: firewall user script written", us is not None)
@@ -152,9 +175,6 @@ def checks_proxy(cap: Path, qube: str) -> None:
               "acl localqubes src 10.137.0.0/16 10.138.0.0/16" in sq
               and "http_access deny all" in sq)
 
-    ub = read(cap, qube, "/rw/config/unbound-quad9.conf")
-    if ub is not None:
-        check_unbound(f"{qube}/unbound", ub)
 
 
 def check_unbound(label: str, ub: str) -> None:
@@ -242,6 +262,56 @@ def checks_modes(cap: Path) -> None:
             check(f"{rel} is not world readable", m in ("0600", "600", "0640", "640"), m)
 
 
+def checks_shell_syntax(cap: Path) -> None:
+    """Hand every generated shell script to a real shell.
+
+    Everything else here is substring matching, which cannot tell a working
+    script from one with an unterminated `if`. `bash -n` parses without
+    executing, so a syntax error in a generated script fails a push instead of
+    failing silently inside a qube at boot, where nothing would report it.
+    """
+    if not shutil.which("bash"):
+        check("bash is available to syntax-check generated scripts", False,
+              "bash not found; generated scripts were NOT parsed")
+        return
+    scripts = []
+    for path in sorted(cap.rglob("*")):
+        if not path.is_file() or path.name.endswith(".mode"):
+            continue
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        head = text[:40]
+        # Selected by NAME as well as by shebang. Keying only on the shebang
+        # means a generated script that loses its `#!` line stops being checked
+        # instead of failing — the count silently drops by one and the suite
+        # stays green.
+        by_name = path.name.endswith(".sh") or path.name == "qubes-firewall-user-script"
+        by_shebang = head.startswith("#!/bin/bash") or head.startswith("#!/bin/sh")
+        if not (by_name or by_shebang):
+            continue
+        scripts.append(path)
+        if by_name:
+            rel = path.relative_to(cap)
+            check(f"{rel}: starts with a shell shebang",
+                  text.startswith("#!"), repr(text[:40]))
+    check("generated shell scripts were found to parse", bool(scripts),
+          "no script with a /bin/sh or /bin/bash shebang was captured")
+    # A floor, so a script disappearing from the capture is a failure rather
+    # than a quietly smaller number.
+    check(f"at least {SHELL_SCRIPT_FLOOR} generated scripts were parsed",
+          len(scripts) >= SHELL_SCRIPT_FLOOR,
+          f"only {len(scripts)} parsed: "
+          + ", ".join(str(p.relative_to(cap)) for p in scripts))
+    for path in scripts:
+        rel = path.relative_to(cap)
+        p = subprocess.run(["bash", "-n", str(path)], capture_output=True,
+                           text=True)
+        check(f"{rel}: parses as shell", p.returncode == 0,
+              p.stderr.strip()[:200])
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__)
@@ -264,6 +334,7 @@ def main(argv: list[str]) -> int:
             check(f"{q} was configured", False, "no captured files for it at all")
     checks_placeholders(cap)
     checks_modes(cap)
+    checks_shell_syntax(cap)
 
     for f in FAILED:
         print(f"  FAIL  {f}")

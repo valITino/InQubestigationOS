@@ -77,12 +77,22 @@ DEFAULT_CONFIG: dict = {
     "secpack_url": "https://github.com/QubesOS/qubes-secpack.git",
 
     # TIER 2 IS THE DEFAULT AND THE INTENDED PATH.
+    #   1 = stock templates only; the investigator templates are built on the
+    #       target by golden_image.py. 1-3 hours of first-boot work and a hard
+    #       dependency on connectivity at install time.
     #   2 = investigator templates baked into the ISO as RPMs. Installs with no
     #       network. First boot only wires the topology — minutes, not hours.
-    #   1 = stock templates only; the investigator templates get built on first
-    #       boot from the network. Smaller ISO, but 1-3 hours of first-boot work
-    #       and a hard dependency on connectivity at install time. Fallback only.
-    "tier": 2,
+    #
+    # The default is 1 because 2 cannot currently be built end to end from this
+    # repository. qubes-builderv2 finds a Debian template flavor's content at
+    # <sources>/builder-debian/template_debian/<flavor>, appended by the
+    # template plugin itself with no configuration hook, and hardcodes extra
+    # directories only for whonix-*, kicksecure and names starting with "kali".
+    # A flavor with no directory there does not fail: it silently builds as
+    # stock Debian while still producing qubes-template-<flavor>-*.rpm. Tier 2
+    # now refuses rather than shipping that; set it once those directories
+    # exist and the build will verify them.
+    "tier": 1,
 
     # "auto" picks the largest writable local filesystem with room for the
     # build, so "somewhere with 250 GB free" stops being something to work out.
@@ -151,6 +161,11 @@ DEFAULT_CONFIG: dict = {
         "required_template": "debian-13-xfce",
         # Complete Qubes' own initial setup non-interactively at first boot.
         "auto_initial_setup": True,
+        # Filesystem for the QUBES_OEM partition that carries the install-time
+        # kickstart. vfat is the widest-compatibility choice and what an OEM
+        # partition conventionally is; ext4 is accepted for hosts without
+        # dosfstools. The LABEL is fixed by Qubes' lorax templates, not by this.
+        "oem_fstype": "vfat",
     },
     # Optional non-secret golden_image.py configuration to embed. Blank uses
     # the provisioner's embedded defaults. Secrets are rejected.
@@ -718,6 +733,11 @@ def setup_builder(x: Ctx):
     else:
         x.skip("builder.yml present")
 
+    # Unconditional, not only on the seeding path: a builder.yml left by an
+    # earlier run still carries the upstream Qubes-executor default, and every
+    # ./qb call below depends on this being right.
+    write_builder_executor(x)
+
     x.info("fetching qubes-release sources (kickstarts and comps live there)")
     x.run("./qb", "-c", "qubes-release", "package", "fetch",
           cwd=x.builder, live=True, check=False)
@@ -741,6 +761,29 @@ def setup_builder(x: Ctx):
 #  two of them. Each step here is the command the guide documents; running them
 #  in sequence is what nobody should have to remember.
 # ---------------------------------------------------------------------------
+
+def bootstrap_backup_args(args, backup_to) -> list[str]:
+    """The backup-key invocation bootstrap runs as its second step.
+
+    Each secret goes to the flag that means it: one passphrase unlocks the
+    signing key so it can be exported, the other encrypts the backup. And
+    the local-backup authorization travels too — without it backup-key
+    refused the very directory onboarding had just accepted for a
+    backup_kind of local-directory.
+    """
+    backup_args: list[str] = []
+    if backup_to:
+        backup_args += ["--to", str(backup_to)]
+    if getattr(args, "use_key", None):
+        backup_args += ["--use-key", args.use_key]
+    if getattr(args, "passphrase_file", None):
+        backup_args += ["--passphrase-file", args.passphrase_file]
+    if getattr(args, "backup_passphrase_file", None):
+        backup_args += ["--backup-passphrase-file", args.backup_passphrase_file]
+    if getattr(args, "allow_local_key_backup", False):
+        backup_args.append("--allow-local-key-backup")
+    return backup_args
+
 def bootstrap(x: Ctx, args) -> int:
     if os.geteuid() == 0:
         raise Fatal("bootstrap must run as a non-root build user. It uses sudo only "
@@ -773,6 +816,13 @@ def bootstrap(x: Ctx, args) -> int:
         workflow.stage("onboarding", "running", "discovering resources and collecting approval")
         workflow.onboard(args)
         workflow.stage("onboarding", "complete", "approved destinations validated")
+        if workflow.cfg.get("backup_kind") == "local-directory" \
+                and not getattr(args, "allow_local_key_backup", False):
+            # Said here, not by backup-key after gen-key has already run.
+            raise Fatal("bootstrap.backup_kind is local-directory, which keeps the "
+                        "signing-key backup on this host's own disk. Pass "
+                        "--allow-local-key-backup to authorize that deliberately, "
+                        "or configure removable backup media.")
         steps: list[tuple[str, str, list[str]]] = [
             ("gen-key", "create or adopt the signing key", ["gen-key"]),
             ("backup-key", "back up the signing key before anything can lose it",
@@ -781,7 +831,8 @@ def bootstrap(x: Ctx, args) -> int:
             ("check-upstream", "confirm the pinned keys and versions are current",
              ["check-upstream"]),
             ("plan", "print the whole build plan", ["--dry-run", "all"]),
-            ("build", "build the templates and the ISO", ["all"]),
+            ("build", "build the templates and the ISO" if int(x.c["tier"]) == 2
+             else "build the ISO", ["all"]),
         ]
         key_args: list[str] = []
         for option, value in (("--uid", args.uid), ("--use-key", args.use_key),
@@ -793,15 +844,9 @@ def bootstrap(x: Ctx, args) -> int:
         if args.passphrase_file:
             key_args += ["--passphrase-file", args.passphrase_file]
         steps[0] = ("gen-key", steps[0][1], ["gen-key", *key_args])
-        backup_args: list[str] = []
         backup_to = workflow.data_paths.get("backup", workflow.backup_path)
-        if backup_to:
-            backup_args += ["--to", str(backup_to)]
-        if args.use_key:
-            backup_args += ["--use-key", args.use_key]
-        if getattr(args, "backup_passphrase_file", None):
-            backup_args += ["--passphrase-file", args.backup_passphrase_file]
-        steps[1] = ("backup-key", steps[1][1], ["backup-key", *backup_args])
+        steps[1] = ("backup-key", steps[1][1],
+                    ["backup-key", *bootstrap_backup_args(args, backup_to)])
 
         print(f"\n{B}{C}══ bootstrap{RST}")
         print("\n  This runs, stopping at the first failure:\n")
@@ -1042,11 +1087,15 @@ if [ "${VERBOSE:-0}" -ge 2 ] || [ "${DEBUG:-0}" == "1" ]; then
 fi
 
 if [ -z "${FLAVORS_DIR}" ]; then
-    # SRC_DIR already resolves to this component's source directory — keys/ and
-    # the flavor directories live directly under it. Appending the component
-    # name again named a directory that is never created, so the Kali keyring
-    # the build had just downloaded and verified could not be found.
-    FLAVORS_DIR="${BUILDER_DIR}/${SRC_DIR}"
+    # qubes-builderv2 sets FLAVORS_DIR only for the whonix, kicksecure and kali
+    # flavors (qubesbuilder/plugins/template/__init__.py); for any other Debian
+    # flavor it is unset, and BUILDER_DIR/SRC_DIR are not in the template
+    # Makefile's environment whitelist either, so the old fallback expanded to
+    # "/". This hook is installed at
+    # <builder-debian>/template_debian/<flavor>/04_install_qubes_post.sh with
+    # keys/ beside it (build_iso.py materialize_flavors), so the directory this
+    # file lives in is the answer.
+    FLAVORS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 [ -n "${SCRIPTSDIR}" ] && TEMPLATE_CONTENT_DIR="${SCRIPTSDIR}"
 [ -n "${INSTALLDIR}" ] && INSTALL_DIR="${INSTALLDIR}"
@@ -1075,7 +1124,7 @@ chroot_cmd bash -c "curl -fsSL '@WAZUH_KEY@' | gpg --no-default-keyring --keyrin
 # SIEM that watches the whole workstation; importing whatever came back from the
 # network and trusting it via signed-by= is not a check.
 chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{print toupper(\\$10)}' | grep -qxF '@WAZUH_KEY_FPR@'" \\
-    || error 'Wazuh signing key is not @WAZUH_KEY_FPR@ — refusing to bake an unverified key into the image'
+    || { error 'Wazuh signing key is not @WAZUH_KEY_FPR@ — refusing to bake an unverified key into the image'; exit 1; }
 echo '@WAZUH_REPO@' > "${INSTALL_DIR}/etc/apt/sources.list.d/wazuh.list"
 aptUpdate
 aptInstall wazuh-agent
@@ -1179,7 +1228,8 @@ aptInstall apt-transport-https ca-certificates curl gnupg
 installQubesRepo
 
 kali_signing_key_file="${{FLAVORS_DIR}}/keys/kali-archive-keyring.gpg"
-test -f "$kali_signing_key_file" || error "Kali keyring missing from the component"
+# error() in builderv2's functions.sh only prints; the exit is ours to do.
+test -f "$kali_signing_key_file" || {{ error "Kali keyring missing at $kali_signing_key_file"; exit 1; }}
 # /usr/share/keyrings, NOT /etc/apt/trusted.gpg.d: a key in trusted.gpg.d is a
 # GLOBAL anchor and apt will accept any repository signed by it, which defeats
 # the signed-by= scoping on the very next line.
@@ -1240,7 +1290,7 @@ echo '{z['repo_line']}' > "${{INSTALL_DIR}}/etc/apt/sources.list.d/security:zeek
 chroot_cmd mkdir -p /usr/share/keyrings
 chroot_cmd bash -c "curl -fsSL '{z['key_url']}' | gpg --dearmor > /usr/share/keyrings/security_zeek.gpg && chmod 644 /usr/share/keyrings/security_zeek.gpg"
 chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/security_zeek.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{{print toupper(\\$10)}}' | grep -qxF '{z['key_fpr']}'" \\
-    || error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'
+    || {{ error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'; exit 1; }}
 aptUpdate
 aptInstall {z['package']}
 uninstallQubesRepo
@@ -1447,7 +1497,16 @@ def _merge(base, over):
     return over
 
 
-def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
+def merge_builder_config(x: Ctx, updates: dict, what: str,
+                         replace_keys: tuple[str, ...] = ()) -> None:
+    """Merge `updates` into builder.yml.
+
+    Keys named in `replace_keys` are replaced wholesale rather than deep-merged.
+    That matters for mappings whose sub-keys are mutually exclusive: the upstream
+    example config selects the Qubes DispVM executor with an `options: {dispvm:}`
+    that means nothing to the container executor, and a deep merge would leave
+    that stray option sitting beside `image:`.
+    """
     bcfg = x.builder / "builder.yml"
     if x.args.dry_run:
         x.info(f"[dry-run] merge {what} into builder.yml: "
@@ -1475,7 +1534,10 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
     if not isinstance(current, dict):
         raise Fatal("builder.yml does not parse as a mapping")
 
-    merged = _merge(current, updates)
+    base = dict(current)
+    for key in replace_keys:
+        base.pop(key, None)
+    merged = _merge(base, updates)
     bcfg.write_text(
         f"# Merged by build_iso.py on {datetime.now():%Y-%m-%d %H:%M:%S} ({what}).\n"
         f"# Previous contents: {backup.name}\n"
@@ -1484,6 +1546,39 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
 
     # Automates the [VERIFY] this step used to print: ask the builder what it
     # actually sees rather than asking the operator to go and check.
+    if "executor" in updates:
+        # Asking the builder resolves this against its own config precedence,
+        # which is the only answer that matters: a stale `executor: type: qubes`
+        # left in builder.yml means every ./qb call needs qrexec, which a
+        # Debian/Fedora build host does not have.
+        raw = x.run("./qb", "config", "get-var", "executor", "--json",
+                    cwd=x.builder, check=False, capture=True).strip()
+        want = updates["executor"]["type"]
+        if not raw:
+            # qb could not be run at all. The file on disk is still the
+            # authority; say so rather than claiming a verification happened.
+            written = (merged.get("executor") or {}).get("type")
+            if written != want:
+                raise Fatal(f"builder.yml executor is {written!r}, not {want!r}")
+            x.warn("'qb config get-var executor' returned nothing — merged "
+                   f"executor is {written!r} on disk, but not verified through qb")
+            return
+        try:
+            resolved = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise Fatal(f"'qb config get-var executor --json' did not return "
+                        f"JSON ({exc}). Restored copy: {backup}") from exc
+        got = (resolved or {}).get("type")
+        if got != want:
+            raise Fatal(
+                f"builder.yml merged but 'qb config get-var executor' reports "
+                f"type={got!r}, not {want!r}.\n"
+                f"     Restored copy: {backup}")
+        image = ((resolved or {}).get("options") or {}).get("image", "")
+        x.ok(f"verified with 'qb config get-var executor': {got}"
+             + (f" ({image})" if image else ""))
+        return
+
     seen = x.run("./qb", "config", "get-var", "templates", cwd=x.builder,
                  check=False, capture=True)
     if seen.strip():
@@ -1499,10 +1594,365 @@ def merge_builder_config(x: Ctx, updates: dict, what: str) -> None:
                "the merge automatically")
 
 
+def quickstart(x: Ctx, args) -> int:
+    """One command: check everything, then build and sign an ISO.
+
+    `bootstrap` is the production release path, and it asks for production
+    things before it will build: a signing identity, two separate passphrases,
+    a separately-mounted medium for the key backup, and a second mounted
+    destination for the finished image. Every one of those is the right demand
+    to make of a release you are going to hand to someone else. None of them
+    should stand between a first build and an ISO.
+
+    So this does the same work with defaults that hold up:
+
+      * every check that can be made runs FIRST, in seconds, before any
+        multi-hour step — and anything this script can fix, it fixes;
+      * the signing key is reused if there is one and generated if not;
+      * one passphrase is asked for, once, and used for the key and its backup;
+      * the key backup goes next to the build unless you say otherwise, with a
+        warning saying exactly what that costs;
+      * the ISO lands in the output directory instead of needing a second
+        mounted destination;
+      * with --usb it writes the stick too.
+
+    Nothing here weakens a check. It removes ceremony, not verification.
+    """
+    lab = bool(getattr(args, "no_passphrase", False))
+    print(f"\n{B}{C}quickstart{RST} — build a signed, installable ISO")
+    print("  Everything that can be checked is checked first. The build only")
+    print("  starts once nothing is known to be wrong.\n")
+
+    # ---- 1. the host ---------------------------------------------------
+    x.phase("1/6", "check this build host, and fix what can be fixed")
+    # signing=False: the key is step 2's job, so its absence must not block
+    # step 1 — otherwise this command could never get as far as creating it.
+    rc = doctor(x, signing=False)
+    if rc != 0:
+        # Fixing is the point of this command, so it is not behind a flag.
+        # setup-host installs packages and needs sudo; doctor has just printed
+        # exactly what is missing, so nothing here is a surprise. Its return
+        # value IS the re-check (it ends by calling doctor again, allowing for
+        # docker group membership that only works through `sg` in this shell).
+        x.info("blocking findings above — running the fixes this script owns")
+        if setup_host(x) != 0:
+            raise Fatal(
+                "this host is still not ready after setup-host.\n"
+                "     The rows marked ✗ above say what is missing. Nothing has\n"
+                "     been built, so fixing them and re-running costs nothing.")
+    ce = x.c["container_engine"]
+    if (ce == "docker" and not x.quiet("docker", "ps")
+            and shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps")
+            and not os.environ.get("INQUBESTIGATION_SG")):
+        # Group membership granted just now does not apply to this process,
+        # and the build below drives docker directly. Rather than printing
+        # "prefix your command with sg docker -c", do it: re-run this exact
+        # command inside the group. The guard variable stops a loop. No secret
+        # has been collected yet, so nothing is carried across the exec.
+        x.info("docker group membership is not active in this shell; "
+               "re-running this command under `sg docker`")
+        os.environ["INQUBESTIGATION_SG"] = "1"
+        os.execvp("sg", ["sg", "docker", "-c",
+                         shlex.join([sys.executable, *sys.argv])])
+    x.ok("build host is ready")
+
+    # ---- 2. the signing key --------------------------------------------
+    x.phase("2/6", "signing key")
+    if not (x.c["iso_sign_key"] or "").strip():
+        existing = secret_key_fingerprints()
+        if len(existing) == 1 and not getattr(args, "uid", None):
+            args.use_key = existing[0][0]
+            x.info(f"adopting the one secret key in this keyring: {existing[0][1]}")
+        elif not getattr(args, "uid", None):
+            args.uid = default_signing_uid()
+            x.info(f"no signing key configured; creating one for {args.uid!r}")
+            x.info("pass --uid to name it yourself")
+        if not lab and not args.passphrase_file and not args.dry_run:
+            args.passphrase_file = str(prompt_secret(
+                "passphrase for the signing key (also encrypts its backup)"))
+        gen_key(x)
+        x.c = load_config(dry_run=args.dry_run)
+    else:
+        x.ok(f"signing key already configured: {x.c['iso_sign_key']}")
+        if not lab and not args.passphrase_file and not args.dry_run:
+            args.passphrase_file = str(prompt_secret(
+                "passphrase for the signing key (also encrypts its backup)"))
+
+    # ---- 3. the key backup ---------------------------------------------
+    x.phase("3/6", "signing-key backup")
+    if lab:
+        x.warn("--no-passphrase: this is a LAB key with no passphrase, and no")
+        x.warn("  backup is being made. Do not sign anything you will hand out.")
+    elif args.dry_run and not (x.c["iso_sign_key"] or "").strip():
+        # A dry-run gen-key creates nothing, so there is nothing to back up yet.
+        x.info(f"[dry-run] back up the new key to {x.work / 'key-backup'}")
+    else:
+        if not getattr(args, "to", None):
+            args.to = str(x.work / "key-backup")
+            args.allow_local_key_backup = True
+        backup_key(x)
+
+    # ---- 4. supply chain -----------------------------------------------
+    x.phase("4/6", "supply chain")
+    if check_upstream(x) != 0:
+        raise Fatal("the supply-chain check did not pass. Nothing has been "
+                    "built.\n     Re-run when the findings above are resolved, "
+                    "or --allow-unreachable\n     if the sources are simply "
+                    "not reachable from here.")
+
+    # ---- 5. build -------------------------------------------------------
+    # Same sequence as main()'s `iso` action, in the same order. It is not
+    # abstracted into a shared function because main() interleaves it with
+    # action-specific branching; it IS kept identical, and
+    # tests/quickstart_checks.py asserts the order.
+    x.phase("5/6", "build and sign")
+    tier2 = int(x.c["tier"]) == 2
+    resolve_auto_values(x)
+    # The two preflight warnings (self-signed, goes stale) are printed in full
+    # but acknowledged here rather than by typing UNDERSTOOD: this command is
+    # the acknowledgement. The USB write below keeps its own "Write to
+    # /dev/sdX?" question unless --yes was given — that one erases a device.
+    ack = getattr(args, "assume_yes", False)
+    args.assume_yes = True
+    try:
+        payload = preflight(x, tier2)
+    finally:
+        args.assume_yes = ack
+    # Clone qubes-builderv2, verify it, build the container image, select the
+    # executor, fetch qubes-release. Without this there is no builder to run
+    # and no kickstarts to compose against; a first version of this command
+    # left it out and would have failed hours in at "no kickstarts found".
+    if not x.done("builder") or args.dry_run:
+        setup_builder(x)
+    else:
+        x.skip("builder setup")
+    if tier2:
+        if x.done("templates") and not args.force and not args.dry_run \
+                and not missing_template_rpms(x):
+            x.skip("template build — every RPM is present in artifacts/")
+        else:
+            fetch_kali_key(x)
+            gen_component(x)
+            build_templates(x)
+    resolve_auto_values(x)
+    build_iso(x, payload)
+
+    # ---- 6. media -------------------------------------------------------
+    x.phase("6/6", "installation media")
+    iso = x.out_dir / x.c["iso_name"]
+    if getattr(args, "usb", False) or getattr(args, "device", None):
+        args.wait = args.wait or not getattr(args, "device", None)
+        if args.dry_run:
+            # A dry-run build produced no image, and write-usb's first check
+            # is that the image exists — so the plan has to be stated here.
+            where = (f"to {args.device}" if getattr(args, "device", None)
+                     else "to the removable device plugged in (--wait)")
+            x.info(f"[dry-run] write-usb: verify the image and the signed "
+                   f"install-time kickstart, write {where}, read the stick back, "
+                   f"then append the {OEM_LABEL} partition")
+            return 0
+        return write_usb(x)
+    print(f"""
+  {G}Done.{RST}  {iso}
+
+  Write it to a USB stick (this also puts the installer's answer file on it,
+  which is what makes the install hands-off):
+
+      ./build_iso.py write-usb --wait
+
+  Then boot the stick on the target laptop.
+""")
+    return 0
+
+
+def default_signing_uid() -> str:
+    """A signing identity derived from this host, so none has to be invented."""
+    import getpass as _getpass
+    import socket
+    try:
+        user = _getpass.getuser()
+    except Exception:
+        user = "builder"
+    return f"InQubestigationOS Image Signing <{user}@{socket.gethostname()}>"
+
+
+def prompt_secret(label: str) -> Path:
+    """Ask once, confirm once, hold it in a mode-0600 runtime file."""
+    import getpass as _getpass
+    first = _getpass.getpass(f"\n  {label}\n  (hidden, held only for this run): ")
+    second = _getpass.getpass("  confirm: ")
+    if not first or first != second:
+        raise Fatal("the passphrase was empty or the two entries did not match")
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    fd, name = tempfile.mkstemp(prefix="inqubestigation-", dir=runtime)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(first)
+    path = Path(name)
+    # Held only for this run: removed when the process ends, whether that is a
+    # normal return, a Fatal, or Ctrl-C. (An exec, as in the sg re-run, does
+    # not run this — but that happens before any secret is collected.)
+    import atexit
+    atexit.register(lambda: path.unlink(missing_ok=True))
+    return path
+
+
+def write_builder_executor(x: Ctx) -> None:
+    """Point builder.yml at the container image setup-host actually built.
+
+    The upstream example config this repository seeds from ships the container
+    executor commented out and `executor: {type: qubes, options: {dispvm:}}`
+    live. That executor drives qrexec into a disposable qube, which exists only
+    on a Qubes host — so on the Debian/Fedora build host this project documents,
+    every `./qb` call fails before it starts. tools/generate-container-image.sh
+    tags the image `qubes-builder-fedora` (no explicit tag, hence `:latest`),
+    which is exactly what upstream's commented-out block names.
+
+    `executor` is replaced rather than merged: `dispvm` is meaningless to
+    ContainerExecutor, whose signature is (container_client, image, ...), and a
+    leftover option would ride along into its **kwargs.
+    """
+    engine = x.c["container_engine"]
+    if engine not in ("docker", "podman"):
+        raise Fatal(f"container_engine must be docker or podman, not {engine!r}")
+    merge_builder_config(
+        x,
+        {"executor": {"type": engine,
+                      "options": {"image": "qubes-builder-fedora:latest"}}},
+        f"{engine} executor",
+        replace_keys=("executor",))
+
+
 def missing_template_rpms(x: Ctx) -> list[str]:
     rpmdir = x.builder / "artifacts" / "templates" / "rpm"
     return [n for n in x.c["tier2_templates"]
             if not list(rpmdir.glob(f"qubes-template-{n}-*.rpm"))]
+
+
+def template_flavor_content_dir(x: Ctx, flavor: str) -> Path:
+    """Where qubes-builderv2 looks for a Debian template flavor's scripts.
+
+    Derived from the real plugin, not guessed. qubesbuilder/plugins/template's
+    update_parameters() sets, for a Debian-family template:
+
+        template_content_dir = <sources>/builder-debian/template_<fullname>
+        template_flavor_dir += [f"+{option}:{template_content_dir}/{option}"
+                                for option in [flavor] + options]
+
+    with extra entries hardcoded only for whonix-*, kicksecure and flavors whose
+    name starts with "kali". There is no configuration hook: template_flavor_dir
+    starts as an empty list inside that function.
+    """
+    return (x.builder / "artifacts" / "sources" / "builder-debian"
+            / "template_debian" / flavor)
+
+
+def verify_template_flavors(x: Ctx, names: list[str], strict: bool) -> None:
+    """Refuse to pass off a stock Debian template as an investigator one.
+
+    A flavor whose directory is not on that search path is not an error in
+    qubes-builderv2: templateDirs()/getFileLocations() simply fall back to the
+    distribution defaults. The build then succeeds, produces
+    qubes-template-<flavor>-*.rpm, and every check this script made — the RPMs
+    are present, the ISO lists them — passed. What shipped was stock Debian
+    trixie with an investigator name on it.
+
+    `strict` is for after a build, when the sources are certain to exist.
+    Before one they may not have been fetched yet, so a missing tree is
+    reported rather than treated as proof of absence.
+    """
+    # A non-empty name, because Path("x") / "" is Path("x") — using "" here
+    # resolved one directory too high and reported the wrong path.
+    base = template_flavor_content_dir(x, "flavor").parent
+    if not base.is_dir():
+        if strict:
+            raise Fatal(
+                f"{base} does not exist after a template build, so the flavor "
+                f"content directories cannot be confirmed.\n"
+                f"     Refusing to certify these templates as investigator "
+                f"builds.")
+        x.info("builder-debian sources are not fetched yet; flavor content "
+               "will be confirmed after the first template build")
+        return
+    # The hook itself, not the directory: an empty directory on the search
+    # path is exactly as stock as no directory.
+    missing = [n for n in names
+               if not (template_flavor_content_dir(x, n) / HOOK_NAME).is_file()]
+    if not missing:
+        x.ok(f"flavor content present for all {len(names)} templates "
+             f"({base})")
+        return
+    detail = "\n".join(f"       {template_flavor_content_dir(x, n) / HOOK_NAME}"
+                       for n in missing)
+    message = (
+        f"no flavor content for: {', '.join(missing)}\n"
+        f"     qubes-builderv2 looks for each flavor here:\n{detail}\n"
+        f"     Nothing there means the template builds as STOCK Debian "
+        f"{x.c['dist_codename']} —\n"
+        f"     no Kali, no Zeek, no Suricata, no Wazuh — while still producing\n"
+        f"     qubes-template-<name>-*.rpm, so the RPM and ISO checks below "
+        f"pass anyway.\n"
+        f"     builderv2 hardcodes extra flavor directories only for whonix-*,\n"
+        f"     kicksecure and names starting with 'kali'; there is no config "
+        f"hook.\n"
+        f"     Either provide those directories, or set tier=1 and let\n"
+        f"     golden_image.py build the investigator templates on the target.")
+    if strict:
+        raise Fatal(message)
+    x.warn(message)
+
+
+HOOK_NAME = "04_install_qubes_post.sh"
+
+
+def build_templates_locally(action: str, tier2: bool) -> bool:
+    """`templates` always builds them here; `all` only at tier 2. At tier 1 the
+    investigator templates are built on the target at first boot, so a local
+    build would spend hours producing RPMs that nothing packs into the ISO."""
+    return action == "templates" or (action == "all" and tier2)
+
+
+def materialize_flavors(x: Ctx, names: list[str]) -> None:
+    """Put the generated flavor content where qubes-builderv2 will look.
+
+    The template plugin searches TEMPLATE_FLAVOR_DIR, which for a Debian flavor
+    it sets to <sources>/builder-debian/template_debian/<flavor> and nothing
+    else (see template_flavor_content_dir). templateFile() in
+    plugins/template/scripts/functions.sh then finds
+    <that dir>/04_install_qubes_post.sh — the same lookup that finds
+    builder-debian's own xfce/02_install_groups_packages_installed.sh.
+    qubeize-image resolves appmenus from
+    ${APPMENUS_DIR:-$TEMPLATE_CONTENT_DIR}/appmenus_<dist>_<flavor>, and
+    APPMENUS_DIR is unset for these flavors. The component directory under
+    work_dir stays as the reviewable record; this copies it into place after
+    fetching builder-debian, which the template build depends on anyway.
+    """
+    x.info("fetching builder-debian sources (the template scripts live there)")
+    x.run("./qb", "-c", "builder-debian", "package", "fetch", cwd=x.builder, live=True)
+    base = template_flavor_content_dir(x, "flavor").parent
+    if not base.is_dir():
+        raise Fatal(f"{base} does not exist after fetching builder-debian — see {x.log}")
+    keys = x.component / "keys"
+    if not (keys / "kali-archive-keyring.gpg").is_file():
+        raise Fatal(f"{keys / 'kali-archive-keyring.gpg'} is missing — the Kali key "
+                    "fetch did not run")
+    dist = x.c["dist_codename"]
+    for n in names:
+        src_hook = x.component / n / HOOK_NAME
+        menus_src = x.component / f"appmenus_{dist}_{n}"
+        if not src_hook.is_file() or not menus_src.is_dir():
+            raise Fatal(f"generated component is incomplete for {n}: expected "
+                        f"{src_hook} and {menus_src}")
+        dst = template_flavor_content_dir(x, n)
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_hook, dst / HOOK_NAME)
+        (dst / HOOK_NAME).chmod(0o755)
+        shutil.rmtree(dst / "keys", ignore_errors=True)
+        shutil.copytree(keys, dst / "keys")
+        menus_dst = base / f"appmenus_{dist}_{n}"
+        shutil.rmtree(menus_dst, ignore_errors=True)
+        shutil.copytree(menus_src, menus_dst)
+    x.ok(f"flavor content installed under {base} for {', '.join(names)}")
 
 
 def build_templates(x: Ctx):
@@ -1524,6 +1974,15 @@ def build_templates(x: Ctx):
             (False, *component_source(x))))}],
     }, "investigator templates")
 
+    # The generated hooks go onto the builder's search path now, and their
+    # presence there is confirmed strictly before the long build starts.
+    if x.args.dry_run:
+        x.info("[dry-run] fetch builder-debian and install the flavor hooks under "
+               f"{template_flavor_content_dir(x, 'flavor').parent}")
+    else:
+        materialize_flavors(x, names)
+        verify_template_flavors(x, names, strict=True)
+
     x.warn(f"the long one: {len(names)} templates, each a full debootstrap. "
            f"Kali dominates.")
     for n in names:
@@ -1534,6 +1993,10 @@ def build_templates(x: Ctx):
 
     rpmdir = x.builder / "artifacts" / "templates" / "rpm"
     if not x.args.dry_run:
+        # Before the RPM checks, because those pass either way: an RPM named
+        # qubes-template-investigator-kali exists whether or not anything
+        # investigator-specific went into it.
+        verify_template_flavors(x, names, strict=True)
         missing = missing_template_rpms(x)
         if missing:
             raise Fatal(f"missing template RPMs: {', '.join(missing)}\n"
@@ -1608,40 +2071,177 @@ def provisioner_config_bytes(x: Ctx, payload: Path) -> bytes:
     return (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode()
 
 
-def write_kickstart(x: Ctx, base_ks: str, payload: Path,
-                    extra_packages: list[str]) -> str:
-    """Write investigator.ks and return the path to put in builder.yml.
+def stock_package_block(x: Ctx, base_ks: str) -> str:
+    """Return the dom0 package list the stock kickstart chain selects.
+
+    The install-time kickstart must name the whole dom0 package set, not only
+    the additions: a kickstart carrying `%packages` replaces Anaconda's default
+    selection rather than adding to it, so shipping only the template RPMs would
+    install a machine with no dom0 on it.
+
+    The stock chain is two files — `iso-online.ks` does `%include
+    qubes-kickstart.cfg`, and the `%packages` block lives in the included one —
+    so follow one level of %include, relative to conf/ as kickstart requires.
+    `repo` lines are deliberately NOT copied: the stock ones point at
+    file:///tmp/qubes-installer/... paths that exist only inside the build cage,
+    while at install time the repository comes from `inst.repo=hd:LABEL=<iso>`
+    on the boot line.
+    """
+    conf = release_dir(x) / "conf"
+    seen: list[str] = []
+    blocks: list[str] = []
+
+    def walk(name: str, depth: int = 0) -> None:
+        if depth > 4 or name in seen:
+            return
+        seen.append(name)
+        path = conf / name
+        if not path.is_file():
+            raise Fatal(f"kickstart {name} is not in {conf}")
+        text = path.read_text(errors="replace")
+        for line in text.splitlines():
+            m = re.match(r"^\s*%include\s+(\S+)\s*$", line)
+            if m:
+                walk(Path(m.group(1)).name, depth + 1)
+        for m in re.finditer(r"(?ms)^%packages\b[^\n]*\n(.*?)^%end\s*$", text):
+            body = m.group(1).rstrip()
+            if body.strip():
+                blocks.append(f"# from conf/{name}\n{body}")
+
+    walk(base_ks)
+    if not blocks:
+        raise Fatal(
+            f"no %packages block found in conf/{base_ks} or anything it "
+            "includes. The install-time kickstart cannot be built without the "
+            "dom0 package set, and guessing one would install a broken machine.")
+    return "\n".join(blocks)
+
+
+def write_kickstart(x: Ctx, base_ks: str, extra_packages: list[str]) -> str:
+    """Write the COMPOSE kickstart and return the path to put in builder.yml.
+
+    This file is not an installer answer file and never reaches the target. It
+    is read at compose time by qubes-builderv2's installer plugin, which runs
+    `scripts/ksparser --extract-repo-conf-to ... --extract-packages-to ...` over
+    it (plugins/installer/Makefile:116) to decide which repositories to enable
+    and which packages to pull into the ISO. lorax is handed no kickstart at
+    all, and `inst.ks` appears nowhere in qubes-builderv2 — so a `%post` written
+    here would be silently discarded.
+
+    The answers and the provisioning payload therefore live in the separate
+    install-time kickstart written by write_oem_kickstart().
 
     It goes into qubes-release/conf/ beside the kickstart it includes. %include
     resolves relative to the including file, so a kickstart written to the
     builder root could never find `conf/<base>` — that directory only exists
     inside the qubes-release source tree.
     """
-    x.phase("2", "generate the custom kickstart")
+    x.phase("2", "generate the compose kickstart")
     conf = release_dir(x) / "conf"
     ks = conf / "investigator.ks"
     rel = "conf/investigator.ks"
     if x.args.dry_run:
-        x.info(f"[dry-run] write {ks} (%include {base_ks} + %post payload)")
+        x.info(f"[dry-run] write {ks} (%include {base_ks} + template packages)")
         return rel
     if not conf.is_dir():
         raise Fatal(f"{conf} does not exist — the qubes-release sources are not "
                     "fetched. Run the builder setup first.")
     if not (conf / base_ks).is_file():
         raise Fatal(f"base kickstart {base_ks} is not in {conf}")
+    pkgs = ""
+    if extra_packages:
+        pkgs = ("\n# Custom templates. comps-dom0.xml on this branch has no\n"
+                "# @QUBES_TEMPLATES@ marker, so a comps group will not pick these up —\n"
+                "# they are named explicitly here so ksparser pulls the RPMs into\n"
+                "# the ISO. What INSTALLS them is the install-time kickstart.\n"
+                "%packages\n"
+                + "\n".join(f"qubes-template-{p}" for p in extra_packages)
+                + "\n%end\n")
+    ks.write_text(f"""\
+# =============================================================================
+#  investigator.ks — {x.c['iso_name']}
+#  Generated by build_iso.py on {datetime.now():%Y-%m-%d %H:%M:%S}
+#
+#  COMPOSE-TIME ONLY. qubes-builderv2 feeds this to scripts/ksparser to decide
+#  what goes INTO the ISO. It is not an Anaconda answer file and never reaches
+#  the installed machine; the installer answers and the provisioning payload
+#  are in the install-time kickstart written beside the ISO.
+# =============================================================================
+
+%include {base_ks}
+{pkgs}""")
+    ks.chmod(0o644)
+    x.ok(f"wrote {ks}")
+    x.info(f"%include {base_ks}  (resolved from {conf})")
+    if extra_packages:
+        x.info(f"%packages adds: {', '.join('qubes-template-'+p for p in extra_packages)}")
+        # Deliberately NOT parsed with stock pykickstart. This file %includes
+        # upstream's conf/iso-online.ks, whose `repo --gpgkey= --ignoregroups=`
+        # options are Qubes extensions: stock pykickstart 3.78 rejects them with
+        # "unrecognized arguments", so a parse here would fail on upstream's own
+        # syntax rather than on anything this build wrote. Qubes builds its own
+        # qubes-pykickstart (a component in the builder's config) and runs
+        # ksparser with it inside the mock chroot — that is what validates this
+        # file, during the build. What is checked here is what this function is
+        # responsible for.
+        body = ks.read_text()
+        absent = [f"qubes-template-{p}" for p in extra_packages
+                  if f"qubes-template-{p}" not in body]
+        if absent:
+            raise Fatal("compose kickstart does not name: " + ", ".join(absent))
+    return rel
+
+
+def write_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
+                        extra_packages: list[str]) -> Path:
+    """Write the INSTALL-TIME kickstart that Anaconda actually reads.
+
+    Qubes' own lorax templates (qubes-lorax-templates release4.3,
+    templates/config_files/x86/grub2-bios.cfg and grub2-efi.cfg) end with:
+
+        if search --set=oem -l QUBES_OEM; then
+            menuentry 'OEM installation (with kickstart file)' --id qubes-oem {
+                ... inst.ks=hd:LABEL=QUBES_OEM
+            }
+            set default="qubes-oem"
+        fi
+
+    So a filesystem labelled QUBES_OEM carrying this file is the supported way
+    to drive a Qubes install, on both BIOS and UEFI, and it is selected as the
+    default boot entry automatically. The signed ISO is not modified.
+
+    This file carries everything the compose kickstart cannot: the dom0 package
+    set, the template RPMs to install, the %post provisioning payload, and —
+    when install.unattended is on — the locale/keyboard/timezone/partitioning
+    answers. With unattended off it deliberately answers none of those, so
+    Anaconda still presents its storage and locale screens while %post still
+    runs.
+    """
+    x.phase("2b", "generate the install-time (QUBES_OEM) kickstart")
+    oem_dir = x.out_dir / "oem"
+    ks = oem_dir / "ks.cfg"
+    if x.args.dry_run:
+        x.info(f"[dry-run] write {ks} (installer answers + %post payload)")
+        return ks
+    conf = release_dir(x) / "conf"
+    if not (conf / base_ks).is_file():
+        raise Fatal(f"base kickstart {base_ks} is not in {conf}")
+    oem_dir.mkdir(parents=True, exist_ok=True)
+    stock_pkgs = stock_package_block(x, base_ks)
     b64 = base64.b64encode(payload.read_bytes()).decode()
     b64 = "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))
     cfg64 = base64.b64encode(provisioner_config_bytes(x, payload)).decode()
     cfg64 = "\n".join(cfg64[i:i + 76] for i in range(0, len(cfg64), 76))
 
-    pkgs = ""
+    # One %packages block: the stock dom0 selection plus our templates. A
+    # kickstart's %packages REPLACES the default selection, so the stock list
+    # has to be carried through or the machine installs without dom0.
+    extra_lines = ""
     if extra_packages:
-        pkgs = ("\n# Custom templates. comps-dom0.xml on this branch has no\n"
-                "# @QUBES_TEMPLATES@ marker, so a comps group will not pick these up —\n"
-                "# they are named explicitly here. The RPMs reach the ISO via\n"
-                "# iso: templates: in builder.yml.\n%packages\n"
-                + "\n".join(f"qubes-template-{p}" for p in extra_packages)
-                + "\n%end\n")
+        extra_lines = ("\n# Custom investigator templates, installed from the "
+                       "ISO's own repository.\n"
+                       + "\n".join(f"qubes-template-{p}" for p in extra_packages))
+    pkgs = f"%packages\n{stock_pkgs}{extra_lines}\n%end\n"
 
     auto_setup = "yes" if x.c["install"]["auto_initial_setup"] else "no"
     autotimer = ("systemctl enable golden-image-firstboot.timer"
@@ -1658,14 +2258,21 @@ def write_kickstart(x: Ctx, base_ks: str, payload: Path,
 
     ks.write_text(f"""\
 # =============================================================================
-#  investigator.ks — {x.c['iso_name']}
+#  ks.cfg — install-time kickstart for {x.c['iso_name']}
 #  Generated by build_iso.py on {datetime.now():%Y-%m-%d %H:%M:%S}
-#  Includes the stock Qubes kickstart unchanged, then plants the golden-image
-#  provisioning payload into dom0.
+#
+#  Anaconda reads this via inst.ks=hd:LABEL=QUBES_OEM, the OEM boot entry that
+#  Qubes' own lorax templates provide. Put it on a filesystem labelled
+#  QUBES_OEM (./build_iso.py write-usb does this) and the installer picks it up
+#  as the default boot entry. The signed ISO is untouched.
+#
+#  Package selection below is the stock dom0 set from conf/{base_ks} and what
+#  it includes, plus the investigator templates. It is NOT the compose
+#  kickstart: that one lives in the builder sources and only decides what goes
+#  into the ISO.
 # =============================================================================
 
-{installer}%include {base_ks}
-{pkgs}
+{installer}{pkgs}
 %post --log=/root/investigator-ks-post.log
 set -x
 
@@ -1747,38 +2354,52 @@ if ! flock -n 9; then
 fi
 ACCOUNT={shlex.quote(x.c['install']['username'])}
 ACCOUNT_MARKER=/var/lib/golden-image/account-enrolled
-if ! getent passwd "$ACCOUNT" >/dev/null; then
-    note "account-enrollment: intended account is missing; deferred"
-    exit 75
-fi
-# A usable existing password is authoritative even if an old marker vanished.
-if [ ! -e "$ACCOUNT_MARKER" ] && passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
+PROV_MARKER=/var/lib/golden-image/provisioning-complete
+mark_enrolled() {{
     tmp=$(mktemp /var/lib/golden-image/.account-enrolled.XXXXXX)
     chmod 0600 "$tmp" && mv -f "$tmp" "$ACCOUNT_MARKER"
-    note "account-enrollment: existing account password retained"
-elif [ ! -e "$ACCOUNT_MARKER" ]; then
-    note "waiting-for-input: account enrollment requires two hidden console entries"
-    PW1=$(systemd-ask-password --timeout=0 "Create login password for $ACCOUNT (not disk unlock)") || exit 75
-    PW2=$(systemd-ask-password --timeout=0 "Confirm login password for $ACCOUNT") || exit 75
+}}
+# The login password is the one thing on this machine only a person can
+# supply. It is asked for here, at the console, but it NEVER gates
+# provisioning: nobody at the keyboard means provisioning proceeds, and the
+# question is asked again on every run (each boot, and every 30 minutes)
+# until it is answered. Provisioning does not need the login.
+enroll() {{
+    [ -e "$ACCOUNT_MARKER" ] && return 0
+    if ! getent passwd "$ACCOUNT" >/dev/null; then
+        note "account-enrollment: account $ACCOUNT does not exist (the kickstart creates it locked); will retry"
+        return 1
+    fi
+    if passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
+        mark_enrolled
+        note "account-enrollment: existing account password retained"
+        return 0
+    fi
+    note "waiting-for-input: asking at the console for the $ACCOUNT login password (90 s)"
+    PW1=$(systemd-ask-password --timeout=90 "Create login password for $ACCOUNT (not disk unlock)") || {{ note "account-enrollment: no input; will ask again"; return 1; }}
+    PW2=$(systemd-ask-password --timeout=90 "Confirm login password for $ACCOUNT") || {{ unset PW1; note "account-enrollment: no input; will ask again"; return 1; }}
     if [ -z "$PW1" ] || [ "$PW1" != "$PW2" ]; then
         unset PW1 PW2
-        note "waiting-for-input: account passwords did not match"
-        exit 75
+        note "waiting-for-input: account passwords did not match; will ask again"
+        return 1
     fi
-    if ! printf '%s:%s\n' "$ACCOUNT" "$PW1" | chpasswd; then
+    if ! printf '%s:%s\\n' "$ACCOUNT" "$PW1" | chpasswd; then
         unset PW1 PW2
         note "account-enrollment: password setting failed; retry is safe"
-        exit 75
+        return 1
     fi
     unset PW1 PW2
     if ! passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
         note "account-enrollment: password state verification failed"
-        exit 75
+        return 1
     fi
-    tmp=$(mktemp /var/lib/golden-image/.account-enrolled.XXXXXX)
-    chmod 0600 "$tmp" && mv -f "$tmp" "$ACCOUNT_MARKER"
+    mark_enrolled
     note "complete: target-local investigator account enrolled"
-fi
+    return 0
+}}
+enroll || true
+# --- provisioning (never gated on the login password) ---
+if [ ! -e "$PROV_MARKER" ]; then
 ready() {{
     qvm-check --quiet sys-net 2>/dev/null &&
     qvm-check --quiet sys-firewall 2>/dev/null &&
@@ -1820,23 +2441,34 @@ fi
 note "starting provisioning"
 /usr/local/sbin/golden-image-provision --offline-checks >> /var/log/golden-image-firstboot.log 2>&1
 rc=$?
-if [ $rc -eq 0 ]; then
-    /usr/local/sbin/golden-image-provision --verify --offline-checks \
-        >> /var/log/golden-image-firstboot.log 2>&1
-    verify_rc=$?
-    if [ $verify_rc -eq 0 ]; then
-        touch "$MARKER"
-        note "complete: provisioning and acceptance checks succeeded"
-        rm -f /etc/motd.d/golden-image
-        systemctl disable golden-image-firstboot.timer >/dev/null 2>&1 || true
-        exit 0
-    fi
-    note "failed: acceptance checks rc=$verify_rc; retry will resume"
-    exit $verify_rc
-else
+if [ $rc -ne 0 ]; then
     note "failed: provisioning rc=$rc; retry will resume"
     exit $rc
 fi
+/usr/local/sbin/golden-image-provision --verify --offline-checks \\
+    >> /var/log/golden-image-firstboot.log 2>&1
+verify_rc=$?
+if [ $verify_rc -ne 0 ]; then
+    note "failed: acceptance checks rc=$verify_rc; retry will resume"
+    exit $verify_rc
+fi
+touch "$PROV_MARKER"
+note "complete: provisioning and acceptance checks succeeded"
+rm -f /etc/motd.d/golden-image
+fi
+# Done only when both halves are: provisioned AND a person has set the login
+# password. Until then the timer keeps this running, and each run asks again.
+if [ -e "$ACCOUNT_MARKER" ]; then
+    touch "$MARKER"
+    note "complete: provisioned and login password enrolled"
+    systemctl disable golden-image-firstboot.timer >/dev/null 2>&1 || true
+    exit 0
+fi
+note "provisioned; the $ACCOUNT login password is not set yet — will ask at the console again"
+mkdir -p /etc/motd.d
+echo "Provisioned. Set the login password now:  sudo golden-image-firstboot" \\
+    > /etc/motd.d/golden-image
+exit 75
 FB_EOF
 chmod 755 /usr/local/sbin/golden-image-firstboot
 
@@ -1861,39 +2493,65 @@ MOTD_EOF
 """)
     ks.chmod(0o644)
     x.ok(f"wrote {ks}")
-    x.info(f"%include {base_ks}  (resolved from {conf})")
-    validate_install_contract(x, ks, conf / base_ks)
+    validate_install_contract(x, ks)
     if extra_packages:
-        x.info(f"%packages adds: {', '.join('qubes-template-'+p for p in extra_packages)}")
-        validate_kickstart(x, ks, extra_packages)
+        x.info(f"installs templates: "
+               f"{', '.join('qubes-template-'+p for p in extra_packages)}")
+    validate_kickstart(x, ks, extra_packages, require_post=True)
     x.info(f"auto-provision on first boot: {x.c['auto_provision']}")
     x.info("the runner records deferred, failed and complete attempts in "
            "/var/lib/golden-image/firstboot-status; a real boot remains a "
            "hardware validation requirement")
-    x.warn("the ISO embeds the provisioning script. It contains NO secrets: credentials")
-    x.warn("  are generated on the target machine, never baked into the image.")
-    return rel
+    x.warn("the kickstart embeds the provisioning script. It contains NO secrets:")
+    x.warn("  credentials are generated on the target machine, never baked in.")
+    return ks
 
 
-def validate_install_contract(x: Ctx, generated: Path, stock: Path) -> None:
-    """Check the final two-part kickstart contract, not only our fragment."""
-    text = stock.read_text(errors="replace") + "\n" + generated.read_text(errors="replace")
+def validate_install_contract(x: Ctx, generated: Path) -> None:
+    """Check the install-time kickstart says what this install mode promises.
+
+    Only the OEM kickstart is examined. The stock compose kickstart is not part
+    of this contract: conf/iso-online.ks and conf/qubes-kickstart.cfg on
+    release4.3 contain nothing but `repo` lines and a `%packages` block — no
+    lang, keyboard, timezone, user, autopart or reboot — so requiring those of
+    the composed pair could never be satisfied and made the default,
+    non-unattended build abort before producing an ISO.
+    """
+    text = generated.read_text(errors="replace")
+    # True in both modes: without these the payload never reaches dom0, which
+    # is the whole reason this file exists.
     required = {
-        "language": r"(?m)^lang\s+\S+",
-        "keyboard": r"(?m)^keyboard\s+",
-        "timezone": r"(?m)^timezone\s+",
+        "provisioning payload (%post)": r"(?m)^%post\b",
+        "package selection": r"(?m)^%packages\b",
+        "provisioner binary": r"golden_image\.py",
+        # In both modes: the first-boot runner enrolls the password of
+        # exactly this account, so it has to exist whatever the operator
+        # typed into Anaconda's user screen.
         "user creation": r"(?m)^user\s+--name=",
-        "encrypted partitioning": r"autopart\s+--encrypted",
-        "installation completion/reboot": r"(?m)^reboot(?:\s|$)",
     }
-    missing = [name for name, pattern in required.items() if not re.search(pattern, text)]
+    if x.c["install"]["unattended"]:
+        # Only an unattended install promises to answer these.
+        required.update({
+            "language": r"(?m)^lang\s+\S+",
+            "keyboard": r"(?m)^keyboard\s+",
+            "timezone": r"(?m)^timezone\s+",
+            "encrypted partitioning": r"autopart\s+--encrypted",
+            "installation completion/reboot": r"(?m)^reboot(?:\s|$)",
+        })
+    missing = [name for name, pattern in required.items()
+               if not re.search(pattern, text)]
     if missing:
-        raise Fatal("final composed kickstart is missing: " + ", ".join(missing))
+        raise Fatal("install-time kickstart is missing: " + ", ".join(missing))
     if x.c["install"]["unattended"] and not x.c["install"]["auto_initial_setup"]:
         raise Fatal("unattended installation requires install.auto_initial_setup=true, "
                     "or Qubes initial setup remains an undocumented GUI dependency")
-    x.ok("final composed kickstart covers user, locale, keyboard, timezone, "
-         "encrypted storage, completion/reboot and Qubes initial setup")
+    if x.c["install"]["unattended"]:
+        x.ok("install-time kickstart covers user, locale, keyboard, timezone, "
+             "encrypted storage, completion/reboot, packages and the payload")
+    else:
+        x.ok("install-time kickstart carries the packages and the provisioning "
+             "payload; Anaconda still asks for locale and storage (unattended "
+             "is off)")
 
 
 def build_installer_directives(x: Ctx) -> str:
@@ -1905,8 +2563,19 @@ def build_installer_directives(x: Ctx) -> str:
     past — while the twenty that need not be, are not asked at all.
     """
     inst = x.c["install"]
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", str(inst.get("username", ""))):
+        raise Fatal("install.username must be a Linux account name (lowercase, max 32 characters)")
+    account = [
+        "# --- the investigator account, in BOTH install modes ----------------",
+        "# Created locked; the first-boot runner asks for its password at the",
+        "# console. Emitted for a manual install too: without it Anaconda's user",
+        "# screen creates whatever name the operator types, the runner never",
+        "# finds install.username, and provisioning defers every 30 minutes",
+        "# forever.",
+        f"user --name={inst['username']} --groups=wheel --lock",
+    ]
     if not inst["unattended"]:
-        return ""
+        return "\n".join(account) + "\n\n"
     target = str(inst.get("disk", "")).strip()
     if not target:
         raise Fatal("install.unattended requires install.disk with a stable target "
@@ -1917,15 +2586,12 @@ def build_installer_directives(x: Ctx) -> str:
                     "so the target is identified on the installation machine")
     if not inst["encrypt_disk"]:
         raise Fatal("unattended destructive installation requires disk encryption")
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", str(inst.get("username", ""))):
-        raise Fatal("install.username must be a Linux account name (lowercase, max 32 characters)")
-    lines = [
+    lines = account + [
         "# --- unattended install (iso-build.json: install.unattended) --------",
         f"lang {inst['lang']}",
         f"keyboard --vckeymap={inst['keyboard']} --xlayouts='{inst['keyboard']}'",
         f"timezone {inst['timezone']} --utc",
         "firstboot --disable",
-        f"user --name={inst['username']} --groups=wheel --lock",
         "reboot",
     ]
     # Resolve on the target in Anaconda's runtime. The build host's disks are
@@ -1944,9 +2610,9 @@ def build_installer_directives(x: Ctx) -> str:
         "src=$(findmnt -nro SOURCE /run/install/repo 2>/dev/null || true)",
         "case \"$src\" in \"$matches\"|\"$matches\"[0-9]*|\"$matches\"p[0-9]*) echo 'target is installation media' >&2; exit 1;; esac",
         "disk=$(basename \"$matches\")",
-        "printf 'ignoredisk --only-use=%s\\nclearpart --all --initlabel --drives=%s\\nautopart --encrypted --luks-version=%s\\n' \"$disk\" \"$disk\" " + shlex.quote(inst["luks_version"]) + " > /tmp/investigator-storage.ks",
+        "printf 'ignoredisk --only-use=%s\\nclearpart --all --initlabel --drives=%s\\nautopart --encrypted --luks-version=%s\\n' \"$disk\" \"$disk\" " + shlex.quote(inst["luks_version"]) + " > " + shlex.quote(STORAGE_INCLUDE),
         "%end",
-        "%include /tmp/investigator-storage.ks",
+        f"%include {STORAGE_INCLUDE}",
         "# Anaconda prompts for the unique per-machine LUKS passphrase.",
     ]
     x.info(f"unattended install directives: {inst['lang']}, {inst['keyboard']}, "
@@ -1959,13 +2625,28 @@ def build_installer_directives(x: Ctx) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def validate_kickstart(x: Ctx, ks: Path, extra_packages: list[str]) -> None:
+#  The storage stanza is written by %pre on the target and pulled in by
+#  %include, because the disk name cannot be known until the by-id symlink is
+#  resolved on the installing machine. Both the generator and the validator
+#  refer to this one constant so they cannot drift apart.
+STORAGE_INCLUDE = "/tmp/investigator-storage.ks"
+
+
+def validate_kickstart(x: Ctx, ks: Path, extra_packages: list[str],
+                       require_post: bool = False) -> None:
     """Parse the generated kickstart with pykickstart, if it is available.
 
-    The open question was whether pykickstart merges two %packages sections or
-    lets one override the other. Rather than asking the operator to confirm
-    standard Anaconda behaviour, parse the file and read the package list back:
-    if every added template is in it, the merge happened.
+    Two questions this answers rather than asks an operator to confirm: that
+    both %packages sections merge instead of overriding one another, and that
+    the file Anaconda will read parses at all.
+
+    The unattended build writes its partitioning in %pre and %includes it, which
+    is the standard Anaconda idiom for a disk whose name is only knowable on the
+    target — but it means the include target does not exist at build time and a
+    naive parse dies with "Unable to open input kickstart file". Rather than
+    skip validation (the file would go unparsed exactly in the mode that erases
+    a disk), materialise a representative expansion and parse a copy that points
+    at it, so the storage directives are parsed too.
     """
     if x.args.dry_run:
         return
@@ -1973,8 +2654,13 @@ def validate_kickstart(x: Ctx, ks: Path, extra_packages: list[str]) -> None:
 import sys
 from pykickstart.parser import KickstartParser
 from pykickstart.version import makeVersion
+from pykickstart.constants import KS_SCRIPT_POST, KS_SCRIPT_PRE
 p = KickstartParser(makeVersion())
 p.readKickstart(sys.argv[1])
+print("KSPARSE_OK")
+names = {KS_SCRIPT_POST: "post", KS_SCRIPT_PRE: "pre"}
+for s in p.handler.scripts:
+    print("SCRIPT", names.get(s.type, s.type))
 print("\\n".join(str(g) for g in p.handler.packages.packageList))
 """
     # Whichever interpreter can import pykickstart: this one on Fedora, or the
@@ -1986,14 +2672,36 @@ print("\\n".join(str(g) for g in p.handler.packages.packageList))
                  "was not parsed. The build checks the template RPMs are in the "
                  "finished ISO, which answers the same question after the fact.")
         return
-    out = x.run(py, "-c", probe, str(ks), check=False, capture=True)
+    text = ks.read_text(errors="replace")
+    with tempfile.TemporaryDirectory() as td:
+        target = ks
+        if STORAGE_INCLUDE in text:
+            # Stand in for what %pre writes on the target. The disk name is the
+            # only unknown; everything else is exactly what will be parsed
+            # there, so autopart/clearpart are really validated.
+            stub = Path(td) / "storage.ks"
+            stub.write_text(
+                "ignoredisk --only-use=sda\n"
+                "clearpart --all --initlabel --drives=sda\n"
+                "autopart --encrypted --luks-version="
+                f"{x.c['install']['luks_version']}\n")
+            target = Path(td) / "ks-parsecopy.cfg"
+            target.write_text(text.replace(STORAGE_INCLUDE, str(stub)))
+        out = x.run(py, "-c", probe, str(target), check=False, capture=True)
     if "ModuleNotFoundError" in out or "ImportError" in out:
         x.verify("pykickstart is not installed here, so the generated kickstart "
                  "was not parsed. The build checks the template RPMs are in the "
                  "finished ISO, which answers the same question after the fact.")
         return
-    if "Traceback" in out:
+    if "Traceback" in out or "KSPARSE_OK" not in out:
         raise Fatal(f"pykickstart cannot parse the generated kickstart:\n{out[-800:]}")
+    # The payload rides in %post. A kickstart that parses but carries no %post
+    # installs a machine that never provisions itself.
+    scripts = [ln.split(None, 1)[1] for ln in out.splitlines()
+               if ln.startswith("SCRIPT ")]
+    if require_post and "post" not in scripts:
+        raise Fatal("pykickstart parsed the kickstart but found no %post script "
+                    "— the provisioning payload would never run on the target.")
     missing = [f"qubes-template-{n}" for n in extra_packages
                if f"qubes-template-{n}" not in out]
     if missing:
@@ -2095,8 +2803,12 @@ def build_iso(x: Ctx, payload: Path):
     if not x.c["iso_sign_key"]:
         x.warn("--allow-unsigned: this image will be UNSIGNED. Do not distribute it.")
 
-    kickstart_rel = write_kickstart(x, base_ks, payload, extra)
-    x.phase("2b", "builder.yml iso: block")
+    kickstart_rel = write_kickstart(x, base_ks, extra)
+    # The answers and the payload do not go into the ISO: they go onto the
+    # QUBES_OEM filesystem that write-usb creates, which is what Anaconda
+    # actually reads.
+    write_oem_kickstart(x, base_ks, payload, extra)
+    x.phase("2c", "builder.yml iso: block")
     write_builder_iso_config(x, base_ks, iso_tpls, kickstart_rel)
 
     x.phase("3", "build the ISO")
@@ -2162,6 +2874,7 @@ def build_iso(x: Ctx, payload: Path):
                   live=True)
             x.ok(f"signed: {sig.name}")
             signed = f"yes, key {x.c['iso_sign_key']}"
+            sign_oem_kickstart(x, x.c["iso_sign_key"])
         except Fatal as e:
             raise Fatal(f"signing failed: {e}\n"
                         f"     The image is at {target} but is NOT signed. Do not "
@@ -2208,6 +2921,8 @@ def build_iso(x: Ctx, payload: Path):
     builder_commit = commit_id(x.builder)
     config_digest = hashlib.sha256(json.dumps(
         x.c, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    ks_state = ("signed" if oem_kickstart_signature_path(x).is_file()
+                else "UNSIGNED — write-usb will refuse it")
     (x.out_dir / "BUILD-RECORD.txt").write_text(f"""\
 {x.c['iso_name']}
 built:            {datetime.now():%Y-%m-%d %H:%M:%S}
@@ -2226,6 +2941,7 @@ auto-provision:   {x.c['auto_provision']}
 size:             {size_gb:.1f} GB
 sha256:           {digest}
 signed:           {signed}
+oem kickstart:    oem/ks.cfg, {ks_state} (write-usb puts it on the QUBES_OEM partition)
 
 EXPIRY: rebuild when a Qubes Security Bulletin affects dom0, Xen or the kernel.
 An investigator ISO older than its dom0 patch level is not fit to install.
@@ -2241,6 +2957,7 @@ Verify before installing:
   ISO        {target}   ({size_gb:.1f} GB)
   Checksum   {x.c['iso_name']}.sha256
   Signature  {signed}
+  Kickstart  oem/ks.cfg ({ks_state})
   Record     BUILD-RECORD.txt
   Log        {x.log}
 
@@ -2273,6 +2990,10 @@ Verify before installing:
 #  a script that has not been written yet. These are those scripts.
 # ===========================================================================
 OK, WARN, FAIL = "ok", "warn", "fail"
+#  "I looked and it is wrong" and "I could not look" are different answers, and
+#  conflating them is how check-upstream came to exit 0 during a network outage
+#  having verified nothing at all.
+UNKNOWN = "unknown"
 
 
 class Check:
@@ -2282,8 +3003,9 @@ class Check:
         self.name, self.state, self.detail, self.fix = name, state, detail, fix
 
 
-def _print_checks(x: Ctx, checks: list[Check]) -> int:
-    sym = {OK: (G, "✓"), WARN: (Y, "!"), FAIL: (R, "✗")}
+def _print_checks(x: Ctx, checks: list[Check],
+                  unknown_blocks: bool = False) -> int:
+    sym = {OK: (G, "✓"), WARN: (Y, "!"), FAIL: (R, "✗"), UNKNOWN: (Y, "?")}
     for c in checks:
         col, mark = sym[c.state]
         line = f"  {col}{mark}{RST} {c.name}"
@@ -2295,9 +3017,18 @@ def _print_checks(x: Ctx, checks: list[Check]) -> int:
             print(f"      {D}fix: {c.fix}{RST}")
     bad = [c for c in checks if c.state == FAIL]
     warns = [c for c in checks if c.state == WARN]
-    print(f"\n  {G}{len(checks) - len(bad) - len(warns)} ok{RST}   "
-          f"{Y}{len(warns)} warnings{RST}   {R}{len(bad)} blocking{RST}")
-    return 1 if bad else 0
+    unknown = [c for c in checks if c.state == UNKNOWN]
+    print(f"\n  {G}{len(checks) - len(bad) - len(warns) - len(unknown)} ok{RST}   "
+          f"{Y}{len(warns)} warnings{RST}   "
+          f"{Y}{len(unknown)} not checked{RST}   {R}{len(bad)} blocking{RST}")
+    if unknown and unknown_blocks:
+        print(f"\n  {R}{len(unknown)} upstream source(s) could not be reached, so "
+              f"they were not verified.{RST}")
+        print("  This is reported as a failure rather than a pass: a green run "
+              "here is taken\n  to mean the supply chain was checked. Re-run "
+              "with network, or pass\n  --allow-unreachable to accept an "
+              "unverified supply chain deliberately.")
+    return 1 if bad or (unknown and unknown_blocks) else 0
 
 
 def host_os_release() -> dict[str, str]:
@@ -2422,7 +3153,7 @@ def _sudo(argv: list[str]) -> list[str]:
     return argv if os.geteuid() == 0 else ["sudo", *argv]
 
 
-def protected_secret_file(args) -> Path | None:
+def protected_secret_file(args, *, attr: str = "passphrase_file") -> Path | None:
     """Return a validated runtime secret file, never its contents.
 
     Named pipes and /proc/self/fd/N are accepted for secret managers. Ordinary
@@ -2431,19 +3162,20 @@ def protected_secret_file(args) -> Path | None:
     secret-key operation, so losing descriptor/file access during a resumed
     orchestration fails closed.
     """
-    raw = getattr(args, "passphrase_file", None)
+    raw = getattr(args, attr, None)
     if not raw:
         return None
+    flag = "--" + attr.replace("_", "-")
     path = Path(raw)
     try:
         st = path.stat()
     except OSError as exc:
-        raise Fatal(f"cannot access --passphrase-file {path}: {exc}") from exc
+        raise Fatal(f"cannot access {flag} {path}: {exc}") from exc
     owner = int(os.environ.get("SUDO_UID", os.getuid()))
     if st.st_uid != owner:
-        raise Fatal(f"--passphrase-file {path} must be owned by build UID {owner}")
+        raise Fatal(f"{flag} {path} must be owned by build UID {owner}")
     if st.st_mode & 0o077:
-        raise Fatal(f"--passphrase-file {path} permissions are too open; use chmod 600")
+        raise Fatal(f"{flag} {path} permissions are too open; use chmod 600")
     if not (path.is_file() or str(path).startswith("/proc/self/fd/")
             or __import__("stat").S_ISFIFO(st.st_mode)):
         raise Fatal("--passphrase-file must be a regular file, protected FIFO, or "
@@ -2451,9 +3183,16 @@ def protected_secret_file(args) -> Path | None:
     return path
 
 
-def gpg_secret_options(args, *, yes: bool = True) -> list[str]:
-    """GPG options for an unattended operation involving private material."""
-    pf = protected_secret_file(args)
+def gpg_secret_options(args, *, yes: bool = True,
+                       attr: str = "passphrase_file") -> list[str]:
+    """GPG options for an unattended operation involving private material.
+
+    `attr` names which secret this operation needs. They are not
+    interchangeable: unlocking the signing key to export it and encrypting the
+    resulting backup are two different passphrases, and the code's own prompt
+    says so ("They may differ; both are needed to restore").
+    """
+    pf = protected_secret_file(args, attr=attr)
     opts = ["--batch"]
     if yes:
         opts.append("--yes")
@@ -2806,6 +3545,11 @@ def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
             ("venv support, for the kickstart validator",
              ["python3-venv", "python3-virtualenv"]),
             ("kickstart validation", ["python3-pykickstart"]),
+            # write-usb appends the QUBES_OEM partition that carries the
+            # install-time kickstart. Without these the stick boots into a
+            # plain manual installer and nothing provisions the machine.
+            ("GPT partitioning for the QUBES_OEM partition", ["gdisk"]),
+            ("FAT tools for the QUBES_OEM partition", ["dosfstools"]),
         ]
     # "docker" is NOT a Fedora binary package name — it is a virtual provide of
     # moby-engine, so `dnf list docker` finds nothing and the old hardcoded
@@ -2830,6 +3574,11 @@ def host_package_plan(fam: str, ce: str) -> list[tuple[str, list[str]]]:
         # it works too, and is kept as a fallback for a Fedora that has only
         # that name.
         ("kickstart validation", ["python3-kickstart", "pykickstart"]),
+        # write-usb appends the QUBES_OEM partition that carries the
+        # install-time kickstart. Without these the stick boots into a plain
+        # manual installer and nothing provisions the machine.
+        ("GPT partitioning for the QUBES_OEM partition", ["gdisk"]),
+        ("FAT tools for the QUBES_OEM partition", ["dosfstools"]),
     ]
     if ce == "docker":
         plan.insert(1, ("the docker command (split from the engine in Fedora)",
@@ -3052,7 +3801,7 @@ def _have_module(name: str) -> bool:
         return False
 
 
-def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
+def host_gaps(ce: str, need_ks: bool = False, oem_fstype: str = "vfat") -> list[str]:
     """Everything the build host is missing that a package can supply.
 
     This used to probe five binaries and nothing else, so on a host that
@@ -3064,6 +3813,13 @@ def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
     loop.
     """
     gaps = [t for t in ("git", "curl", "gpg", "rsync", ce) if not shutil.which(t)]
+    # Needed only by write-usb, but missing them there means discovering it
+    # with the stick already written and the operator waiting.
+    # The formatter install.oem_fstype selects — ext4 exists precisely for a
+    # host without dosfstools, so demanding mkfs.vfat there blocked a valid
+    # configuration.
+    mkfs = "mkfs.vfat" if oem_fstype == "vfat" else "mkfs.ext4"
+    gaps += [t for t in ("sgdisk", mkfs) if not shutil.which(t)]
     if not _have_module("yaml"):
         # Named by what it is, not by one distribution's package name: this
         # message is printed on Fedora hosts too, where it is python3-pyyaml.
@@ -3156,7 +3912,7 @@ def setup_host(x: Ctx) -> int:
     # listed at all. The virtualenv step re-checks and does nothing if the
     # package install satisfied it, so a Fedora host uses its own package.
     need_ks = not kickstart_python(x)[0]
-    gaps = host_gaps(ce, need_ks)
+    gaps = host_gaps(ce, need_ks, x.c["install"]["oem_fstype"])
     if gaps:
         x.info("missing on this host: " + ", ".join(gaps))
         if fam == "debian":
@@ -3485,26 +4241,51 @@ def backup_key(x: Ctx) -> int:
     while mount != mount.parent and not os.path.ismount(mount):
         mount = mount.parent
     if mount == Path("/"):
-        raise Fatal(f"backup destination {dest} is not on a separately mounted "
-                    "medium. Mount the intended backup disk and retry.")
+        if not getattr(x.args, "allow_local_key_backup", False):
+            raise Fatal(f"backup destination {dest} is not on a separately mounted "
+                        "medium. Mount the intended backup disk and retry, or "
+                        "pass --allow-local-key-backup to keep the backup on "
+                        "this host.")
+        x.warn("THIS KEY BACKUP IS ON THIS HOST'S OWN DISK.")
+        x.warn(f"  {dest}")
+        x.warn("  It does not survive losing this machine, and it sits next to")
+        x.warn("  the key it backs up. Copy it onto removable media you keep")
+        x.warn("  somewhere else BEFORE you ship an image signed with this key.")
     dest.mkdir(parents=True, exist_ok=True)
     dest.chmod(0o700)
     old_umask = os.umask(0o077)
     try:
         sec = dest / f"{fpr}-secret.asc"
-        pf = protected_secret_file(x.args)
-        if not pf:
+        # Two different secrets. --passphrase-file unlocks the SIGNING key so
+        # it can be exported; --backup-passphrase-file encrypts the resulting
+        # backup. Feeding one to both steps meant a non-interactive backup
+        # could only work when the two happened to be the same string, and
+        # otherwise failed at the export with a confusing gpg error.
+        signing_pf = protected_secret_file(x.args, attr="passphrase_file")
+        backup_pf = protected_secret_file(x.args, attr="backup_passphrase_file")
+        if backup_pf is None and signing_pf is not None:
+            # Backwards compatible: one file given, used for both, as before.
+            backup_pf = signing_pf
+            backup_attr = "passphrase_file"
+            x.info("one --passphrase-file given: using it for both the key "
+                   "export and the backup encryption")
+        else:
+            backup_attr = "backup_passphrase_file"
+        if not signing_pf and not backup_pf:
             if not sys.stdin.isatty():
                 raise Fatal("backing up a key needs a terminal for the "
                             "passphrase prompts, or --passphrase-file <path> "
-                            "to encrypt the backup non-interactively.")
+                            "(to unlock the signing key) and "
+                            "--backup-passphrase-file <path> (to encrypt the "
+                            "backup) to run non-interactively.")
             x.info("gpg will ask for the key's passphrase, and then for a "
                    "passphrase to encrypt the backup with. They may differ; both "
                    "are needed to restore.")
         # Encrypted at rest with a passphrase, not a bare export: this file is
         # about to be carried somewhere.
         sec.unlink(missing_ok=True)
-        rc = subprocess.run(["gpg", *gpg_secret_options(x.args),
+        rc = subprocess.run(["gpg", *gpg_secret_options(x.args,
+                                                        attr="passphrase_file"),
                              "--export-secret-keys", "--armor", "--output",
                              str(sec), fpr], stdin=subprocess.DEVNULL).returncode
         if rc != 0 or not sec.exists():
@@ -3514,8 +4295,8 @@ def backup_key(x: Ctx) -> int:
         enc.unlink(missing_ok=True)
         argv = ["gpg", "--symmetric", "--cipher-algo", "AES256",
                 "--output", str(enc)]
-        if pf:
-            argv[1:1] = gpg_secret_options(x.args)
+        if backup_pf:
+            argv[1:1] = gpg_secret_options(x.args, attr=backup_attr)
         rc = subprocess.run(argv + [str(sec)]).returncode
         if rc != 0 or not enc.exists():
             sec.unlink(missing_ok=True)
@@ -3644,37 +4425,72 @@ def config_get(x: Ctx, dotted: str) -> int:
 
 
 def config_set(x: Ctx, dotted: str, raw: str, quiet: bool = False) -> int:
-    if dotted not in _flat_keys(DEFAULT_CONFIG):
-        near = [k for k in sorted(_flat_keys(DEFAULT_CONFIG))
-                if dotted.split(".")[-1] in k]
-        raise Fatal(f"'{dotted}' is not a configuration key."
-                    + (f"\n     did you mean: {', '.join(near[:5])}" if near else ""))
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        value = raw
+    return config_set_many(x, [(dotted, raw)], quiet=quiet)
 
+
+def config_set_many(x: Ctx, pairs: list[tuple[str, str]], quiet: bool = False) -> int:
+    """Apply every --set, then validate ONCE, then write.
+
+    All of them before validating, because a legitimate pair can be invalid
+    halfway through: `--set install.unattended=true --set install.disk=...`
+    describes a valid configuration only once both have been applied.
+
+    Validating before the write is what keeps the file repairable. Writing
+    first and validating at load time meant a single documented command could
+    leave iso-build.json in a state where every later invocation — including
+    the --set needed to correct it — died in load_config before doing
+    anything, and only hand-editing the JSON could recover it.
+    """
     stored: dict = {}
     if CONF_PATH.exists():
         try:
             stored = json.loads(CONF_PATH.read_text())
         except (json.JSONDecodeError, ValueError) as e:
             raise Fatal(f"{CONF_PATH.name} is not valid JSON: {e}")
-    node = stored
-    parts = dotted.split(".")
-    for part in parts[:-1]:
-        node = node.setdefault(part, {})
-        if not isinstance(node, dict):
-            raise Fatal(f"cannot set {dotted}: {part} is not a section")
-    node[parts[-1]] = value
+
+    applied: list[tuple[str, object]] = []
+    for dotted, raw in pairs:
+        if dotted not in _flat_keys(DEFAULT_CONFIG):
+            near = [k for k in sorted(_flat_keys(DEFAULT_CONFIG))
+                    if dotted.split(".")[-1] in k]
+            raise Fatal(f"'{dotted}' is not a configuration key."
+                        + (f"\n     did you mean: {', '.join(near[:5])}" if near else ""))
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        node = stored
+        parts = dotted.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise Fatal(f"cannot set {dotted}: {part} is not a section")
+        node[parts[-1]] = value
+        applied.append((dotted, value))
+
+    merged = deep_merge(DEFAULT_CONFIG, stored)
+    try:
+        # validate_config raises ValueError, not Fatal.
+        validate_config(merged)
+    except (ValueError, Fatal) as exc:
+        raise Fatal(
+            f"{exc}\n"
+            f"     Refusing to write {CONF_PATH.name}: it would leave a "
+            f"configuration no build can use.\n"
+            f"     Nothing has been changed. Set the values that go together "
+            f"in one command, e.g.\n"
+            f"       ./build_iso.py --set install.unattended=true "
+            f"--set install.disk=/dev/disk/by-id/...") from None
 
     if x.args.dry_run:
-        x.info(f"[dry-run] {dotted} = {value!r}")
+        for dotted, value in applied:
+            x.info(f"[dry-run] {dotted} = {value!r}")
         return 0
     CONF_PATH.write_text(json.dumps(stored, indent=2) + "\n")
-    x.c = deep_merge(DEFAULT_CONFIG, stored)
+    x.c = merged
     if not quiet:
-        x.ok(f"{dotted} = {value!r}   ({CONF_PATH.name})")
+        for dotted, value in applied:
+            x.ok(f"{dotted} = {value!r}   ({CONF_PATH.name})")
     return 0
 
 
@@ -3928,10 +4744,10 @@ def check_upstream(x: Ctx) -> int:
                            "two independent sources agreeing is the standard "
                            "before a police workstation trusts a repository"))
         except Exception as e:                               # noqa: BLE001
-            c.append(Check("Kali: independent keyserver reachable", WARN,
+            c.append(Check("Kali: independent keyserver reachable", UNKNOWN,
                            f"{type(e).__name__}: {e}"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Kali: keyring reachable", WARN, f"{type(e).__name__}: {e}",
+        c.append(Check("Kali: keyring reachable", UNKNOWN, f"{type(e).__name__}: {e}",
                        "network check skipped — re-run where the build host has "
                        "outbound HTTPS"))
 
@@ -3966,7 +4782,7 @@ def check_upstream(x: Ctx) -> int:
                            "re-add the key in tpl-ids before it expires or the "
                            "DPI recorder quietly stops receiving updates"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Zeek: OBS key reachable", WARN, f"{type(e).__name__}: {e}"))
+        c.append(Check("Zeek: OBS key reachable", UNKNOWN, f"{type(e).__name__}: {e}"))
 
     # --- Wazuh --------------------------------------------------------
     #  Read the apt index this image actually installs from, not a release
@@ -3994,7 +4810,7 @@ def check_upstream(x: Ctx) -> int:
                            f"{pinned} is newer than anything in the repository",
                            "the agents would never install"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Wazuh: package index reachable", WARN, f"{type(e).__name__}: {e}"))
+        c.append(Check("Wazuh: package index reachable", UNKNOWN, f"{type(e).__name__}: {e}"))
 
     # --- Wazuh signing key --------------------------------------------
     try:
@@ -4016,7 +4832,7 @@ def check_upstream(x: Ctx) -> int:
                                OK if days > 90 else (WARN if days > 0 else FAIL),
                                f"{days} days left"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Wazuh: signing key reachable", WARN, f"{type(e).__name__}: {e}"))
+        c.append(Check("Wazuh: signing key reachable", UNKNOWN, f"{type(e).__name__}: {e}"))
 
     # --- the vendor scripts phase 8 runs as root ----------------------
     try:
@@ -4035,7 +4851,7 @@ def check_upstream(x: Ctx) -> int:
                            "update wazuh.certs_tool_sha256 / "
                            "wazuh.passwords_tool_sha256 in golden-image.json"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Wazuh: vendor scripts reachable", WARN,
+        c.append(Check("Wazuh: vendor scripts reachable", UNKNOWN,
                        f"{type(e).__name__}: {e}"))
 
     # --- Qubes security bulletins ------------------------------------
@@ -4078,12 +4894,22 @@ def check_upstream(x: Ctx) -> int:
                            "older than its dom0 patch level installs known-"
                            "vulnerable dom0 before its first update"))
     except Exception as e:                                   # noqa: BLE001
-        c.append(Check("Qubes: security bulletin index reachable", WARN,
+        c.append(Check("Qubes: security bulletin index reachable", UNKNOWN,
                        f"{type(e).__name__}: {e}"))
 
-    rc = _print_checks(x, c)
+    rc = _print_checks(
+        x, c, unknown_blocks=not getattr(x.args, "allow_unreachable", False))
 
     if update and not x.args.dry_run:
+        unverified = [ch.name for ch in c if ch.state == UNKNOWN]
+        if unverified:
+            # What could not be reached was not checked. Recording today's
+            # date anyway would let every build for check_upstream_max_age_days
+            # skip exactly the sources that were never verified — a one-run
+            # --allow-unreachable turned into a multi-day bypass.
+            seen.pop("checked", None)
+            x.warn(f"{len(unverified)} source(s) were not verified, so the "
+                   "freshness date is not advanced — the next build checks again")
         merged = deep_merge(lock, seen)
         LOCK_PATH.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
         x.ok(f"recorded in {LOCK_PATH.name} — commit it so the next check has a "
@@ -4136,21 +4962,60 @@ if [ -n "$FPR" ] && [ -f "$ISO.asc" ]; then
     # baked into this script would prove nothing: the script travels with the
     # image, so whoever replaced one could replace the other.
     status=$(gpg --batch --status-fd 1 --verify "$ISO.asc" "$ISO" 2>/dev/null)
+    # Revocation is checked FIRST: a revoked key turns GOODSIG into REVKEYSIG,
+    # so the generic "does not verify" branch would otherwise catch it and tell
+    # the operator something materially different from what happened. gpg still
+    # exits 0 and still emits VALIDSIG here.
+    if echo "$status" | grep -qE '^\\[GNUPG:\\] (KEYREVOKED|REVKEYSIG)'; then
+        printf 'REVOKED\\n\\n  The signing key has been REVOKED by its owner.\\n'
+        printf '  Do not install this image.\\n\\n'
+        exit 1
+    fi
     if ! echo "$status" | grep -q '^\\[GNUPG:\\] GOODSIG'; then
         printf 'BAD\\n\\n  The signature does not verify. Do not install this image.\\n\\n'
         exit 1
     fi
     printf 'ok\\n'
-    signer=$(echo "$status" | sed -n 's/^\\[GNUPG:\\] VALIDSIG \\([0-9A-F]*\\).*/\\1/p' | head -1)
-    printf '\\n  Signed by:  %s\\n' "$signer"
-    if [ -n "$FPR" ] && [ "$signer" != "$FPR" ]; then
+    # VALIDSIG names the signing key FIRST and the primary key LAST. With a
+    # normal GnuPG key the signature is made by a signing SUBKEY, so comparing
+    # only the first field against the unit's primary fingerprint rejects a
+    # genuine image. Accept either.
+    validsig=$(echo "$status" | grep '^\\[GNUPG:\\] VALIDSIG ' | head -1)
+    signer=$(echo "$validsig" | awk '{{print $3}}')
+    primary=$(echo "$validsig" | awk '{{print $NF}}')
+    printf '\\n  Signed by:  %s\\n' "$primary"
+    if [ "$signer" != "$primary" ]; then
+        printf '  (signing subkey %s)\\n' "$signer"
+    fi
+    # The install-time kickstart, when the bundle carries one. It runs as root
+    # inside the installer, and the image's signature does not cover it.
+    if [ -f oem/ks.cfg ]; then
+        printf '  install-time kickstart ... '
+        if [ ! -f oem/ks.cfg.asc ]; then
+            printf 'UNSIGNED\\n\\n  oem/ks.cfg carries no signature. Do not write this bundle to media.\\n\\n'
+            exit 1
+        fi
+        ksstatus=$(gpg --batch --status-fd 1 --verify oem/ks.cfg.asc oem/ks.cfg 2>/dev/null)
+        if echo "$ksstatus" | grep -qE '^\\[GNUPG:\\] (KEYREVOKED|REVKEYSIG)' \\
+                || ! echo "$ksstatus" | grep -q '^\\[GNUPG:\\] GOODSIG'; then
+            printf 'BAD\\n\\n  The kickstart signature does not verify. Do not write this bundle to media.\\n\\n'
+            exit 1
+        fi
+        ksprimary=$(echo "$ksstatus" | grep '^\\[GNUPG:\\] VALIDSIG ' | head -1 | awk '{{print $NF}}')
+        if [ "$ksprimary" != "$primary" ]; then
+            printf 'BAD\\n\\n  The kickstart was signed by a different key than the image.\\n\\n'
+            exit 1
+        fi
+        printf 'ok\\n'
+    fi
+    if [ -n "$FPR" ] && [ "$signer" != "$FPR" ] && [ "$primary" != "$FPR" ]; then
         printf '  Expected:   %s\\n' "$FPR"
         printf '\\n  *** The signer is NOT the key this image was built with. ***\\n'
         printf '  Stop. Do not install this image.\\n\\n'
         exit 1
     fi
     if [ -n "$EXPECT" ]; then
-        if [ "$signer" = "$EXPECT" ]; then
+        if [ "$signer" = "$EXPECT" ] || [ "$primary" = "$EXPECT" ]; then
             printf '  Matches the fingerprint you supplied.\\n\\n'
         else
             printf '  Expected:   %s\\n' "$EXPECT"
@@ -4218,6 +5083,7 @@ def sign_iso(x: Ctx) -> int:
     x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr, "--detach-sign",
           "--armor", "--output", str(sig), str(iso), live=True)
     x.ok(f"signed: {sig.name}")
+    ks_sig = sign_oem_kickstart(x, fpr)
     # Everything that has to travel with, or beside, the signature.
     x.export_pubkey()
     write_verify_script(x, digest)
@@ -4226,7 +5092,7 @@ def sign_iso(x: Ctx) -> int:
     print(f"""
   Copy back to the build host, or hand out from here:
     {iso.name}, {sha.name}, {sig.name}
-    unit-signing-key.asc, verify-iso.sh
+    unit-signing-key.asc, verify-iso.sh{', oem/ks.cfg, oem/ks.cfg.asc' if ks_sig else ''}
   And, through a channel independent of all of those:
     {iso.parent / 'FINGERPRINT.txt'}
 """)
@@ -4310,6 +5176,13 @@ if (-not $gpg) {{
 & gpg.exe --quiet --import unit-signing-key.asc 2>$null
 Write-Host '  signature ... ' -NoNewline
 $status = & gpg.exe --batch --status-fd 1 --verify "$Iso.asc" $Iso 2>$null
+# Revocation first: a revoked key turns GOODSIG into REVKEYSIG, so the
+# generic branch would otherwise report the wrong reason.
+if ($status -match 'KEYREVOKED' -or $status -match 'REVKEYSIG') {{
+    Write-Host 'REVOKED' -f Red
+    Write-Host '  The signing key has been REVOKED by its owner. Stop.' -f Red
+    exit 1
+}}
 if (-not ($status -match 'GOODSIG')) {{
     Write-Host 'BAD' -f Red
     Write-Host '  The signature does not verify. Do not install this image.' -f Red
@@ -4317,17 +5190,23 @@ if (-not ($status -match 'GOODSIG')) {{
 }}
 Write-Host 'ok' -f Green
 
-$signer = ($status | Select-String 'VALIDSIG ([0-9A-F]{{40}})').Matches.Groups[1].Value
+# VALIDSIG names the signing key first and the primary key last. A normal
+# GnuPG key signs with a subkey, so accept either fingerprint.
+$validsig = ($status | Select-String '^\\[GNUPG:\\] VALIDSIG ' | Select-Object -First 1).Line
+$fields = $validsig -split '\\s+'
+$signer = $fields[2].ToUpper()
+$primary = $fields[-1].ToUpper()
 Write-Host ''
-Write-Host "  Signed by:  $signer"
-if ($Fpr -and $signer -ne $Fpr) {{
+Write-Host "  Signed by:  $primary"
+if ($signer -ne $primary) {{ Write-Host "  (signing subkey $signer)" }}
+if ($Fpr -and $signer -ne $Fpr -and $primary -ne $Fpr) {{
     Write-Host "  Expected:   $Fpr" -f Red
     Write-Host '  The signer is NOT the key this image was built with. Stop.' -f Red
     exit 1
 }}
 if ($Expect) {{
     $e = ($Expect -replace '\\s','').ToUpper()
-    if ($e -eq $signer) {{ Write-Host '  Matches the fingerprint you supplied.' -f Green }}
+    if ($e -eq $signer -or $e -eq $primary) {{ Write-Host '  Matches the fingerprint you supplied.' -f Green }}
     else {{
         Write-Host "  Expected:   $e" -f Red
         Write-Host '  MISMATCH. Do not install this image.' -f Red
@@ -4383,7 +5262,11 @@ def write_usb(x: Ctx) -> int:
     if not iso.is_file():
         raise Fatal(f"no image at {iso}. Build it first:  ./build_iso.py iso")
 
-    # 1. Never write an image you have not just verified.
+    # 1. Never write anything you have not just verified — the install-time
+    #    kickstart included. It runs as root inside the installer and travels
+    #    beside the image, not inside it, so the image's checksum and
+    #    signature say nothing about it: a replaced oem/ks.cfg would verify
+    #    exactly as well as the genuine one. It gets the same authentication.
     sha = x.out_dir / f"{x.c['iso_name']}.sha256"
     if sha.is_file():
         import hashlib
@@ -4399,36 +5282,44 @@ def write_usb(x: Ctx) -> int:
     else:
         raise Fatal("no .sha256 beside the image — refusing destructive write")
 
+    no_oem = bool(getattr(x.args, "no_oem", False))
+    ks = oem_kickstart_path(x)
+    ks_sig = oem_kickstart_signature_path(x)
+    if no_oem:
+        pass
+    elif not ks.is_file():
+        raise Fatal(
+            f"no install-time kickstart at {ks}.\n"
+            f"     It is written by `./build_iso.py iso`. Without it the "
+            f"installer has nothing to read and the provisioning payload never\n"
+            f"     reaches dom0. Rebuild, or pass --no-oem to write a plain "
+            f"Qubes installer stick deliberately.")
+    elif not ks_sig.is_file():
+        raise Fatal(
+            f"no signature beside the install-time kickstart ({ks_sig}).\n"
+            f"     It runs as root inside the installer, so it gets the same "
+            f"authentication as the image.\n"
+            f"     `./build_iso.py iso` signs it; `./build_iso.py sign` signs one "
+            f"built elsewhere;\n     --no-oem writes a plain installer stick "
+            f"deliberately.")
+
     asc = x.out_dir / f"{x.c['iso_name']}.asc"
     if asc.is_file():
-        # Not quiet(): it has a 180 s timeout, and verifying a detached
-        # signature means hashing the entire image. A timeout would have been
-        # swallowed into False and reported as a forged signature.
         x.info("verifying the signature (gpg hashes the whole image)")
         # --status-fd, not a bare --verify: `gpg --verify` exits 0 for a good
         # signature from ANY key in the keyring, so reporting "verifies against
         # <the unit key>" after it asserted a binding that was never tested —
         # on the last checkpoint before an image reaches removable media.
-        out = x.run("gpg", "--batch", "--status-fd", "1", "--verify",
-                    str(asc), str(iso), check=False, capture=True)
-        signer = ""
-        for line in out.splitlines():
-            if line.startswith("[GNUPG:] VALIDSIG "):
-                signer = line.split()[2]
-                break
-        if not signer:
-            raise Fatal("the detached signature does not verify. Do not write "
-                        "this image to media.")
-        want = (x.c["iso_sign_key"] or "").upper()
-        if want and signer.upper() != want:
-            raise Fatal(f"the image is signed by {signer}, not by the configured "
-                        f"key {want}.\n     Do not write it to media.")
+        signer = verify_detached_signature(asc, iso, x.c["iso_sign_key"])
         x.ok(f"signature verifies, signed by {signer}")
     else:
         raise Fatal("no detached signature beside the image — refusing destructive write")
     if not (x.c.get("iso_sign_key") or "").strip():
         raise Fatal("iso_sign_key is not configured, so the expected signer cannot "
                     "be authenticated before writing")
+    if not no_oem:
+        signer = verify_detached_signature(ks_sig, ks, x.c["iso_sign_key"])
+        x.ok(f"install-time kickstart signature verifies, signed by {signer}")
 
     # 2. Pick a device, and refuse anything that is not removable.
     devs = removable_devices()
@@ -4545,6 +5436,20 @@ def write_usb(x: Ctx) -> int:
         raise Fatal("readback does NOT match the image. The write failed silently "
                     "or the media is faulty. Do not distribute this stick.")
 
+    # Only now, after the image has been compared against the stick: appending
+    # the partition rewrites the GPT, which lives inside the ISO's system area.
+    # The kickstart itself was authenticated in step 1, before any device was
+    # touched.
+    if no_oem:
+        x.warn(f"--no-oem: no {OEM_LABEL} partition written. The installer will "
+               f"not find a kickstart, so nothing provisions the machine and "
+               f"the install is an ordinary manual Qubes install.")
+    else:
+        target = getattr(x.args, "oem_device", None) or dev_path
+        if target != dev_path:
+            guard_second_device(x, target)
+        write_oem_partition(x, target, ks)
+
     print(f"""
   Also copy these onto a SEPARATE stick or an internal page — never only the
   one carrying the image:
@@ -4554,6 +5459,248 @@ def write_usb(x: Ctx) -> int:
       {x.out_dir / 'verify-iso.sh'}
 """)
     return 0
+
+
+#  Qubes' own lorax templates look for exactly this label and nothing else:
+#  `if search --set=oem -l QUBES_OEM` in templates/config_files/x86/grub2-bios.cfg
+#  and grub2-efi.cfg. It is not a name this project is free to choose.
+OEM_LABEL = "QUBES_OEM"
+
+
+def oem_kickstart_path(x: Ctx) -> Path:
+    return x.out_dir / "oem" / "ks.cfg"
+
+
+def oem_kickstart_signature_path(x: Ctx) -> Path:
+    return oem_kickstart_path(x).with_name("ks.cfg.asc")
+
+
+def sign_oem_kickstart(x: Ctx, fpr: str) -> Path | None:
+    """Detach-sign oem/ks.cfg with the release key.
+
+    The kickstart is executed as root by the installer, and it travels beside
+    the image rather than inside it, so the image's signature says nothing
+    about it. Signing it here, and authenticating that signature in write-usb
+    before it reaches media, gives it the same boundary the image has. None
+    when there is no kickstart to sign (an image built with --no-oem in mind).
+    """
+    ks = oem_kickstart_path(x)
+    if not ks.is_file():
+        return None
+    sig = oem_kickstart_signature_path(x)
+    sig.unlink(missing_ok=True)
+    x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
+          "--detach-sign", "--armor", "--output", str(sig), str(ks))
+    x.ok(f"signed: oem/{sig.name} (the install-time kickstart)")
+    return sig
+
+
+def verify_detached_signature(sig: Path, payload: Path, expected: str) -> str:
+    """gpg --verify with --status-fd, authenticated against `expected`.
+
+    Not quiet(): that has a 180 s timeout, and a detached signature over an
+    image means hashing the whole file. A timeout would be swallowed into
+    False and reported as a forged signature.
+    """
+    proc = subprocess.run(
+        ["gpg", "--batch", "--status-fd", "1", "--verify", str(sig), str(payload)],
+        capture_output=True, text=True)
+    return authenticate_signature(proc.stdout, proc.returncode, expected)
+
+
+def partition_node(dev_path: str, number: int) -> str:
+    """/dev/sdb + 3 -> /dev/sdb3;  /dev/nvme0n1 + 3 -> /dev/nvme0n1p3.
+
+    Resolved first: an operator may name the stick as /dev/disk/by-id/usb-...,
+    whose partitions are ...-part3, not ...3. The kernel node is what carries
+    the pN / N suffix, so that is what the suffix is applied to.
+    """
+    real = os.path.realpath(dev_path)
+    return f"{real}p{number}" if real[-1:].isdigit() else f"{real}{number}"
+
+
+def _gpt_partition_numbers(x: Ctx, dev_path: str) -> set[int]:
+    out = x.run(*_sudo(["sgdisk", "-p", dev_path]), check=False, capture=True)
+    found = set()
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+\d+\s+\d+\s", line)
+        if m:
+            found.add(int(m.group(1)))
+    return found
+
+
+def guard_second_device(x: Ctx, target: str) -> None:
+    """The guards a device gets before a partition is appended to it.
+
+    The image stick was just erased with the operator's consent. A device named
+    with --oem-device was not, so it gets the same three checks the image stick
+    got: removable (or --allow-fixed-disk), nothing mounted, and a question.
+    """
+    second = next((d for d in removable_devices() if d["dev"] == target), None)
+    if second is None and not getattr(x.args, "allow_fixed_disk", False):
+        raise Fatal(f"--oem-device {target} is not a removable device. "
+                    f"Refusing — a partition would be appended to it.\n"
+                    f"     If you are certain, pass --allow-fixed-disk.")
+    mounted = _mounted_partitions(target)
+    if mounted:
+        raise Fatal(f"{target} has mounted partitions "
+                    f"({', '.join(mounted)}). Unmount them first.")
+    x.warn(f"A {OEM_LABEL} partition will be APPENDED to {target}"
+           + (f"  ({second['size'] / 1e9:.1f} GB {second['model']})" if second else ""))
+    if not confirmed(x, f"Append a partition to {target}?"):
+        raise Fatal("aborted")
+
+
+def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
+    """Add the QUBES_OEM partition carrying the install-time kickstart.
+
+    Anaconda reads it because Qubes' lorax templates add an OEM boot entry with
+    `inst.ks=hd:LABEL=QUBES_OEM` and make it the default when a filesystem with
+    that label is present. Nothing here modifies the ISO image itself, so the
+    detached signature and the checksum still describe the artefact that was
+    verified before the write.
+
+    Two facts this depends on, both measured rather than assumed (see
+    tests/oem_media_checks.py, which runs the real sgdisk/mkfs/mount against a
+    loop device):
+
+      * `dd` of a hybrid ISO leaves the backup GPT at the end of the IMAGE, not
+        the end of the stick, so `sgdisk -e` has to move it before a partition
+        can be appended.
+      * `sgdisk -e` plus appending a partition leaves sector 0 — the isohybrid
+        MBR that BIOS boots from — byte for byte unchanged.
+
+    It does rewrite the primary GPT in sectors 1-33, which lie inside the ISO's
+    32 KiB system area. That is why this runs only after the image readback has
+    already compared the stick against the ISO, and why the media check offered
+    by the "Test media and install" boot entry will report a mismatch on a stick
+    prepared this way. The install and OEM entries do not run that check.
+    """
+    fstype = x.c["install"]["oem_fstype"]
+    if fstype not in ("vfat", "ext4"):
+        raise Fatal(f"install.oem_fstype must be vfat or ext4, not {fstype!r}")
+    mkfs_tool = "mkfs.vfat" if fstype == "vfat" else "mkfs.ext4"
+    for tool in ("sgdisk", mkfs_tool, "blkid"):
+        if not shutil.which(tool):
+            raise Fatal(
+                f"{tool} is not installed, so the {OEM_LABEL} partition cannot "
+                f"be created and the installer would never read the kickstart.\n"
+                f"     fix: ./build_iso.py setup-host")
+    if x.args.dry_run:
+        x.info(f"[dry-run] sgdisk -e {dev_path}; append a {fstype} partition "
+               f"labelled {OEM_LABEL}; copy {ks.name} onto it")
+        return
+
+    x.info(f"creating the {OEM_LABEL} partition that carries the kickstart")
+    before = _gpt_partition_numbers(x, dev_path)
+    # The backup GPT came from the ISO and sits at the end of the image.
+    x.run(*_sudo(["sgdisk", "-e", dev_path]))
+    # Partition number 0 tells sgdisk to take the first free one.
+    x.run(*_sudo(["sgdisk", "-n", "0:0:0", "-t", "0:0700",
+                  "-c", f"0:{OEM_LABEL}", dev_path]))
+    # Both are best-effort re-read nudges, and neither is guaranteed to be
+    # installed. check=False does not cover a missing binary — subprocess
+    # raises before there is a return code to ignore — so probe first.
+    for nudge in (["partx", "-u", dev_path], ["udevadm", "settle"]):
+        if shutil.which(nudge[0]):
+            x.run(*_sudo(nudge), check=False)
+    after = _gpt_partition_numbers(x, dev_path)
+    new = sorted(after - before)
+    if len(new) != 1:
+        raise Fatal(f"expected exactly one new partition on {dev_path}, "
+                    f"got {new or 'none'}. The stick has not been prepared; "
+                    f"do not distribute it.")
+    part = partition_node(dev_path, new[0])
+    if not Path(part).exists():
+        raise Fatal(f"{part} did not appear after partitioning {dev_path}")
+
+    if fstype == "vfat":
+        x.run(*_sudo([mkfs_tool, "-n", OEM_LABEL, part]))
+    else:
+        x.run(*_sudo([mkfs_tool, "-q", "-L", OEM_LABEL, part]))
+
+    # GRUB finds this by label. If the label is not what the boot entry looks
+    # for, the OEM entry never appears and the install is silently manual.
+    seen = x.run(*_sudo(["blkid", "-s", "LABEL", "-o", "value", part]),
+                 check=False, capture=True).strip()
+    if seen != OEM_LABEL:
+        raise Fatal(f"{part} reports LABEL={seen!r}, not {OEM_LABEL!r} — the "
+                    f"OEM boot entry would never fire.")
+
+    with tempfile.TemporaryDirectory() as td:
+        x.run(*_sudo(["mount", part, td]))
+        try:
+            x.run(*_sudo(["cp", str(ks), str(Path(td) / "ks.cfg")]))
+            x.run(*_sudo(["sync"]))
+        finally:
+            x.run(*_sudo(["umount", td]), check=False)
+        # Mount again and compare bytes: a copy that succeeded into the page
+        # cache and never reached the stick is exactly the failure this whole
+        # command exists to rule out.
+        x.run(*_sudo(["mount", part, td]))
+        try:
+            written = Path(td) / "ks.cfg"
+            got = x.run(*_sudo(["cat", str(written)]), check=False,
+                        capture=True)
+            if got != ks.read_text():
+                raise Fatal(f"the kickstart on {part} does not match "
+                            f"{ks}. Do not distribute this stick.")
+        finally:
+            x.run(*_sudo(["umount", td]), check=False)
+    x.ok(f"{OEM_LABEL} partition {part} carries ks.cfg, verified by readback")
+
+
+def authenticate_signature(status: str, returncode: int, expected: str) -> str:
+    """The fingerprint that signed, or raise Fatal. `expected` is the primary.
+
+    Two things measured against gpg 2.4 rather than assumed, both of which the
+    previous per-site checks got wrong:
+
+      * VALIDSIG names TWO fingerprints. Field 1 is the key that actually made
+        the signature — a SIGNING SUBKEY when the key has one — and the last
+        field is the primary. Comparing field 1 against the configured primary
+        rejects a perfectly good image whenever the signing key has a subkey,
+        which is the normal shape of a GnuPG key and what `gen-key --use-key`
+        adopts. Either fingerprint is accepted.
+
+      * A REVOKED key still emits VALIDSIG, and gpg still exits 0. The only
+        difference in the status output is that GOODSIG becomes REVKEYSIG and
+        KEYREVOKED appears. Accepting VALIDSIG alone therefore accepts a
+        signature from a key whose owner has published a revocation — on the
+        last checkpoint before an image reaches removable media.
+    """
+    expected = (expected or "").replace(" ", "").upper()
+    if not expected:
+        raise Fatal("no expected signing fingerprint configured, so the "
+                    "signature cannot be authenticated")
+    lines = status.splitlines()
+
+    def has(tag: str) -> bool:
+        return any(ln.startswith(f"[GNUPG:] {tag}") for ln in lines)
+
+    if returncode != 0:
+        raise Fatal("the detached signature does not verify. Do not write this "
+                    "image to media.")
+    if has("KEYREVOKED") or has("REVKEYSIG"):
+        raise Fatal("the signing key has been REVOKED by its owner. gpg still "
+                    "reports the signature as valid and still exits 0; this is "
+                    "refused deliberately.")
+    if has("EXPKEYSIG"):
+        raise Fatal("the signature was made by an expired key.")
+    if has("BADSIG") or not has("GOODSIG"):
+        raise Fatal("the signature is not good (no GOODSIG in gpg's status "
+                    "output). Do not write this image to media.")
+    for ln in lines:
+        if ln.startswith("[GNUPG:] VALIDSIG "):
+            parts = ln.split()
+            signer, primary = parts[2].upper(), parts[-1].upper()
+            if expected in (signer, primary):
+                return signer
+            raise Fatal(
+                f"the image is signed by {signer} (primary {primary}), not by "
+                f"the configured key {expected}.\n     Do not write it to media.")
+    raise Fatal("gpg produced no VALIDSIG line; the signature was not "
+                "authenticated.")
 
 
 def want_digest(x: Ctx) -> str:
@@ -4576,7 +5723,8 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
-def load_config(write_only=False, dry_run=False) -> dict:
+def load_config(write_only=False, dry_run=False,
+                validate_semantics: bool = True) -> dict:
     if CONF_PATH.exists():
         if write_only:
             print(f"iso-build.json already exists — not overwriting: {CONF_PATH}",
@@ -4599,7 +5747,10 @@ def load_config(write_only=False, dry_run=False) -> dict:
                         raise ValueError(f"{name} must be {type(expected).__name__}")
             validate(DEFAULT_CONFIG, supplied)
             merged = deep_merge(DEFAULT_CONFIG, supplied)
-            validate_config(merged)
+            if validate_semantics:
+                # Skipped for --set, so that a file already in a bad state can
+                # still be corrected with the tool rather than by hand.
+                validate_config(merged)
             return merged
         except json.JSONDecodeError as e:
             print(f"{R}FATAL:{RST} {CONF_PATH.name} is not valid JSON: {e}",
@@ -4672,7 +5823,8 @@ lifecycle
   list-kickstarts  show what the fetched Qubes sources offer
 """)
     p.add_argument("action", nargs="?", default="iso",
-                   choices=["iso", "templates", "all", "list-kickstarts",
+                   choices=["quickstart", "iso", "templates", "all",
+                            "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
                             "write-usb", "config", "sign",
                             "backup-key", "restore-key", "bootstrap",
@@ -4710,6 +5862,19 @@ lifecycle
                    help="permit a non-removable target (destroys it)")
     u.add_argument("--wait", action="store_true",
                    help="wait for a removable device to be plugged in")
+    u.add_argument("--oem-device", metavar="/dev/sdY",
+                   help=f"put the {OEM_LABEL} kickstart partition on this device "
+                        f"instead of the image stick (leaves the image stick's "
+                        f"media check intact)")
+    u.add_argument("--usb", action="store_true",
+                   help="quickstart: write the USB stick at the end too")
+    u.add_argument("--allow-local-key-backup", action="store_true",
+                   help="keep the signing-key backup on this host instead of "
+                        "requiring separately mounted media")
+    u.add_argument("--no-oem", action="store_true",
+                   help=f"do not write the {OEM_LABEL} partition; the installer "
+                        f"will then find no kickstart and nothing provisions the "
+                        f"machine")
     b = p.add_argument_group("backup-key / restore-key")
     b.add_argument("--to", metavar="DIR", help="where to write the key backup")
     b.add_argument("--from", dest="from_dir", metavar="DIR",
@@ -4730,6 +5895,9 @@ lifecycle
                    help="do not check the supply chain before building")
     c.add_argument("--update", action="store_true",
                    help="record what upstream currently offers as the new baseline")
+    c.add_argument("--allow-unreachable", action="store_true",
+                   help="exit 0 even when an upstream source could not be "
+                        "reached and therefore was not verified")
     args = p.parse_args()
     # --yes answers prompts. It must NOT imply --force, which also means
     # "rebuild the templates even though their RPMs are present" — an
@@ -4743,17 +5911,20 @@ lifecycle
         # even the default config. ('config' writes it — that is its job.)
         cfg = load_config(write_only=args.write_config,
                           dry_run=args.dry_run
-                          or args.action in ("doctor", "list-kickstarts"))
+                          or args.action in ("doctor", "list-kickstarts"),
+                          validate_semantics=not args.set_kv)
         # Bootstrap consumes configuration while constructing paths and before
         # spawning any dependent stage.  Apply and persist its overrides now;
         # the old dispatch below happened too late and silently ignored them.
         if args.action == "bootstrap" and args.set_kv:
             probe = Ctx(cfg, args)
+            pairs = []
             for kv in args.set_kv:
                 if "=" not in kv:
                     raise Fatal(f"--set expects KEY=VALUE, got '{kv}'")
                 key, value = kv.split("=", 1)
-                config_set(probe, key.strip(), value.strip(), quiet=True)
+                pairs.append((key.strip(), value.strip()))
+            config_set_many(probe, pairs, quiet=True)
             cfg = load_config()
         x = Ctx(cfg, args)
         tier2 = int(cfg["tier"]) == 2
@@ -4782,11 +5953,14 @@ lifecycle
 
         if args.action == "config":
             rc = 0
+            pairs = []
             for kv in (args.set_kv or []):
                 if "=" not in kv:
                     raise Fatal(f"--set expects KEY=VALUE, got '{kv}'")
                 k, v = kv.split("=", 1)
-                rc |= config_set(x, k.strip(), v.strip())
+                pairs.append((k.strip(), v.strip()))
+            if pairs:
+                rc |= config_set_many(x, pairs)
             if args.get_key:
                 rc |= config_get(x, args.get_key)
             if not args.set_kv and not args.get_key:
@@ -4798,6 +5972,9 @@ lifecycle
                     if not isinstance(val, dict):
                         print(f"  {k} = {json.dumps(val)}")
             return rc
+
+        if args.action == "quickstart":
+            return quickstart(x, args)
 
         if args.action == "doctor":
             return doctor(x)
@@ -4843,7 +6020,11 @@ lifecycle
         else:
             x.skip("builder setup")
 
-        if args.action in ("templates", "all"):
+        if args.action == "all" and not tier2:
+            x.info("tier 1: the investigator templates are built on the target at "
+                   "first boot, so 'all' builds the ISO only (set tier=2 to bake "
+                   "them in)")
+        if build_templates_locally(args.action, tier2):
             if not tier2:
                 x.warn("tier is 1 — building templates anyway, but set tier=2 in "
                        "iso-build.json to bake them into the ISO")

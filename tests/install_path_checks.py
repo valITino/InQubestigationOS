@@ -50,16 +50,52 @@ def main():
         x = bi.Ctx(cfg, arguments())
         conf = bi.release_dir(x) / "conf"
         conf.mkdir(parents=True)
+        # Mirrors the real release4.3 layout: iso-online.ks carries repo lines
+        # and %includes qubes-kickstart.cfg, and the %packages block lives in
+        # the included file. Nothing upstream answers lang/user/autopart.
         stock = conf / "iso-online.ks"
-        stock.write_text("user --name=user --groups=wheel\n")
+        stock.write_text(
+            "%include qubes-kickstart.cfg\n"
+            "repo --name=qubes-r4.3 --gpgkey=file:///tmp/qubes-installer/k "
+            "--baseurl=http://yum.qubes-os.org/r4.3 --ignoregroups=true\n")
+        (conf / "qubes-kickstart.cfg").write_text(
+            "repo --name=fedora --gpgkey=file:///etc/pki/k --ignoregroups=true\n"
+            "%packages\n@core\n@standard\n@qubes\nkernel-latest\n-avahi\n%end\n")
         custom = root / "target.json"
         custom.write_text(json.dumps({"wazuh": {"mode": "central",
                                                  "central_address": "10.0.0.5"},
-                                      "image_version": "2.2"}))
+                                      # Read from the provisioner rather than
+                                      # written here: a hardcoded copy silently
+                                      # drifts at the next version bump, and
+                                      # this fixture exists to exercise the
+                                      # check that catches exactly that.
+                                      "image_version":
+                                          gi.DEFAULT_CONFIG["image_version"]}))
         x.c["provisioner_config"] = str(custom)
         with mock.patch.object(bi, "kickstart_python", return_value=(None, "")):
-            rel = bi.write_kickstart(x, stock.name, ROOT / "golden_image.py", [])
-        text = (conf / Path(rel).name).read_text()
+            rel = bi.write_kickstart(x, stock.name, [])
+            oem = bi.write_oem_kickstart(x, stock.name, ROOT / "golden_image.py", [])
+
+        # The compose kickstart is a manifest for the builder, not an answer
+        # file: qubes-builderv2 feeds it to scripts/ksparser and hands lorax no
+        # kickstart at all, so anything installer-side written here would be
+        # silently dropped.
+        compose = (conf / Path(rel).name).read_text()
+        assert "%post" not in compose, "compose kickstart must carry no %post"
+        assert "golden_image.py" not in compose
+        assert "autopart" not in compose and "clearpart" not in compose
+        assert f"%include {stock.name}" in compose
+
+        # Everything installer-side lives in the QUBES_OEM kickstart instead.
+        text = oem.read_text()
+        assert oem.name == "ks.cfg" and oem.parent.name == "oem"
+        # The stock dom0 selection is carried through; a %packages block
+        # replaces Anaconda's default rather than adding to it, so dropping it
+        # would install a machine with no dom0 on it.
+        for group in ("@core", "@standard", "@qubes", "kernel-latest", "-avahi"):
+            assert group in text, f"OEM kickstart lost stock package entry {group}"
+        # Build-cage-only repo paths must not be copied into an install-time file.
+        assert "file:///tmp/qubes-installer" not in text
         assert "RemainAfterExit" not in text
         assert "OnUnitInactiveSec=30min" in text and "flock -n 9" in text
         assert "exit 75" in text and "exit $rc" in text
@@ -78,48 +114,136 @@ def main():
         # Account enrollment no longer depends on the selected upstream file:
         # the generated target kickstart creates it locked and first boot asks
         # for its unique secret on the physical laptop.
-        stock.write_text("lang en_US.UTF-8\n")
-        bi.validate_install_contract(x, conf / Path(rel).name, stock)
+        bi.validate_install_contract(x, oem)
         assert "user --name=investigator --groups=wheel --lock" in text
         assert "systemd-ask-password" in text and "| chpasswd" in text
         assert text.index("flock -n 9") < text.index("systemd-ask-password")
         assert "if ! printf '%s:%s" in text and '"$ACCOUNT" "$PW1" | chpasswd; then' in text
 
         # Execute the account-enrollment portion of the actual generated
-        # first-boot script. A failing chpasswd must return deferred and must
-        # never publish account-enrolled.
+        # first-boot script, with stubs, under three conditions. The contract:
+        # enrollment NEVER gates provisioning. A failing chpasswd, or nobody at
+        # the console, publishes no marker and lets the run continue; a
+        # successful enrollment publishes the marker. The old runner blocked on
+        # systemd-ask-password with no timeout before provisioning began.
+        sentinel = "\n# --- provisioning (never gated on the login password) ---"
+        assert sentinel in text, "runner lost its provisioning sentinel"
+        assert "--timeout=0" not in text, "an untimed console prompt would block provisioning"
+        assert "--timeout=90" in text
+        assert text.index("enroll || true") < text.index('note "first-boot runner started"')
+        assert text.index('touch "$PROV_MARKER"') < text.index('touch "$MARKER"'), \
+            "provisioning must record its own completion before the final marker"
+        assert 'if [ -e "$ACCOUNT_MARKER" ]; then\n    touch "$MARKER"' in text, \
+            "the final marker must require the login password to be enrolled"
         generated = text.split("cat > /usr/local/sbin/golden-image-firstboot <<'FB_EOF'\n", 1)[1]
-        generated = generated.split("\nnote \"first-boot runner started\"", 1)[0] + "\nexit 0\n"
+        generated = generated.split(sentinel, 1)[0] + "\nexit 0\n"
         state = root / "target-state"
         run = root / "run"
         stubs = root / "stubs"
-        state.mkdir()
-        run.mkdir()
-        stubs.mkdir()
+        for d in (state, run, stubs):
+            d.mkdir(exist_ok=True)
         generated = generated.replace("/var/lib/golden-image", str(state)).replace(
             "/run/golden-image-firstboot.lock", str(run / "lock"))
-        for name, body in {
-                "getent": "exit 0", "passwd": "echo 'investigator L 0 0 99999 7 -1'",
-                "systemd-ask-password": "echo correct-horse", "chpasswd": "exit 42",
-                "logger": "exit 0"}.items():
-            stub = stubs / name
-            stub.write_text("#!/bin/sh\n" + body + "\n")
-            stub.chmod(0o755)
-        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
-        failed = subprocess.run(["bash"], input=generated, text=True,
-                                capture_output=True, env=env)
-        assert failed.returncode == 75
+
+        def stub(name: str, body: str) -> None:
+            path = stubs / name
+            path.write_text("#!/bin/sh\n" + body + "\n")
+            path.chmod(0o755)
+
+        def enroll_run(*, ask_rc: int, chpasswd_rc: int) -> subprocess.CompletedProcess:
+            for f in ("account-enrolled", "firstboot-status"):
+                (state / f).unlink(missing_ok=True)
+            (stubs / ".set").unlink(missing_ok=True)
+            stub("getent", "exit 0")
+            # Stateful: reports P (password set) only after chpasswd succeeded.
+            stub("passwd", f'[ -e "{stubs}/.set" ] && echo "investigator P 0 0 99999 7 -1" '
+                           '|| echo "investigator L 0 0 99999 7 -1"')
+            stub("systemd-ask-password", f"echo correct-horse; exit {ask_rc}")
+            stub("chpasswd", f'cat >/dev/null; [ {chpasswd_rc} -eq 0 ] && touch "{stubs}/.set"; exit {chpasswd_rc}')
+            stub("logger", "exit 0")
+            env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
+            return subprocess.run(["bash"], input=generated, text=True,
+                                  capture_output=True, env=env)
+
+        # The whole runner, not just the half executed below, must parse: a
+        # syntax error after the sentinel would only surface on the laptop.
+        whole = text.split("cat > /usr/local/sbin/golden-image-firstboot <<'FB_EOF'\n", 1)[1]
+        whole = whole.split("\nFB_EOF\n", 1)[0]
+        parsed = subprocess.run(["bash", "-n"], input=whole, text=True, capture_output=True)
+        assert parsed.returncode == 0, parsed.stderr[-300:]
+
+        status = state / "firstboot-status"
+        # a. chpasswd fails: no marker, and the run continues to provisioning.
+        r = enroll_run(ask_rc=0, chpasswd_rc=42)
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
         assert not (state / "account-enrolled").exists()
+        assert "password setting failed" in status.read_text()
+        # b. nobody at the console: no marker, provisioning still continues.
+        r = enroll_run(ask_rc=1, chpasswd_rc=0)
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+        assert not (state / "account-enrolled").exists()
+        assert "no input" in status.read_text()
+        # c. a person answers: the marker is published, mode 0600.
+        r = enroll_run(ask_rc=0, chpasswd_rc=0)
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+        marker = state / "account-enrolled"
+        assert marker.exists() and (marker.stat().st_mode & 0o777) == 0o600
+        assert "account enrolled" in status.read_text()
+
+        # ---------------------------------------------------------------
+        # Hand the generated file to the real parser. Without this the only
+        # thing proving the kickstart is valid is that we wrote it.
+        # Both modes, because the unattended one takes a different path:
+        # its partitioning is written by %pre and pulled in by %include, and
+        # a naive parse dies on the include target not existing yet.
+        try:
+            import pykickstart  # noqa: F401
+            have_ks = True
+        except ImportError:
+            have_ks = False
+        if have_ks:
+            for unattended in (False, True):
+                x.c["install"] = dict(x.c["install"], unattended=unattended,
+                                      disk="/dev/disk/by-id/wwn-test")
+                parsed = bi.write_oem_kickstart(x, stock.name,
+                                                ROOT / "golden_image.py",
+                                                ["investigator-kali"])
+                body = parsed.read_text()
+                assert "%post" in body
+                assert ("autopart --encrypted" in body) == unattended, (
+                    "unattended must answer partitioning; manual must not")
+            x.c["install"] = dict(x.c["install"], unattended=True,
+                                  disk="/dev/disk/by-id/wwn-test")
+        else:
+            print("  ! pykickstart absent — generated kickstart not parsed")
 
         # write-usb refuses before device discovery if integrity metadata is absent.
         iso = x.out_dir / x.c["iso_name"]
         iso.write_bytes(b"fixture")
         fatal(lambda: bi.write_usb(x), ".sha256")
+        # With the checksum in place, the next thing it wants is the install-
+        # time kickstart AND its signature: the kickstart runs as root inside
+        # the installer and the image's signature does not cover it, so an
+        # unsigned one is refused before any device is even looked for.
+        import hashlib
+        (x.out_dir / f"{x.c['iso_name']}.sha256").write_text(
+            f"{hashlib.sha256(b'fixture').hexdigest()}  {x.c['iso_name']}\n")
+        for f in (bi.oem_kickstart_path(x), bi.oem_kickstart_signature_path(x)):
+            f.unlink(missing_ok=True)
+        fatal(lambda: bi.write_usb(x), "no install-time kickstart")
+        bi.oem_kickstart_path(x).parent.mkdir(parents=True, exist_ok=True)
+        bi.oem_kickstart_path(x).write_text("%post\necho hi\n%end\n")
+        fatal(lambda: bi.write_usb(x), "ks.cfg.asc")
+        # --no-oem skips the kickstart gate and proceeds to the image's own
+        # signature, which this fixture does not have.
+        x.args.no_oem = True
+        fatal(lambda: bi.write_usb(x), "no detached signature")
+        x.args.no_oem = False
 
         runner = SimpleNamespace(run=lambda *a, **k: "total_memory : 32768\n")
         assert gi.physical_memory_gb(runner) == 32
 
-    print("  16/16 installation-path checks pass")
+    print("  44/44 installation-path checks pass")
     return 0
 
 
