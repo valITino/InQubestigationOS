@@ -89,6 +89,9 @@ Only these files are copied to a new internal `rc-<commit>` directory:
 * `unit-signing-key.asc`, `FINGERPRINT.txt`
 * `verify-iso.sh`, `verify-iso.ps1`
 * `BUILD-RECORD.txt`
+* `oem/ks.cfg` and `oem/ks.cfg.asc` — the install-time kickstart `write-usb`
+  puts on the `QUBES_OEM` partition, signed with the release key; the gate
+  verifies that signature and `write-usb` refuses an unsigned one
 
 Unexpected output files fail the allowlist. Work trees, logs, passphrase files,
 key backups and provisioning credentials are never recursively copied or

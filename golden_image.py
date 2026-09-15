@@ -4040,7 +4040,16 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                    "installed them, or the ISO shipped none")
             return
         for rpm in rpms:
-            name = r.run("rpm", "-qp", "--qf", "%{NAME}", str(rpm), capture=True).strip()
+            # run(capture=True) returns stdout alone; stderr goes to the log.
+            # --nosignature so a package signed by a key dom0's rpm database
+            # does not hold (a locally signed tier-2 template) is not even
+            # reported about, and the name is validated before it is used
+            # as a qube name.
+            name = r.run("rpm", "-qp", "--nosignature", "--qf", "%{NAME}", str(rpm),
+                         capture=True).strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name):
+                raise Fatal(f"unexpected package name from rpm -qp for {rpm.name}: "
+                            f"{name!r}")
             tpl = name[len("qubes-template-"):] if name.startswith("qubes-template-") else name
             if not tpl:
                 raise Fatal(f"could not read the package name of {rpm}")

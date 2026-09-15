@@ -19,6 +19,10 @@ ALLOWLIST = (
     "InQubestigationOS.iso", "InQubestigationOS.iso.sha256",
     "InQubestigationOS.iso.asc", "unit-signing-key.asc", "verify-iso.sh",
     "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt",
+    # The install-time kickstart write-usb puts on the QUBES_OEM partition,
+    # and its signature. A candidate without them cannot produce the
+    # provisioning media; without the signature write-usb refuses to.
+    "oem/ks.cfg", "oem/ks.cfg.asc",
 )
 
 
@@ -167,6 +171,12 @@ def main() -> int:
         raise Gate("the signing and backup-encryption passphrase files must be "
                    "distinct; a backup encrypted with the signing passphrase "
                    "protects nothing the signing key does not already")
+    # The values too, not only the paths: two files holding the same secret
+    # are the same secret. The workflow compares them before writing the
+    # files, but this gate is usable on its own and claims the same thing.
+    if a.passphrase_file.read_bytes().strip() == a.backup_passphrase_file.read_bytes().strip():
+        raise Gate("the signing and backup-encryption passphrases are the same "
+                   "secret; the backup must be encrypted with a different one")
     if run(["gpg", "--batch", "--list-secret-keys", fingerprint],
            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
         raise Gate("approved secret signing key is unavailable")
@@ -190,7 +200,10 @@ def main() -> int:
 
     output = a.work_dir / "output"
     missing = [name for name in ALLOWLIST if not (output / name).is_file()]
-    extras = [p.name for p in output.iterdir() if p.is_file() and p.name not in ALLOWLIST]
+    present = [p.name for p in output.iterdir() if p.is_file()]
+    if (output / "oem").is_dir():
+        present += [f"oem/{p.name}" for p in (output / "oem").iterdir() if p.is_file()]
+    extras = [name for name in present if name not in ALLOWLIST]
     if missing or extras:
         raise Gate(f"release allowlist mismatch; missing={missing}, unexpected={extras}")
     iso = output / ALLOWLIST[0]
@@ -198,6 +211,7 @@ def main() -> int:
     if (output / ALLOWLIST[1]).read_text().split()[0].lower() != digest:
         raise Gate("ISO checksum does not match")
     verify_signature(iso, output / ALLOWLIST[2], fingerprint)
+    verify_signature(output / "oem/ks.cfg", output / "oem/ks.cfg.asc", fingerprint)
     size = sum((output / name).stat().st_size for name in ALLOWLIST)
     if size > a.max_artifact_gb * 1024**3:
         raise Gate(f"candidate is {size / 1024**3:.1f} GiB; owner limit is "
@@ -223,6 +237,7 @@ def main() -> int:
         raise Gate(f"candidate already exists: {candidate}")
     candidate.mkdir(mode=0o755)
     for name in ALLOWLIST:
+        (candidate / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(output / name, candidate / name)
     print(json.dumps(result, sort_keys=True))
     print(f"staged only {len(ALLOWLIST)} allowlisted files at {candidate}")

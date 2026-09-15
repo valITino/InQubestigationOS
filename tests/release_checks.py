@@ -67,7 +67,8 @@ def main():
     assert rc.ALLOWLIST == (
         "InQubestigationOS.iso", "InQubestigationOS.iso.sha256",
         "InQubestigationOS.iso.asc", "unit-signing-key.asc", "verify-iso.sh",
-        "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt")
+        "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt",
+        "oem/ks.cfg", "oem/ks.cfg.asc")
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "x"
         p.write_bytes(b"release-candidate")
@@ -115,7 +116,18 @@ def main():
     # The documented RC_ARGS must carry every flag the parser requires.
     release_doc = (ROOT / "docs/RELEASE.md").read_text()
     assert "--backup-passphrase-file /run/user/$UID/iq-backup-session" in release_doc
-    print("  34/34 release-candidate policy checks pass")
+    # Two files holding the same passphrase are the same secret; the gate
+    # compares values, not only paths.
+    assert ("a.passphrase_file.read_bytes().strip() == "
+            "a.backup_passphrase_file.read_bytes().strip()") in source
+    # The install-time kickstart is staged with the candidate, its signature
+    # is verified by the gate, and a stray file under oem/ fails the allowlist.
+    assert 'verify_signature(output / "oem/ks.cfg", output / "oem/ks.cfg.asc", fingerprint)' in source
+    assert 'present += [f"oem/{p.name}"' in source
+    assert "(candidate / name).parent.mkdir(parents=True, exist_ok=True)" in source
+    release_doc = (ROOT / "docs/RELEASE.md").read_text()
+    assert "`oem/ks.cfg`" in release_doc and "`oem/ks.cfg.asc`" in release_doc
+    print("  40/40 release-candidate policy checks pass")
     return 0
 
 

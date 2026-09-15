@@ -481,7 +481,25 @@ def main():
     assert "build_templates_locally(args.action, tier2)" in main_src, \
         "main must take the tier decision from build_templates_locally"
 
-    print("  63/63 unattended orchestration checks pass")
+    # The Makefile refuses a numeric signing identity, but only on the targets
+    # that consume it: a shell that exports UID must not break `make help`.
+    import shutil as _sh
+    assert _sh.which("make"), "make is needed to check the Makefile guard"
+    mk = ROOT / "Makefile"
+    text = mk.read_text()
+    assert "\nkey: check-uid" in text and "\nbootstrap: check-uid" in text
+    assert "$(error" not in text, "a parse-time $(error) aborts every target"
+
+    def make(*argv):
+        return subprocess.run(["make", "-f", str(mk), *argv], cwd=ROOT,
+                              capture_output=True, text=True)
+
+    numeric = make("check-uid", "UID=1000")
+    assert numeric.returncode != 0 and "numeric" in numeric.stderr, numeric
+    assert make("check-uid", 'UID=Unit Image Signing <cyber@example.ch>').returncode == 0
+    assert make("help", "UID=1000").returncode == 0, "help must work under a numeric UID"
+
+    print("  67/67 unattended orchestration checks pass")
     return 0
 
 

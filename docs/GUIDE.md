@@ -536,6 +536,12 @@ Rather than a `dd` line you have to get right at four in the afternoon, this:
 - writes, syncs, then **reads the stick back** and compares it byte for byte. A
   stick that writes without error and reads back wrong is a failure you would
   otherwise discover at the install, on someone else's desk
+- verifies the signature on `oem/ks.cfg` — the install-time kickstart it then
+  puts on the stick's `QUBES_OEM` partition — against the same key, **before**
+  any of the above. That file runs as root inside the installer and the
+  image's signature does not cover it; the build signs it beside the image,
+  and an unsigned or altered one is refused. `verify-iso.sh` checks it too
+  when the bundle carries one
 
 With one removable device plugged in, `--device` can be omitted.
 

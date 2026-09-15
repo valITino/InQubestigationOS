@@ -38,6 +38,8 @@ what upstream does and upstream does something else.
 | 10 | three hook guards | `\|\| error "…"` | `error()` in functions.sh prints and returns | `\|\| { error …; exit 1; }` |
 | 11 | `all`, bootstrap, release gate | templates built at tier 1; tier 1 refused for release | — | `all` builds the ISO only at tier 1; gate accepts 1 or 2 |
 | 12 | GUIDE.md | fences and sections spliced since 2.1 | — | repaired; structure check added |
+| 13 | `write-usb`, release gate (review of this pass) | `oem/ks.cfg` executed as root by the installer, signed by nothing | Anaconda reads the QUBES_OEM kickstart as is; the image's signature does not cover it | signed beside the image; write-usb and the release gate authenticate it; staged with the candidate |
+| 14 | release gate (review of this pass) | passphrase files compared by path only | — | values compared too |
 
 Every fix has a test that fails with the fix reverted: the harness reads the
 recorded in-qube actions (defects 1–7), the orchestration checks execute the

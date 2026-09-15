@@ -2849,6 +2849,7 @@ def build_iso(x: Ctx, payload: Path):
                   live=True)
             x.ok(f"signed: {sig.name}")
             signed = f"yes, key {x.c['iso_sign_key']}"
+            sign_oem_kickstart(x, x.c["iso_sign_key"])
         except Fatal as e:
             raise Fatal(f"signing failed: {e}\n"
                         f"     The image is at {target} but is NOT signed. Do not "
@@ -2895,6 +2896,8 @@ def build_iso(x: Ctx, payload: Path):
     builder_commit = commit_id(x.builder)
     config_digest = hashlib.sha256(json.dumps(
         x.c, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    ks_state = ("signed" if oem_kickstart_signature_path(x).is_file()
+                else "UNSIGNED — write-usb will refuse it")
     (x.out_dir / "BUILD-RECORD.txt").write_text(f"""\
 {x.c['iso_name']}
 built:            {datetime.now():%Y-%m-%d %H:%M:%S}
@@ -2913,6 +2916,7 @@ auto-provision:   {x.c['auto_provision']}
 size:             {size_gb:.1f} GB
 sha256:           {digest}
 signed:           {signed}
+oem kickstart:    oem/ks.cfg, {ks_state} (write-usb puts it on the QUBES_OEM partition)
 
 EXPIRY: rebuild when a Qubes Security Bulletin affects dom0, Xen or the kernel.
 An investigator ISO older than its dom0 patch level is not fit to install.
@@ -2928,6 +2932,7 @@ Verify before installing:
   ISO        {target}   ({size_gb:.1f} GB)
   Checksum   {x.c['iso_name']}.sha256
   Signature  {signed}
+  Kickstart  oem/ks.cfg ({ks_state})
   Record     BUILD-RECORD.txt
   Log        {x.log}
 
@@ -4944,6 +4949,27 @@ if [ -n "$FPR" ] && [ -f "$ISO.asc" ]; then
     if [ "$signer" != "$primary" ]; then
         printf '  (signing subkey %s)\\n' "$signer"
     fi
+    # The install-time kickstart, when the bundle carries one. It runs as root
+    # inside the installer, and the image's signature does not cover it.
+    if [ -f oem/ks.cfg ]; then
+        printf '  install-time kickstart ... '
+        if [ ! -f oem/ks.cfg.asc ]; then
+            printf 'UNSIGNED\\n\\n  oem/ks.cfg carries no signature. Do not write this bundle to media.\\n\\n'
+            exit 1
+        fi
+        ksstatus=$(gpg --batch --status-fd 1 --verify oem/ks.cfg.asc oem/ks.cfg 2>/dev/null)
+        if echo "$ksstatus" | grep -qE '^\\[GNUPG:\\] (KEYREVOKED|REVKEYSIG)' \\
+                || ! echo "$ksstatus" | grep -q '^\\[GNUPG:\\] GOODSIG'; then
+            printf 'BAD\\n\\n  The kickstart signature does not verify. Do not write this bundle to media.\\n\\n'
+            exit 1
+        fi
+        ksprimary=$(echo "$ksstatus" | grep '^\\[GNUPG:\\] VALIDSIG ' | head -1 | awk '{{print $NF}}')
+        if [ "$ksprimary" != "$primary" ]; then
+            printf 'BAD\\n\\n  The kickstart was signed by a different key than the image.\\n\\n'
+            exit 1
+        fi
+        printf 'ok\\n'
+    fi
     if [ -n "$FPR" ] && [ "$signer" != "$FPR" ] && [ "$primary" != "$FPR" ]; then
         printf '  Expected:   %s\\n' "$FPR"
         printf '\\n  *** The signer is NOT the key this image was built with. ***\\n'
@@ -5019,6 +5045,7 @@ def sign_iso(x: Ctx) -> int:
     x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr, "--detach-sign",
           "--armor", "--output", str(sig), str(iso), live=True)
     x.ok(f"signed: {sig.name}")
+    ks_sig = sign_oem_kickstart(x, fpr)
     # Everything that has to travel with, or beside, the signature.
     x.export_pubkey()
     write_verify_script(x, digest)
@@ -5027,7 +5054,7 @@ def sign_iso(x: Ctx) -> int:
     print(f"""
   Copy back to the build host, or hand out from here:
     {iso.name}, {sha.name}, {sig.name}
-    unit-signing-key.asc, verify-iso.sh
+    unit-signing-key.asc, verify-iso.sh{', oem/ks.cfg, oem/ks.cfg.asc' if ks_sig else ''}
   And, through a channel independent of all of those:
     {iso.parent / 'FINGERPRINT.txt'}
 """)
@@ -5197,7 +5224,11 @@ def write_usb(x: Ctx) -> int:
     if not iso.is_file():
         raise Fatal(f"no image at {iso}. Build it first:  ./build_iso.py iso")
 
-    # 1. Never write an image you have not just verified.
+    # 1. Never write anything you have not just verified — the install-time
+    #    kickstart included. It runs as root inside the installer and travels
+    #    beside the image, not inside it, so the image's checksum and
+    #    signature say nothing about it: a replaced oem/ks.cfg would verify
+    #    exactly as well as the genuine one. It gets the same authentication.
     sha = x.out_dir / f"{x.c['iso_name']}.sha256"
     if sha.is_file():
         import hashlib
@@ -5213,27 +5244,44 @@ def write_usb(x: Ctx) -> int:
     else:
         raise Fatal("no .sha256 beside the image — refusing destructive write")
 
+    no_oem = bool(getattr(x.args, "no_oem", False))
+    ks = oem_kickstart_path(x)
+    ks_sig = oem_kickstart_signature_path(x)
+    if no_oem:
+        pass
+    elif not ks.is_file():
+        raise Fatal(
+            f"no install-time kickstart at {ks}.\n"
+            f"     It is written by `./build_iso.py iso`. Without it the "
+            f"installer has nothing to read and the provisioning payload never\n"
+            f"     reaches dom0. Rebuild, or pass --no-oem to write a plain "
+            f"Qubes installer stick deliberately.")
+    elif not ks_sig.is_file():
+        raise Fatal(
+            f"no signature beside the install-time kickstart ({ks_sig}).\n"
+            f"     It runs as root inside the installer, so it gets the same "
+            f"authentication as the image.\n"
+            f"     `./build_iso.py iso` signs it; `./build_iso.py sign` signs one "
+            f"built elsewhere;\n     --no-oem writes a plain installer stick "
+            f"deliberately.")
+
     asc = x.out_dir / f"{x.c['iso_name']}.asc"
     if asc.is_file():
-        # Not quiet(): it has a 180 s timeout, and verifying a detached
-        # signature means hashing the entire image. A timeout would have been
-        # swallowed into False and reported as a forged signature.
         x.info("verifying the signature (gpg hashes the whole image)")
         # --status-fd, not a bare --verify: `gpg --verify` exits 0 for a good
         # signature from ANY key in the keyring, so reporting "verifies against
         # <the unit key>" after it asserted a binding that was never tested —
         # on the last checkpoint before an image reaches removable media.
-        proc = subprocess.run(
-            ["gpg", "--batch", "--status-fd", "1", "--verify",
-             str(asc), str(iso)], capture_output=True, text=True)
-        signer = authenticate_signature(proc.stdout, proc.returncode,
-                                        x.c["iso_sign_key"])
+        signer = verify_detached_signature(asc, iso, x.c["iso_sign_key"])
         x.ok(f"signature verifies, signed by {signer}")
     else:
         raise Fatal("no detached signature beside the image — refusing destructive write")
     if not (x.c.get("iso_sign_key") or "").strip():
         raise Fatal("iso_sign_key is not configured, so the expected signer cannot "
                     "be authenticated before writing")
+    if not no_oem:
+        signer = verify_detached_signature(ks_sig, ks, x.c["iso_sign_key"])
+        x.ok(f"install-time kickstart signature verifies, signed by {signer}")
 
     # 2. Pick a device, and refuse anything that is not removable.
     devs = removable_devices()
@@ -5352,18 +5400,12 @@ def write_usb(x: Ctx) -> int:
 
     # Only now, after the image has been compared against the stick: appending
     # the partition rewrites the GPT, which lives inside the ISO's system area.
-    ks = oem_kickstart_path(x)
-    if getattr(x.args, "no_oem", False):
+    # The kickstart itself was authenticated in step 1, before any device was
+    # touched.
+    if no_oem:
         x.warn(f"--no-oem: no {OEM_LABEL} partition written. The installer will "
                f"not find a kickstart, so nothing provisions the machine and "
                f"the install is an ordinary manual Qubes install.")
-    elif not ks.is_file():
-        raise Fatal(
-            f"no install-time kickstart at {ks}.\n"
-            f"     It is written by `./build_iso.py iso`. Without it the "
-            f"installer has nothing to read and the provisioning payload never\n"
-            f"     reaches dom0. Rebuild, or pass --no-oem to write a plain "
-            f"Qubes installer stick deliberately.")
     else:
         target = getattr(x.args, "oem_device", None) or dev_path
         if target != dev_path:
@@ -5389,6 +5431,43 @@ OEM_LABEL = "QUBES_OEM"
 
 def oem_kickstart_path(x: Ctx) -> Path:
     return x.out_dir / "oem" / "ks.cfg"
+
+
+def oem_kickstart_signature_path(x: Ctx) -> Path:
+    return oem_kickstart_path(x).with_name("ks.cfg.asc")
+
+
+def sign_oem_kickstart(x: Ctx, fpr: str) -> Path | None:
+    """Detach-sign oem/ks.cfg with the release key.
+
+    The kickstart is executed as root by the installer, and it travels beside
+    the image rather than inside it, so the image's signature says nothing
+    about it. Signing it here, and authenticating that signature in write-usb
+    before it reaches media, gives it the same boundary the image has. None
+    when there is no kickstart to sign (an image built with --no-oem in mind).
+    """
+    ks = oem_kickstart_path(x)
+    if not ks.is_file():
+        return None
+    sig = oem_kickstart_signature_path(x)
+    sig.unlink(missing_ok=True)
+    x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
+          "--detach-sign", "--armor", "--output", str(sig), str(ks))
+    x.ok(f"signed: oem/{sig.name} (the install-time kickstart)")
+    return sig
+
+
+def verify_detached_signature(sig: Path, payload: Path, expected: str) -> str:
+    """gpg --verify with --status-fd, authenticated against `expected`.
+
+    Not quiet(): that has a 180 s timeout, and a detached signature over an
+    image means hashing the whole file. A timeout would be swallowed into
+    False and reported as a forged signature.
+    """
+    proc = subprocess.run(
+        ["gpg", "--batch", "--status-fd", "1", "--verify", str(sig), str(payload)],
+        capture_output=True, text=True)
+    return authenticate_signature(proc.stdout, proc.returncode, expected)
 
 
 def partition_node(dev_path: str, number: int) -> str:

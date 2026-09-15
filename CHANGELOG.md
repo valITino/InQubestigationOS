@@ -61,6 +61,21 @@ qubes-builderv2's template plugin. Detail in [docs/REVIEW.md](docs/REVIEW.md).
 - The release gate refused tier 1, the default; RELEASE.md's example lacked
   the backup passphrase file the entry point requires.
 
+**Fixed — from review of this release**
+
+- The install-time kickstart (`oem/ks.cfg`) travels beside the image and is
+  executed as root by the installer, but only the image was signed. The build
+  now signs it with the release key, `write-usb` authenticates that signature
+  before touching any device (and refuses an unsigned one; `--no-oem` remains
+  the deliberate opt-out), `verify-iso.sh` checks it when present, and the
+  release gate stages `oem/ks.cfg` and `oem/ks.cfg.asc` with the candidate
+  after verifying them.
+- The release gate compares the two passphrase values, not only their paths.
+- `--initial-setup` reads the RPM name with `--nosignature` and validates it
+  before using it as a qube name.
+- The numeric-UID refusal in the Makefile applies only to the targets that
+  consume the signing identity, not to every invocation.
+
 **Tests and docs**
 
 - The fake-dom0 harness now asserts on the recorded in-qube actions: proxied

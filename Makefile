@@ -11,10 +11,14 @@ DEVICE ?=
 RC_ARGS ?=
 
 # Some shells export UID as the numeric user id. A key whose identity is "1000"
-# would be created and backed up before anyone noticed, so refuse it here.
-ifeq ($(shell printf '%s' '$(UID)' | grep -Ec '^[0-9]+$$'),1)
-$(error UID is numeric ("$(UID)"); pass the signing identity, e.g. make key UID="Unit Image Signing <cyber@example.ch>")
-endif
+# would be created and backed up before anyone noticed, so the targets that
+# consume the signing identity refuse it — only those, so `make help` or
+# `make check` under such a shell still work.
+.PHONY: check-uid
+check-uid:
+	@case '$(UID)' in ''|*[!0-9]*) ;; *) \
+	  echo 'UID is numeric ("$(UID)"): pass the signing identity, e.g. make key UID="Unit Image Signing <cyber@example.ch>"' >&2; \
+	  exit 1;; esac
 
 .PHONY: help
 help:  ## show this help
@@ -28,7 +32,7 @@ quickstart:  ## check everything first, then build, sign and write the USB (one 
 	./build_iso.py quickstart --usb
 
 .PHONY: bootstrap
-bootstrap:  ## production release path: independent key-backup media, audited export
+bootstrap: check-uid  ## production release path: independent key-backup media, audited export
 	./build_iso.py bootstrap $(if $(UID),--uid "$(UID)",)
 
 .PHONY: host
@@ -36,7 +40,7 @@ host:  ## install and configure everything the build host needs
 	./build_iso.py setup-host
 
 .PHONY: key
-key:  ## create the ISO signing key and record its fingerprint (UID=...)
+key: check-uid  ## create the ISO signing key and record its fingerprint (UID=...)
 	./build_iso.py gen-key --uid "$(UID)"
 
 .PHONY: backup-key

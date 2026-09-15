@@ -221,11 +221,29 @@ def main():
         iso = x.out_dir / x.c["iso_name"]
         iso.write_bytes(b"fixture")
         fatal(lambda: bi.write_usb(x), ".sha256")
+        # With the checksum in place, the next thing it wants is the install-
+        # time kickstart AND its signature: the kickstart runs as root inside
+        # the installer and the image's signature does not cover it, so an
+        # unsigned one is refused before any device is even looked for.
+        import hashlib
+        (x.out_dir / f"{x.c['iso_name']}.sha256").write_text(
+            f"{hashlib.sha256(b'fixture').hexdigest()}  {x.c['iso_name']}\n")
+        for f in (bi.oem_kickstart_path(x), bi.oem_kickstart_signature_path(x)):
+            f.unlink(missing_ok=True)
+        fatal(lambda: bi.write_usb(x), "no install-time kickstart")
+        bi.oem_kickstart_path(x).parent.mkdir(parents=True, exist_ok=True)
+        bi.oem_kickstart_path(x).write_text("%post\necho hi\n%end\n")
+        fatal(lambda: bi.write_usb(x), "ks.cfg.asc")
+        # --no-oem skips the kickstart gate and proceeds to the image's own
+        # signature, which this fixture does not have.
+        x.args.no_oem = True
+        fatal(lambda: bi.write_usb(x), "no detached signature")
+        x.args.no_oem = False
 
         runner = SimpleNamespace(run=lambda *a, **k: "total_memory : 32768\n")
         assert gi.physical_memory_gb(runner) == 32
 
-    print("  41/41 installation-path checks pass")
+    print("  44/44 installation-path checks pass")
     return 0
 
 
