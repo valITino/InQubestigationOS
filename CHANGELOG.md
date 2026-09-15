@@ -18,7 +18,10 @@ recalled. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
   warning that says exactly what that costs; `bootstrap` remains the
   production path that insists on independent media. If docker group
   membership was granted during the run, quickstart re-executes itself under
-  `sg docker` instead of asking you to.
+  `sg docker` instead of asking you to. It runs the same sequence as the
+  `iso` action — including the builder setup that clones qubes-builderv2,
+  builds the container image and fetches `qubes-release` — and the test
+  asserts that order against it.
 
 **Fixed — would not have worked**
 

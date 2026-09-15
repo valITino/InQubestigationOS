@@ -1679,7 +1679,13 @@ def quickstart(x: Ctx, args) -> int:
                     "not reachable from here.")
 
     # ---- 5. build -------------------------------------------------------
+    # Same sequence as main()'s `iso` action, in the same order. It is not
+    # abstracted into a shared function because main() interleaves it with
+    # action-specific branching; it IS kept identical, and
+    # tests/quickstart_checks.py asserts the order.
     x.phase("5/6", "build and sign")
+    tier2 = int(x.c["tier"]) == 2
+    resolve_auto_values(x)
     # The two preflight warnings (self-signed, goes stale) are printed in full
     # but acknowledged here rather than by typing UNDERSTOOD: this command is
     # the acknowledgement. The USB write below keeps its own "Write to
@@ -1687,14 +1693,26 @@ def quickstart(x: Ctx, args) -> int:
     ack = getattr(args, "assume_yes", False)
     args.assume_yes = True
     try:
-        payload = preflight(x, int(x.c["tier"]) == 2)
+        payload = preflight(x, tier2)
     finally:
         args.assume_yes = ack
+    # Clone qubes-builderv2, verify it, build the container image, select the
+    # executor, fetch qubes-release. Without this there is no builder to run
+    # and no kickstarts to compose against; a first version of this command
+    # left it out and would have failed hours in at "no kickstarts found".
+    if not x.done("builder") or args.dry_run:
+        setup_builder(x)
+    else:
+        x.skip("builder setup")
+    if tier2:
+        if x.done("templates") and not args.force and not args.dry_run \
+                and not missing_template_rpms(x):
+            x.skip("template build — every RPM is present in artifacts/")
+        else:
+            fetch_kali_key(x)
+            gen_component(x)
+            build_templates(x)
     resolve_auto_values(x)
-    if int(x.c["tier"]) == 2:
-        fetch_kali_key(x)
-        gen_component(x)
-        build_templates(x)
     build_iso(x, payload)
 
     # ---- 6. media -------------------------------------------------------
@@ -1739,7 +1757,13 @@ def prompt_secret(label: str) -> Path:
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as stream:
         stream.write(first)
-    return Path(name)
+    path = Path(name)
+    # Held only for this run: removed when the process ends, whether that is a
+    # normal return, a Fatal, or Ctrl-C. (An exec, as in the sg re-run, does
+    # not run this — but that happens before any secret is collected.)
+    import atexit
+    atexit.register(lambda: path.unlink(missing_ok=True))
+    return path
 
 
 def write_builder_executor(x: Ctx) -> None:

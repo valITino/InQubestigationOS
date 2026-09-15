@@ -89,6 +89,11 @@ def run_quickstart(td: Path, a, *, doctor_rc=0, setup_rc=0, upstream_rc=0,
         mock.patch.object(bi, "check_upstream", side_effect=rec("check_upstream", upstream_rc)),
         mock.patch.object(bi, "preflight", side_effect=fake_preflight),
         mock.patch.object(bi, "resolve_auto_values", side_effect=rec("resolve_auto_values")),
+        mock.patch.object(bi, "setup_builder", side_effect=rec("setup_builder")),
+        mock.patch.object(bi, "fetch_kali_key", side_effect=rec("fetch_kali_key")),
+        mock.patch.object(bi, "gen_component", side_effect=rec("gen_component")),
+        mock.patch.object(bi, "build_templates", side_effect=rec("build_templates")),
+        mock.patch.object(bi, "missing_template_rpms", return_value=["x"]),
         mock.patch.object(bi, "build_iso", side_effect=rec("build_iso")),
         mock.patch.object(bi, "write_usb", side_effect=rec("write_usb")),
         mock.patch.object(bi, "prompt_secret", side_effect=rec("prompt_secret")),
@@ -137,7 +142,29 @@ def main() -> int:
               a.allow_local_key_backup is True)
         check("supply chain is checked before the build",
               seq.index("check_upstream") < seq.index("build_iso"), str(seq))
+        # main()'s own `iso` order: resolve -> preflight -> setup_builder ->
+        # build. A first version of quickstart skipped setup_builder entirely
+        # and would have failed hours in at "no kickstarts found".
+        check("auto values are resolved before preflight",
+              seq.index("resolve_auto_values") < seq.index("preflight"), str(seq))
+        check("the builder is set up after preflight and before the build",
+              seq.index("preflight") < seq.index("setup_builder") < seq.index("build_iso"),
+              str(seq))
+        check("tier 1 builds no templates",
+              "build_templates" not in seq and "gen_component" not in seq, str(seq))
         check("the build is the last long step", seq[-1] == "build_iso", str(seq))
+
+        # Tier 2 builds the templates, after the builder exists and before
+        # the ISO; a completed template set is skipped rather than rebuilt.
+        a = args()
+        with mock.patch.dict(bi.DEFAULT_CONFIG, {"tier": 2}):
+            rc, calls, _ = run_quickstart(td, a)
+        seq2 = names(calls)
+        check("tier 2 builds the templates between builder setup and the ISO",
+              seq2.index("setup_builder") < seq2.index("build_templates") < seq2.index("build_iso"),
+              str(seq2))
+        check("tier 2 generates the component before building templates",
+              seq2.index("gen_component") < seq2.index("build_templates"), str(seq2))
         check("no USB write without --usb", "write_usb" not in seq)
 
         # 2. Preflight's acknowledgement is scoped to preflight. Leaking it
@@ -214,6 +241,7 @@ def main() -> int:
                 mock.patch.object(bi, "check_upstream", return_value=0), \
                 mock.patch.object(bi, "preflight", return_value=ROOT / "golden_image.py"), \
                 mock.patch.object(bi, "resolve_auto_values", return_value=None), \
+                mock.patch.object(bi, "setup_builder", return_value=None), \
                 mock.patch.object(bi, "build_iso", return_value=None), \
                 mock.patch.object(bi, "prompt_secret", return_value=Path("/dev/null")), \
                 mock.patch.object(bi, "secret_key_fingerprints", return_value=[]), \
