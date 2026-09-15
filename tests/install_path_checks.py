@@ -121,30 +121,74 @@ def main():
         assert "if ! printf '%s:%s" in text and '"$ACCOUNT" "$PW1" | chpasswd; then' in text
 
         # Execute the account-enrollment portion of the actual generated
-        # first-boot script. A failing chpasswd must return deferred and must
-        # never publish account-enrolled.
+        # first-boot script, with stubs, under three conditions. The contract:
+        # enrollment NEVER gates provisioning. A failing chpasswd, or nobody at
+        # the console, publishes no marker and lets the run continue; a
+        # successful enrollment publishes the marker. The old runner blocked on
+        # systemd-ask-password with no timeout before provisioning began.
+        sentinel = "\n# --- provisioning (never gated on the login password) ---"
+        assert sentinel in text, "runner lost its provisioning sentinel"
+        assert "--timeout=0" not in text, "an untimed console prompt would block provisioning"
+        assert "--timeout=90" in text
+        assert text.index("enroll || true") < text.index('note "first-boot runner started"')
+        assert text.index('touch "$PROV_MARKER"') < text.index('touch "$MARKER"'), \
+            "provisioning must record its own completion before the final marker"
+        assert 'if [ -e "$ACCOUNT_MARKER" ]; then\n    touch "$MARKER"' in text, \
+            "the final marker must require the login password to be enrolled"
         generated = text.split("cat > /usr/local/sbin/golden-image-firstboot <<'FB_EOF'\n", 1)[1]
-        generated = generated.split("\nnote \"first-boot runner started\"", 1)[0] + "\nexit 0\n"
+        generated = generated.split(sentinel, 1)[0] + "\nexit 0\n"
         state = root / "target-state"
         run = root / "run"
         stubs = root / "stubs"
-        state.mkdir()
-        run.mkdir()
-        stubs.mkdir()
+        for d in (state, run, stubs):
+            d.mkdir(exist_ok=True)
         generated = generated.replace("/var/lib/golden-image", str(state)).replace(
             "/run/golden-image-firstboot.lock", str(run / "lock"))
-        for name, body in {
-                "getent": "exit 0", "passwd": "echo 'investigator L 0 0 99999 7 -1'",
-                "systemd-ask-password": "echo correct-horse", "chpasswd": "exit 42",
-                "logger": "exit 0"}.items():
-            stub = stubs / name
-            stub.write_text("#!/bin/sh\n" + body + "\n")
-            stub.chmod(0o755)
-        env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
-        failed = subprocess.run(["bash"], input=generated, text=True,
-                                capture_output=True, env=env)
-        assert failed.returncode == 75
+
+        def stub(name: str, body: str) -> None:
+            path = stubs / name
+            path.write_text("#!/bin/sh\n" + body + "\n")
+            path.chmod(0o755)
+
+        def enroll_run(*, ask_rc: int, chpasswd_rc: int) -> subprocess.CompletedProcess:
+            for f in ("account-enrolled", "firstboot-status"):
+                (state / f).unlink(missing_ok=True)
+            (stubs / ".set").unlink(missing_ok=True)
+            stub("getent", "exit 0")
+            # Stateful: reports P (password set) only after chpasswd succeeded.
+            stub("passwd", f'[ -e "{stubs}/.set" ] && echo "investigator P 0 0 99999 7 -1" '
+                           '|| echo "investigator L 0 0 99999 7 -1"')
+            stub("systemd-ask-password", f"echo correct-horse; exit {ask_rc}")
+            stub("chpasswd", f'cat >/dev/null; [ {chpasswd_rc} -eq 0 ] && touch "{stubs}/.set"; exit {chpasswd_rc}')
+            stub("logger", "exit 0")
+            env = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")
+            return subprocess.run(["bash"], input=generated, text=True,
+                                  capture_output=True, env=env)
+
+        # The whole runner, not just the half executed below, must parse: a
+        # syntax error after the sentinel would only surface on the laptop.
+        whole = text.split("cat > /usr/local/sbin/golden-image-firstboot <<'FB_EOF'\n", 1)[1]
+        whole = whole.split("\nFB_EOF\n", 1)[0]
+        parsed = subprocess.run(["bash", "-n"], input=whole, text=True, capture_output=True)
+        assert parsed.returncode == 0, parsed.stderr[-300:]
+
+        status = state / "firstboot-status"
+        # a. chpasswd fails: no marker, and the run continues to provisioning.
+        r = enroll_run(ask_rc=0, chpasswd_rc=42)
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
         assert not (state / "account-enrolled").exists()
+        assert "password setting failed" in status.read_text()
+        # b. nobody at the console: no marker, provisioning still continues.
+        r = enroll_run(ask_rc=1, chpasswd_rc=0)
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+        assert not (state / "account-enrolled").exists()
+        assert "no input" in status.read_text()
+        # c. a person answers: the marker is published, mode 0600.
+        r = enroll_run(ask_rc=0, chpasswd_rc=0)
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+        marker = state / "account-enrolled"
+        assert marker.exists() and (marker.stat().st_mode & 0o777) == 0o600
+        assert "account enrolled" in status.read_text()
 
         # ---------------------------------------------------------------
         # Hand the generated file to the real parser. Without this the only
@@ -181,7 +225,7 @@ def main():
         runner = SimpleNamespace(run=lambda *a, **k: "total_memory : 32768\n")
         assert gi.physical_memory_gb(runner) == 32
 
-    print("  28/28 installation-path checks pass")
+    print("  41/41 installation-path checks pass")
     return 0
 
 

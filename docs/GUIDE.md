@@ -620,10 +620,18 @@ Then the install is:
 
 ## 9. First boot
 
-Provisioning starts automatically. On a Tier 1 image — the default — the
-investigator templates are built here, from the network: expect 1-3 hours and
-make sure the machine has connectivity. On a Tier 2 image the templates are
-already on disk, so this wires the topology only, in minutes.
+Provisioning starts automatically and needs nobody at the keyboard. On a
+Tier 1 image — the default — the investigator templates are built here, from
+the network: expect 1-3 hours and make sure the machine has connectivity. On a
+Tier 2 image the templates are already on disk, so this wires the topology
+only, in minutes.
+
+The console will ask, once per run, for the `investigator` login password —
+the one thing only a person can supply. It waits 90 seconds and then carries
+on without it; provisioning never depends on that answer. If you were not
+there, the question comes back at the next boot and every 30 minutes, and
+`sudo golden-image-firstboot` asks it right now. The machine counts as fully
+provisioned only once both halves are done.
 
 Watch it:
 

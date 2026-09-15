@@ -24,7 +24,7 @@ physical-host export.
 | `lsblk` returned `mountpoints: [null]` | Discovery validates the JSON object/list shapes, removes null entries, and prints `unmounted`; malformed facts are rejected. | `python tests/bootstrap_workflow_checks.py` exercises the production discovery function. |
 | `/mnt` mountpoint was created as the build user | An absolute, non-symlink, empty destination is created with the narrowly scoped privileged `install -d -m 0700 -- PATH` argv before mounting; the mounted filesystem is then checked for build-user write/search access. | The bootstrap workflow check records the real privileged boundary and ordering. |
 | Device aliases were compared as spelling | Block sources must resolve to the same nonzero kernel device identity; unresolved or replaced sources fail. Network transports retain protocol/source identity checks and are not treated as block devices. | Bootstrap identity tests use distinct spellings with a measured device identity and reject unavailable identity. |
-| Enrollment marked success after `chpasswd` failed | First boot locks before prompting, checks account/password state, explicitly gates the pipeline, verifies the resulting non-secret password state, and atomically publishes the marker. | `python tests/install_path_checks.py` executes the generated script with a failing `chpasswd` stub and observes exit 75 with no marker. |
+| Enrollment marked success after `chpasswd` failed | First boot locks before prompting, checks account/password state, verifies the resulting non-secret password state, and atomically publishes the marker only on success. Enrollment never gates provisioning: a failure or an unanswered prompt is logged, no marker is published, provisioning proceeds, and the prompt returns on the next run. | `python tests/install_path_checks.py` executes the generated script with a failing `chpasswd` stub, with an unanswered prompt, and with a successful enrollment: no marker in the first two, a mode-0600 marker in the third, and the run continues in all three. |
 | Inventory appeared only after export | A mode-0600 planned inventory is atomically initialized immediately after lock acquisition. Export remains unverified until destination readback and signature authentication complete. | Bootstrap workflow and orchestration checks cover early state and publication ordering. |
 | Secrets survived pre-export child failures | Workflow cleanup now encloses every child stage as well as export; only run-owned secret files and mounts are cleaned. Lock contention writes neither status nor inventory. | Orchestration and bootstrap workflow checks cover failure and ownership boundaries. |
 
@@ -97,9 +97,11 @@ workflow does not introduce unrelated password reuse.
 
 The upstream Anaconda path is interactive unless `install.unattended=true`.
 Unattended mode requires an exact stable disk identity and deliberately enrolls
-encryption on that laptop. The kickstart creates `install.username` locked. On the physical laptop, the
-visible first-boot continuation uses `systemd-ask-password` twice and streams
-the unique value to `chpasswd` before provisioning. No password or hash crosses
+encryption on that laptop. The kickstart creates `install.username` locked, in both install modes. On the
+physical laptop, the first-boot runner asks at the console with
+`systemd-ask-password` (90 s each, twice) and streams the unique value to
+`chpasswd`; provisioning never waits on that answer, and an unanswered prompt
+returns on every subsequent run until a person sets the password. No password or hash crosses
 the build host or enters the ISO. No prompt-free physical installation or boot
 is claimed or tested.
 

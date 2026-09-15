@@ -2239,38 +2239,52 @@ if ! flock -n 9; then
 fi
 ACCOUNT={shlex.quote(x.c['install']['username'])}
 ACCOUNT_MARKER=/var/lib/golden-image/account-enrolled
-if ! getent passwd "$ACCOUNT" >/dev/null; then
-    note "account-enrollment: intended account is missing; deferred"
-    exit 75
-fi
-# A usable existing password is authoritative even if an old marker vanished.
-if [ ! -e "$ACCOUNT_MARKER" ] && passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
+PROV_MARKER=/var/lib/golden-image/provisioning-complete
+mark_enrolled() {{
     tmp=$(mktemp /var/lib/golden-image/.account-enrolled.XXXXXX)
     chmod 0600 "$tmp" && mv -f "$tmp" "$ACCOUNT_MARKER"
-    note "account-enrollment: existing account password retained"
-elif [ ! -e "$ACCOUNT_MARKER" ]; then
-    note "waiting-for-input: account enrollment requires two hidden console entries"
-    PW1=$(systemd-ask-password --timeout=0 "Create login password for $ACCOUNT (not disk unlock)") || exit 75
-    PW2=$(systemd-ask-password --timeout=0 "Confirm login password for $ACCOUNT") || exit 75
+}}
+# The login password is the one thing on this machine only a person can
+# supply. It is asked for here, at the console, but it NEVER gates
+# provisioning: nobody at the keyboard means provisioning proceeds, and the
+# question is asked again on every run (each boot, and every 30 minutes)
+# until it is answered. Provisioning does not need the login.
+enroll() {{
+    [ -e "$ACCOUNT_MARKER" ] && return 0
+    if ! getent passwd "$ACCOUNT" >/dev/null; then
+        note "account-enrollment: account $ACCOUNT does not exist (the kickstart creates it locked); will retry"
+        return 1
+    fi
+    if passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
+        mark_enrolled
+        note "account-enrollment: existing account password retained"
+        return 0
+    fi
+    note "waiting-for-input: asking at the console for the $ACCOUNT login password (90 s)"
+    PW1=$(systemd-ask-password --timeout=90 "Create login password for $ACCOUNT (not disk unlock)") || {{ note "account-enrollment: no input; will ask again"; return 1; }}
+    PW2=$(systemd-ask-password --timeout=90 "Confirm login password for $ACCOUNT") || {{ unset PW1; note "account-enrollment: no input; will ask again"; return 1; }}
     if [ -z "$PW1" ] || [ "$PW1" != "$PW2" ]; then
         unset PW1 PW2
-        note "waiting-for-input: account passwords did not match"
-        exit 75
+        note "waiting-for-input: account passwords did not match; will ask again"
+        return 1
     fi
-    if ! printf '%s:%s\n' "$ACCOUNT" "$PW1" | chpasswd; then
+    if ! printf '%s:%s\\n' "$ACCOUNT" "$PW1" | chpasswd; then
         unset PW1 PW2
         note "account-enrollment: password setting failed; retry is safe"
-        exit 75
+        return 1
     fi
     unset PW1 PW2
     if ! passwd -S "$ACCOUNT" | awk '{{exit ($2 == "P" ? 0 : 1)}}'; then
         note "account-enrollment: password state verification failed"
-        exit 75
+        return 1
     fi
-    tmp=$(mktemp /var/lib/golden-image/.account-enrolled.XXXXXX)
-    chmod 0600 "$tmp" && mv -f "$tmp" "$ACCOUNT_MARKER"
+    mark_enrolled
     note "complete: target-local investigator account enrolled"
-fi
+    return 0
+}}
+enroll || true
+# --- provisioning (never gated on the login password) ---
+if [ ! -e "$PROV_MARKER" ]; then
 ready() {{
     qvm-check --quiet sys-net 2>/dev/null &&
     qvm-check --quiet sys-firewall 2>/dev/null &&
@@ -2312,23 +2326,34 @@ fi
 note "starting provisioning"
 /usr/local/sbin/golden-image-provision --offline-checks >> /var/log/golden-image-firstboot.log 2>&1
 rc=$?
-if [ $rc -eq 0 ]; then
-    /usr/local/sbin/golden-image-provision --verify --offline-checks \
-        >> /var/log/golden-image-firstboot.log 2>&1
-    verify_rc=$?
-    if [ $verify_rc -eq 0 ]; then
-        touch "$MARKER"
-        note "complete: provisioning and acceptance checks succeeded"
-        rm -f /etc/motd.d/golden-image
-        systemctl disable golden-image-firstboot.timer >/dev/null 2>&1 || true
-        exit 0
-    fi
-    note "failed: acceptance checks rc=$verify_rc; retry will resume"
-    exit $verify_rc
-else
+if [ $rc -ne 0 ]; then
     note "failed: provisioning rc=$rc; retry will resume"
     exit $rc
 fi
+/usr/local/sbin/golden-image-provision --verify --offline-checks \\
+    >> /var/log/golden-image-firstboot.log 2>&1
+verify_rc=$?
+if [ $verify_rc -ne 0 ]; then
+    note "failed: acceptance checks rc=$verify_rc; retry will resume"
+    exit $verify_rc
+fi
+touch "$PROV_MARKER"
+note "complete: provisioning and acceptance checks succeeded"
+rm -f /etc/motd.d/golden-image
+fi
+# Done only when both halves are: provisioned AND a person has set the login
+# password. Until then the timer keeps this running, and each run asks again.
+if [ -e "$ACCOUNT_MARKER" ]; then
+    touch "$MARKER"
+    note "complete: provisioned and login password enrolled"
+    systemctl disable golden-image-firstboot.timer >/dev/null 2>&1 || true
+    exit 0
+fi
+note "provisioned; the $ACCOUNT login password is not set yet — will ask at the console again"
+mkdir -p /etc/motd.d
+echo "Provisioned. Set the login password now:  sudo golden-image-firstboot" \\
+    > /etc/motd.d/golden-image
+exit 75
 FB_EOF
 chmod 755 /usr/local/sbin/golden-image-firstboot
 
@@ -2384,6 +2409,10 @@ def validate_install_contract(x: Ctx, generated: Path) -> None:
         "provisioning payload (%post)": r"(?m)^%post\b",
         "package selection": r"(?m)^%packages\b",
         "provisioner binary": r"golden_image\.py",
+        # In both modes: the first-boot runner enrolls the password of
+        # exactly this account, so it has to exist whatever the operator
+        # typed into Anaconda's user screen.
+        "user creation": r"(?m)^user\s+--name=",
     }
     if x.c["install"]["unattended"]:
         # Only an unattended install promises to answer these.
@@ -2391,7 +2420,6 @@ def validate_install_contract(x: Ctx, generated: Path) -> None:
             "language": r"(?m)^lang\s+\S+",
             "keyboard": r"(?m)^keyboard\s+",
             "timezone": r"(?m)^timezone\s+",
-            "user creation": r"(?m)^user\s+--name=",
             "encrypted partitioning": r"autopart\s+--encrypted",
             "installation completion/reboot": r"(?m)^reboot(?:\s|$)",
         })
@@ -2420,8 +2448,19 @@ def build_installer_directives(x: Ctx) -> str:
     past — while the twenty that need not be, are not asked at all.
     """
     inst = x.c["install"]
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", str(inst.get("username", ""))):
+        raise Fatal("install.username must be a Linux account name (lowercase, max 32 characters)")
+    account = [
+        "# --- the investigator account, in BOTH install modes ----------------",
+        "# Created locked; the first-boot runner asks for its password at the",
+        "# console. Emitted for a manual install too: without it Anaconda's user",
+        "# screen creates whatever name the operator types, the runner never",
+        "# finds install.username, and provisioning defers every 30 minutes",
+        "# forever.",
+        f"user --name={inst['username']} --groups=wheel --lock",
+    ]
     if not inst["unattended"]:
-        return ""
+        return "\n".join(account) + "\n\n"
     target = str(inst.get("disk", "")).strip()
     if not target:
         raise Fatal("install.unattended requires install.disk with a stable target "
@@ -2432,15 +2471,12 @@ def build_installer_directives(x: Ctx) -> str:
                     "so the target is identified on the installation machine")
     if not inst["encrypt_disk"]:
         raise Fatal("unattended destructive installation requires disk encryption")
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", str(inst.get("username", ""))):
-        raise Fatal("install.username must be a Linux account name (lowercase, max 32 characters)")
-    lines = [
+    lines = account + [
         "# --- unattended install (iso-build.json: install.unattended) --------",
         f"lang {inst['lang']}",
         f"keyboard --vckeymap={inst['keyboard']} --xlayouts='{inst['keyboard']}'",
         f"timezone {inst['timezone']} --utc",
         "firstboot --disable",
-        f"user --name={inst['username']} --groups=wheel --lock",
         "reboot",
     ]
     # Resolve on the target in Anaconda's runtime. The build host's disks are

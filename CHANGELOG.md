@@ -22,6 +22,13 @@ recalled. Full detail in [docs/REVIEW.md](docs/REVIEW.md).
 
 **Fixed — would not have worked**
 
+- The first-boot runner blocked on a console password prompt with no timeout
+  before provisioning began, so a laptop left alone never provisioned; and on
+  a manual install the `investigator` account was never created, so the
+  runner deferred every 30 minutes forever. The kickstart now creates the
+  account locked in both install modes, the prompt times out after 90 s and
+  returns on every run until answered, and provisioning never waits on it.
+  The machine counts as fully provisioned only once both halves are done.
 - `builder.yml` kept upstream's `executor: type: qubes`, which drives qrexec
   into a disposable qube. On the Debian/Fedora build host this project
   documents, the first `./qb` call could not run. It now selects the container

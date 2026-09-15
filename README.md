@@ -68,8 +68,11 @@ For a throwaway test build, `--no-passphrase` asks nothing at all. For the
 production release path with independent key-backup media and an audited
 export, use `bootstrap` instead — `make` lists every step on its own.
 
-Boot the USB and install. First boot provisions itself; there is nothing to do
-by hand, and the recurring maintenance installs itself as timers.
+Boot the USB and install. First boot provisions itself with nobody at the
+keyboard. The one thing only a person can supply — the login password — is
+asked for at the console and never holds provisioning up: unanswered, it is
+asked again at every boot and every 30 minutes until someone sets it. The
+recurring maintenance installs itself as timers.
 
 Full walkthrough: **[docs/GUIDE.md](docs/GUIDE.md)**.
 Trusted release-candidate runner setup: **[docs/RELEASE.md](docs/RELEASE.md)**.
