@@ -499,7 +499,24 @@ def main():
     assert make("check-uid", 'UID=Unit Image Signing <cyber@example.ch>').returncode == 0
     assert make("help", "UID=1000").returncode == 0, "help must work under a numeric UID"
 
-    print("  67/67 unattended orchestration checks pass")
+    # check-upstream --update during an outage must not record today as the
+    # date the supply chain was last checked: the sources it could not reach
+    # were not checked, and the freshness date is what lets later builds skip
+    # the check for check_upstream_max_age_days.
+    with tempfile.TemporaryDirectory() as td4:
+        a4 = args(action="check-upstream", dry_run=False)
+        a4.update, a4.allow_unreachable = True, True
+        x4 = ctx(td4, a4)
+        lock = Path(td4) / "supply-chain.lock.json"
+        lock.write_text(json.dumps({"checked": "2020-01-01"}))
+        with mock.patch.object(bi, "LOCK_PATH", lock), \
+                mock.patch.object(bi, "_fetch", side_effect=OSError("offline")):
+            rc4 = bi.check_upstream(x4)
+        assert rc4 == 0, "--allow-unreachable is the explicit override for one run"
+        assert json.loads(lock.read_text()).get("checked") == "2020-01-01", \
+            "an unverified run advanced the freshness date"
+
+    print("  69/69 unattended orchestration checks pass")
     return 0
 
 

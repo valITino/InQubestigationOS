@@ -229,6 +229,14 @@ def main() -> int:
         check("--usb writes the stick after the build",
               names(calls)[-1] == "write_usb", str(names(calls)))
         check("--usb without --device waits for a stick", a.wait is True)
+        # A dry run of the same command plans the media step instead: there
+        # is no image for write-usb to verify, so calling it would abort the
+        # plan at its first check.
+        a = args(usb=True, dry_run=True)
+        rc, calls, _ = run_quickstart(td, a)
+        check("--dry-run --usb completes", rc == 0)
+        check("--dry-run --usb does not call write-usb",
+              "write_usb" not in names(calls), str(names(calls)))
 
         # 9. Re-exec under sg docker must not loop: with the guard set, the
         #    exec is skipped even when docker only works through sg.

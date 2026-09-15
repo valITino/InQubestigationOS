@@ -761,6 +761,29 @@ def setup_builder(x: Ctx):
 #  two of them. Each step here is the command the guide documents; running them
 #  in sequence is what nobody should have to remember.
 # ---------------------------------------------------------------------------
+
+def bootstrap_backup_args(args, backup_to) -> list[str]:
+    """The backup-key invocation bootstrap runs as its second step.
+
+    Each secret goes to the flag that means it: one passphrase unlocks the
+    signing key so it can be exported, the other encrypts the backup. And
+    the local-backup authorization travels too — without it backup-key
+    refused the very directory onboarding had just accepted for a
+    backup_kind of local-directory.
+    """
+    backup_args: list[str] = []
+    if backup_to:
+        backup_args += ["--to", str(backup_to)]
+    if getattr(args, "use_key", None):
+        backup_args += ["--use-key", args.use_key]
+    if getattr(args, "passphrase_file", None):
+        backup_args += ["--passphrase-file", args.passphrase_file]
+    if getattr(args, "backup_passphrase_file", None):
+        backup_args += ["--backup-passphrase-file", args.backup_passphrase_file]
+    if getattr(args, "allow_local_key_backup", False):
+        backup_args.append("--allow-local-key-backup")
+    return backup_args
+
 def bootstrap(x: Ctx, args) -> int:
     if os.geteuid() == 0:
         raise Fatal("bootstrap must run as a non-root build user. It uses sudo only "
@@ -793,6 +816,13 @@ def bootstrap(x: Ctx, args) -> int:
         workflow.stage("onboarding", "running", "discovering resources and collecting approval")
         workflow.onboard(args)
         workflow.stage("onboarding", "complete", "approved destinations validated")
+        if workflow.cfg.get("backup_kind") == "local-directory" \
+                and not getattr(args, "allow_local_key_backup", False):
+            # Said here, not by backup-key after gen-key has already run.
+            raise Fatal("bootstrap.backup_kind is local-directory, which keeps the "
+                        "signing-key backup on this host's own disk. Pass "
+                        "--allow-local-key-backup to authorize that deliberately, "
+                        "or configure removable backup media.")
         steps: list[tuple[str, str, list[str]]] = [
             ("gen-key", "create or adopt the signing key", ["gen-key"]),
             ("backup-key", "back up the signing key before anything can lose it",
@@ -814,23 +844,9 @@ def bootstrap(x: Ctx, args) -> int:
         if args.passphrase_file:
             key_args += ["--passphrase-file", args.passphrase_file]
         steps[0] = ("gen-key", steps[0][1], ["gen-key", *key_args])
-        backup_args: list[str] = []
         backup_to = workflow.data_paths.get("backup", workflow.backup_path)
-        if backup_to:
-            backup_args += ["--to", str(backup_to)]
-        if args.use_key:
-            backup_args += ["--use-key", args.use_key]
-        # Each secret to the flag that means it. These are different
-        # passphrases: one unlocks the signing key so it can be exported, the
-        # other encrypts the backup. Passing the backup secret as
-        # --passphrase-file made the export step try to unlock the signing key
-        # with it.
-        if args.passphrase_file:
-            backup_args += ["--passphrase-file", args.passphrase_file]
-        if getattr(args, "backup_passphrase_file", None):
-            backup_args += ["--backup-passphrase-file",
-                            args.backup_passphrase_file]
-        steps[1] = ("backup-key", steps[1][1], ["backup-key", *backup_args])
+        steps[1] = ("backup-key", steps[1][1],
+                    ["backup-key", *bootstrap_backup_args(args, backup_to)])
 
         print(f"\n{B}{C}══ bootstrap{RST}")
         print("\n  This runs, stopping at the first failure:\n")
@@ -1726,6 +1742,15 @@ def quickstart(x: Ctx, args) -> int:
     iso = x.out_dir / x.c["iso_name"]
     if getattr(args, "usb", False) or getattr(args, "device", None):
         args.wait = args.wait or not getattr(args, "device", None)
+        if args.dry_run:
+            # A dry-run build produced no image, and write-usb's first check
+            # is that the image exists — so the plan has to be stated here.
+            where = (f"to {args.device}" if getattr(args, "device", None)
+                     else "to the removable device plugged in (--wait)")
+            x.info(f"[dry-run] write-usb: verify the image and the signed "
+                   f"install-time kickstart, write {where}, read the stick back, "
+                   f"then append the {OEM_LABEL} partition")
+            return 0
         return write_usb(x)
     print(f"""
   {G}Done.{RST}  {iso}
@@ -3776,7 +3801,7 @@ def _have_module(name: str) -> bool:
         return False
 
 
-def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
+def host_gaps(ce: str, need_ks: bool = False, oem_fstype: str = "vfat") -> list[str]:
     """Everything the build host is missing that a package can supply.
 
     This used to probe five binaries and nothing else, so on a host that
@@ -3790,7 +3815,11 @@ def host_gaps(ce: str, need_ks: bool = False) -> list[str]:
     gaps = [t for t in ("git", "curl", "gpg", "rsync", ce) if not shutil.which(t)]
     # Needed only by write-usb, but missing them there means discovering it
     # with the stick already written and the operator waiting.
-    gaps += [t for t in ("sgdisk", "mkfs.vfat") if not shutil.which(t)]
+    # The formatter install.oem_fstype selects — ext4 exists precisely for a
+    # host without dosfstools, so demanding mkfs.vfat there blocked a valid
+    # configuration.
+    mkfs = "mkfs.vfat" if oem_fstype == "vfat" else "mkfs.ext4"
+    gaps += [t for t in ("sgdisk", mkfs) if not shutil.which(t)]
     if not _have_module("yaml"):
         # Named by what it is, not by one distribution's package name: this
         # message is printed on Fedora hosts too, where it is python3-pyyaml.
@@ -3883,7 +3912,7 @@ def setup_host(x: Ctx) -> int:
     # listed at all. The virtualenv step re-checks and does nothing if the
     # package install satisfied it, so a Fedora host uses its own package.
     need_ks = not kickstart_python(x)[0]
-    gaps = host_gaps(ce, need_ks)
+    gaps = host_gaps(ce, need_ks, x.c["install"]["oem_fstype"])
     if gaps:
         x.info("missing on this host: " + ", ".join(gaps))
         if fam == "debian":
@@ -4872,6 +4901,15 @@ def check_upstream(x: Ctx) -> int:
         x, c, unknown_blocks=not getattr(x.args, "allow_unreachable", False))
 
     if update and not x.args.dry_run:
+        unverified = [ch.name for ch in c if ch.state == UNKNOWN]
+        if unverified:
+            # What could not be reached was not checked. Recording today's
+            # date anyway would let every build for check_upstream_max_age_days
+            # skip exactly the sources that were never verified — a one-run
+            # --allow-unreachable turned into a multi-day bypass.
+            seen.pop("checked", None)
+            x.warn(f"{len(unverified)} source(s) were not verified, so the "
+                   "freshness date is not advanced — the next build checks again")
         merged = deep_merge(lock, seen)
         LOCK_PATH.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
         x.ok(f"recorded in {LOCK_PATH.name} — commit it so the next check has a "

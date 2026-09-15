@@ -541,7 +541,10 @@ Rather than a `dd` line you have to get right at four in the afternoon, this:
   any of the above. That file runs as root inside the installer and the
   image's signature does not cover it; the build signs it beside the image,
   and an unsigned or altered one is refused. `verify-iso.sh` checks it too
-  when the bundle carries one
+  when the bundle carries one. Nothing verifies the stick at boot, for the
+  image or for the kickstart: Qubes' installer has no such mechanism, so a
+  written stick is protected by custody, exactly as an image-only stick
+  always was
 
 With one removable device plugged in, `--device` can be omitted.
 

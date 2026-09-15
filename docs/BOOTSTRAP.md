@@ -83,6 +83,11 @@ value is not stored in configuration, status, inventory, logs, bundle, or ISO.
 Signing-key and backup-encryption passphrases remain distinct concepts; the
 workflow does not introduce unrelated password reuse.
 
+A `backup_kind` of `local-directory` keeps the key backup on the build host's
+own disk. Bootstrap requires `--allow-local-key-backup` to run that way,
+refuses before creating a key without it, and forwards the flag to
+`backup-key`.
+
 ## Interaction inventory
 
 | Group / machine | Input or action | Secret | Safe source and reuse |

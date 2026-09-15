@@ -40,6 +40,7 @@ what upstream does and upstream does something else.
 | 12 | GUIDE.md | fences and sections spliced since 2.1 | — | repaired; structure check added |
 | 13 | `write-usb`, release gate (review of this pass) | `oem/ks.cfg` executed as root by the installer, signed by nothing | Anaconda reads the QUBES_OEM kickstart as is; the image's signature does not cover it | signed beside the image; write-usb and the release gate authenticate it; staged with the candidate |
 | 14 | release gate (review of this pass) | passphrase files compared by path only | — | values compared too |
+| 15 | `quickstart`, `doctor`, `check-upstream`, `bootstrap` (review of this pass) | `--dry-run --usb` aborted on the missing image; `doctor` demanded `mkfs.vfat` under `oem_fstype=ext4`; `--update --allow-unreachable` recorded an unverified run as fresh; `--allow-local-key-backup` never reached `backup-key` | — | the dry run plans the media step; the doctor checks the configured formatter; an unverified run leaves the freshness date alone; bootstrap forwards the flag and refuses early without it |
 
 Every fix has a test that fails with the fix reverted: the harness reads the
 recorded in-qube actions (defects 1–7), the orchestration checks execute the

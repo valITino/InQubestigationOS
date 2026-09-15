@@ -75,6 +75,14 @@ qubes-builderv2's template plugin. Detail in [docs/REVIEW.md](docs/REVIEW.md).
   before using it as a qube name.
 - The numeric-UID refusal in the Makefile applies only to the targets that
   consume the signing identity, not to every invocation.
+- `quickstart --dry-run --usb` plans the media step instead of aborting on
+  the image a dry run never built.
+- `doctor` requires the formatter `install.oem_fstype` selects, so an ext4
+  configuration is not blocked on `mkfs.vfat`.
+- `check-upstream --update --allow-unreachable` no longer records an
+  unverified run as the date the supply chain was last checked.
+- `bootstrap` forwards `--allow-local-key-backup` to `backup-key`, and refuses
+  a `local-directory` backup before creating a key when the flag is absent.
 
 **Tests and docs**
 
