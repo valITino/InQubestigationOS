@@ -3851,7 +3851,15 @@ def install_packages(x: Ctx, fam: str, pkgs: list[str], batch: bool = True) -> N
     if not pkgs:
         x.warn("nothing left to install")
         return
-    base = ["apt-get", "install", "-y"] if fam == "debian" else ["dnf", "install", "-y"]
+    # Without noninteractive, a debconf question from any package in the batch
+    # (a libc6 upgrade asking to restart services, say) takes over the
+    # terminal as a whiptail dialog that often fails to draw — a blank blue
+    # screen that looks like a crash. `env` because sudo scrubs the
+    # environment; confold keeps the host's own edited config files.
+    base = (["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+             "-o", "Dpkg::Options::=--force-confdef",
+             "-o", "Dpkg::Options::=--force-confold"]
+            if fam == "debian" else ["dnf", "install", "-y"])
     if batch:
         try:
             x.run(*_sudo([*base, *pkgs]), live=True)
