@@ -2038,7 +2038,15 @@ def write_builder_iso_config(x: Ctx, base_ks: str, iso_tpls: list[str], kickstar
     }
     if x.c["iso_version"]:
         iso["version"] = str(x.c["iso_version"])
-    updates: dict = {"iso": iso}
+    # The installer's Mock chroot installs lorax-templates-qubes, and the ISO
+    # pulls dom0 packages. Nothing here builds Qubes components, so the
+    # builder-local repository is empty; without use-qubes-repo the installer
+    # plugin never enables the signed yum.qubes-os.org repository and dnf
+    # stops at "No match for argument: lorax-templates-qubes".
+    updates: dict = {
+        "iso": iso,
+        "use-qubes-repo": {"version": str(x.c["qubes_release"]).lstrip("rR")},
+    }
     # Only when there is something to cache: an empty 'cache: {templates: []}'
     # would replace whatever the upstream example config put there.
     if x.c["cache_templates"]:

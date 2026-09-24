@@ -213,6 +213,19 @@ def main():
         assert merged["git"]["branch"] == "release4.3"
         assert len(merged["components"]) == 2
 
+        # The iso block turns on the signed Qubes repository: nothing is built
+        # locally, so it is where lorax-templates-qubes comes from. A testing
+        # flag the operator set survives the merge.
+        with open(bcfg, "a") as fh:
+            fh.write("use-qubes-repo:\n  testing: true\n")
+        with mock.patch.object(x, "run", return_value=""):
+            bi.write_builder_iso_config(x, "iso-online.ks", ["debian-13-xfce"],
+                                        "conf/custom.ks")
+        merged = yaml.safe_load(bcfg.read_text())
+        assert merged["use-qubes-repo"] == {"testing": True, "version": "4.3"}, \
+            merged["use-qubes-repo"]
+        assert merged["iso"]["templates"] == ["debian-13-xfce"]
+
         # podman is a supported engine; anything else is refused rather than
         # written into builder.yml for ./qb to choke on later.
         x.c["container_engine"] = "podman"
@@ -533,7 +546,7 @@ def main():
         assert json.loads(lock.read_text()).get("checked") == "2020-01-01", \
             "an unverified run advanced the freshness date"
 
-    print("  71/71 unattended orchestration checks pass")
+    print("  73/73 unattended orchestration checks pass")
     return 0
 
 
