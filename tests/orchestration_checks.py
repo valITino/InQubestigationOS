@@ -231,6 +231,23 @@ def main():
             expect_fatal(lambda: bi.write_builder_executor(x),
                          "reports type='qubes'")
 
+        # qb's answer is parsed from stdout alone, and a line of noise before
+        # the JSON does not fail the build. When qb itself crashes, the
+        # message shows what it said instead of just "not JSON".
+        def qb_answer(stdout, both):
+            def run(*argv, capture=False, **kw):
+                return stdout if capture == "stdout" else both
+            return run
+        ok = '{"type": "docker", "options": {"image": "qubes-builder-fedora"}}'
+        with mock.patch.object(x, "run", side_effect=qb_answer(
+                "loading plugins\n" + ok, "WARNING: noise\n" + ok)):
+            bi.write_builder_executor(x)
+        crash = ("Traceback (most recent call last):\n"
+                 "ModuleNotFoundError: No module named 'pathspec'")
+        with mock.patch.object(x, "run", side_effect=qb_answer(crash, crash)):
+            expect_fatal(lambda: bi.write_builder_executor(x),
+                         "No module named 'pathspec'")
+
         # ---------------------------------------------------------------
         # Wiring, not just the helper: setup_builder must fix the executor
         # BEFORE it runs ./qb for anything. Testing the helper alone let
@@ -516,7 +533,7 @@ def main():
         assert json.loads(lock.read_text()).get("checked") == "2020-01-01", \
             "an unverified run advanced the freshness date"
 
-    print("  69/69 unattended orchestration checks pass")
+    print("  71/71 unattended orchestration checks pass")
     return 0
 
 
