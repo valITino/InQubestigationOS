@@ -2033,7 +2033,13 @@ def write_builder_iso_config(x: Ctx, base_ks: str, iso_tpls: list[str], kickstar
         "comps": x.c["comps_file"],
         "flavor": x.c["iso_flavor"],
         "is-final": False,
-        "use-kernel-latest": True,
+        # True makes the installer Makefile pass lorax `--excludepkgs kernel`,
+        # and lorax since its libdnf5 port (40+, what Fedora 41 ships) runs
+        # that removepkg before any transaction exists: "Transaction needs to
+        # be run before calling _filelists". This only picks the kernel the
+        # installer boots; the installed system still gets kernel-latest from
+        # the kickstart's %packages.
+        "use-kernel-latest": False,
         "templates": list(iso_tpls),
     }
     if x.c["iso_version"]:

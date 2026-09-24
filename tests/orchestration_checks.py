@@ -225,6 +225,9 @@ def main():
         assert merged["use-qubes-repo"] == {"testing": True, "version": "4.3"}, \
             merged["use-qubes-repo"]
         assert merged["iso"]["templates"] == ["debian-13-xfce"]
+        # use-kernel-latest makes lorax run --excludepkgs, which crashes
+        # libdnf5 lorax before its transaction exists.
+        assert merged["iso"]["use-kernel-latest"] is False
 
         # podman is a supported engine; anything else is refused rather than
         # written into builder.yml for ./qb to choke on later.
@@ -546,7 +549,7 @@ def main():
         assert json.loads(lock.read_text()).get("checked") == "2020-01-01", \
             "an unverified run advanced the freshness date"
 
-    print("  73/73 unattended orchestration checks pass")
+    print("  74/74 unattended orchestration checks pass")
     return 0
 
 
