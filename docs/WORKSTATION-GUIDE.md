@@ -25,12 +25,12 @@ it, or finish the job with one command.
 sudo golden-image-provision --status
 ```
 
-The first line says `edition: wired` or `edition: unwired`.
+Under the version header it says `edition: wired` or `edition: unwired`.
 
 | | Wired | Unwired |
 |---|---|---|
 | Templates with their tools installed | yes | yes |
-| Wazuh agent installed in every template (disabled) | yes | yes |
+| Wazuh agent installed, disabled, in the templates | every template | the new `tpl-*` templates only |
 | Inspection chain (proxy, IPS, DPI) created | yes | **no** |
 | Wazuh manager (SIEM) created | yes | **no** |
 | App qubes re-templated and re-routed | yes | **no** |
@@ -38,8 +38,8 @@ The first line says `edition: wired` or `edition: unwired`.
 | dom0 policy, backups, maintenance timers | yes | **no** |
 
 On the unwired edition, nothing you already had is changed: `sys-net`,
-`sys-firewall`, `personal`, `work`, `vault` and the rest stay as Qubes
-installed them.
+`sys-firewall`, `personal`, `work`, `vault`, the stock templates and the rest
+stay as Qubes installed them.
 
 ## 2. The templates you have
 
@@ -48,8 +48,8 @@ package manager, one update cadence).
 
 | Template | What is in it | Meant for |
 |---|---|---|
-| `tpl-sys` | the Debian service-qube packages (networking, USB, firmware) | `sys-net`, `sys-firewall`, `sys-usb` |
-| `tpl-proxy` | Squid and unbound | an attribution/logging web proxy qube |
+| `tpl-sys` | the Debian service-qube packages (networking, USB, firmware), and unbound for `sys-firewall`'s DNS over TLS | `sys-net`, `sys-firewall`, `sys-usb` |
+| `tpl-proxy` | Squid | an attribution/logging web proxy qube |
 | `tpl-ids` | Suricata and Zeek | an inline IPS qube and a DPI qube |
 | `tpl-kali` | Kali (dist-upgraded, `kali-linux-default`) | investigation qubes |
 | `tpl-personal` | LibreOffice and the office payload | `personal`, `work`, `vault`, offline viewers |
@@ -120,7 +120,22 @@ qvm-prefs sys-usb      template tpl-sys
 If your keyboard or mouse goes through `sys-usb`, expect input to drop while it
 restarts.
 
-**Investigation and everyday qubes:**
+**Everyday qubes onto the office template, and behind the proxy** (shut them
+down first):
+
+```bash
+qvm-shutdown --wait personal work vault
+qvm-prefs personal template tpl-personal
+qvm-prefs work     template tpl-personal
+qvm-prefs vault    template tpl-personal
+qvm-prefs personal    netvm sys-proxy
+qvm-prefs work        netvm sys-proxy
+qvm-prefs untrusted   netvm sys-proxy
+qvm-prefs default-dvm netvm sys-proxy
+qvm-prefs vault netvm none
+```
+
+**Investigation qubes, and an offline disposable for evidence:**
 
 ```bash
 qvm-create --class AppVM --template tpl-kali --label yellow kali-clear
@@ -130,17 +145,21 @@ qvm-prefs kali-tor netvm sys-whonix
 qvm-create --class AppVM --template tpl-personal --label red dvm-offline
 qvm-prefs dvm-offline netvm none
 qvm-prefs dvm-offline template_for_dispvms True
-qvm-prefs work netvm sys-proxy
-qvm-prefs vault netvm none
+qvm-features dvm-offline appmenus-dispvm 1
 ```
 
-**Egress limits** for `personal` and `work` (web and DNS only):
+**Egress limits** for `personal` and `work` (web and DNS only). Clear the
+qube's existing rules first — rules are added, not replaced, and an earlier
+broad accept would still match ahead of the final drop — then repeat the same
+for `personal`:
 
 ```bash
+qvm-firewall work reset          # remove the existing rules
 qvm-firewall work add accept proto=tcp dstports=80
 qvm-firewall work add accept proto=tcp dstports=443
 qvm-firewall work add accept specialtarget=dns
 qvm-firewall work add drop
+qvm-firewall work list           # check what is now in force
 ```
 
 ## 5. Or let the provisioner wire it
@@ -152,8 +171,12 @@ per-machine secrets, and builds, configures and tests everything in section 3.
 ```bash
 sudo golden-image-provision --edition wired --dry-run   # see every action first
 sudo golden-image-provision --edition wired             # wire it
-sudo golden-image-provision --edition wired --verify    # the full acceptance tests
+sudo golden-image-provision --verify                    # the full acceptance tests
 ```
+
+Running it with `--edition wired` records the change in the machine's
+configuration, so `--status`, `--verify`, `--issue` and the weekly self-check
+treat the machine as wired from then on.
 
 After wiring, the credentials land in `~/golden-image/credentials.json`
 (mode 600). Rotate, escrow and shred them with

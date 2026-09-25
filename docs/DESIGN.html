@@ -174,7 +174,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
 <div class="wrap">
 
 <header class="masthead">
-  <div class="doc-id">Kapo Cyber · Build specification · v2.4 · 2026-09-15</div>
+  <div class="doc-id">Kapo Cyber · Build specification · v2.5 · 2026-09-25</div>
   <h1>InQubestigationOS<br><span style='font-size:.62em;font-weight:500;color:var(--ink-2)'>Cybercrime investigator workstation</span></h1>
   <p class="lede" style="margin-top:16px">Reference design and verified build for the team-standard laptop. One inspected road for every clearnet connection, one anonymous road for Tor, endpoint telemetry in every compartment, reproducible from a stock installer or a custom ISO.</p>
   <div class="chips">
@@ -183,7 +183,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
     <span class="chip">dom0 <strong>Fedora 41 · Xen 4.19</strong></span>
     <span class="chip ok">estate <strong>Debian 13 everywhere else</strong></span>
     <span class="chip">siem <strong>Wazuh 4.14.7, agent in every template</strong></span>
-    <span class="chip ok">verified <strong>2026-09-01 · 58/58 checks</strong></span>
+    <span class="chip ok">first real build <strong>2026-09-24 · Kali, tier 1, signed</strong></span>
   </div>
 
   <nav class="toc">
@@ -735,8 +735,8 @@ sequenceDiagram
 </figure>
 
 <h2 id="backup"><span class="num">11</span>Weekly backup</h2>
-<div class="cal fix"><div class="ct"><span class="tag">corrected</span> <code>qvm-backup</code> has no <code>--yes</code> flag</div>
-<p>The previous revision's timer would have hung waiting for confirmation, every Sunday at 03:00, forever — the kind of failure nobody notices until they need a restore. <strong>Profile mode is the documented non-interactive path</strong>, and <code>--profile</code> is mutually exclusive with all other options.</p></div>
+<div class="cal fix"><div class="ct"><span class="tag">corrected</span> <code>qvm-backup</code> runs unattended: profile plus <code>--yes</code></div>
+<p>A timer that can be asked a y/N question hangs every Sunday at 03:00, forever — the kind of failure nobody notices until they need a restore. <strong>Profile mode is the documented non-interactive path</strong> (it is how the passphrase reaches an unattended run), and <code>--yes</code> goes beside it: it sits on <code>qvm-backup</code>'s top-level parser, outside the mutually exclusive profile group. See REVIEW.md, pass 2.</p></div>
 
 <div class="filehead">dom0 · /etc/qubes/backup/golden-image.conf  (mode 0600 — holds the passphrase)</div>
 <pre class="conf">destination_vm: sys-usb
@@ -844,14 +844,16 @@ sudo ./golden_image.py --verify         <span class="cm"># acceptance tests only
 <div class="tw"><table>
   <tr><th>Test</th><th>Result</th></tr>
   <tr><td>Both scripts compile</td><td class="ok">pass</td></tr>
-  <tr><td>Dry run, all twelve phases</td><td class="ok">180 actions planned, no aborts</td></tr>
+  <tr><td>Dry run, all twelve phases</td><td class="ok">285 actions planned, no aborts</td></tr>
   <tr><td>Real run against a fake-dom0 harness</td><td class="ok">all twelve phases run; the exit code matches the test summary</td></tr>
   <tr><td>Phase 12 refuses to mark complete when tests fail</td><td class="ok">pass</td></tr>
-  <tr><td>Generated config files captured and validated</td><td class="ok">58 / 58 checks</td></tr>
+  <tr><td>Generated config files captured and validated</td><td class="ok">136 / 136 checks</td></tr>
   <tr><td>systemd unit structural validation</td><td class="ok">pass</td></tr>
   <tr><td>Credentials mode 600, four unique secrets</td><td class="ok">pass</td></tr>
+  <tr><td>Unwired edition: template phases only, stock templates untouched, nothing wired</td><td class="ok">pass</td></tr>
+  <tr><td>ISO build on a real host (Kali, VirtualBox, Docker, tier 1)</td><td class="ok">built and signed, 7.8 GB</td></tr>
 </table></div>
-<p class="sub">The 59 checks cover nftables brace balance, chain types and hooks against the valid sets, <code>redirect</code> used only in a nat prerouting context, absence of the non-existent <code>custom-prerouting</code>, nft set spacing, the add-then-delete idiom and <code>dstnat</code> priority in the DNS script, Squid peek-then-splice with no decryption plus <code>%&gt;a</code> attribution, unbound DoT syntax and non-open-resolver posture, Suricata <code>queue num</code> and genuine fail-closed with no <code>bypass</code> in any executable line, and no unsubstituted placeholders anywhere.</p>
+<p class="sub">The checks cover nftables brace balance, chain types and hooks against the valid sets, <code>redirect</code> used only in a nat prerouting context, absence of the non-existent <code>custom-prerouting</code>, nft set spacing, the add-then-delete idiom and <code>dstnat</code> priority in the DNS script, Squid peek-then-splice with no decryption plus <code>%&gt;a</code> attribution, unbound DoT syntax and non-open-resolver posture, Suricata <code>queue num</code> and genuine fail-closed with no <code>bypass</code> in any executable line, and no unsubstituted placeholders anywhere.</p>
 
 <h2 id="verify"><span class="num">15</span>Open verification</h2>
 <p class="section-note">This list used to be nine items an operator had to confirm by hand on the issued machine. Every one of them that could become a test has: acceptance-test <strong>group 13</strong> runs them on the real hardware, and <code>--verify</code> exits non-zero if any fails. What is left below is what genuinely needs a person.</p>
@@ -864,9 +866,9 @@ sudo ./golden_image.py --verify         <span class="cm"># acceptance tests only
   <li><strong>Now a test — Squid peek/splice.</strong> Group 13 runs <code>squid -k parse</code> against the shipped build.</li>
   <li><strong>Now handled at boot — Zeek install prefix.</strong> The rc hook discovers <code>zeekctl</code> rather than assuming <code>/opt/zeek</code>, and logs a line if it is somewhere else.</li>
   <li><strong>Now a test — the Tor branch really uses Tor.</strong> Group 13 asks <code>check.torproject.org/api/ip</code> from <code>kali-tor</code> and fails if <code>IsTor</code> is false.</li>
-  <li><strong>Still yours: the builder itself.</strong> The signature on the qubes-builderv2 checkout — the builder verifies what it fetches; nothing verifies the builder for you.</li>
-  <li><strong>Still yours: an end-to-end run.</strong> Neither script has been run against a live Qubes 4.3.1 system. Both run twelve phases against a fake-dom0 harness on every push, which is not the same thing.</li>
-  <li><strong>Still yours: the Wazuh certificate layout.</strong> The paths against the single-node guide for the pinned version — the layout changes between series, and a wrong one looks like a working install until the indexer will not start.</li>
+  <li><strong>Now automated: the builder itself.</strong> <code>verify_builder</code> checks the qubes-builderv2 checkout's signed <code>mm_&lt;sha&gt;</code> tag against developer keys the pinned Qubes Master Signing Key validly certifies.</li>
+  <li><strong>Still yours: an install.</strong> <code>build_iso.py</code> has built and signed an image end to end on Kali (VirtualBox, Docker, tier 1). Nobody has installed it yet, so <code>golden_image.py</code> has never run against a live Qubes 4.3.1 system; it runs all twelve phases, and the unwired edition, against a fake-dom0 harness on every push, which is not the same thing.</li>
+  <li><strong>Now a test: the Wazuh certificate layout.</strong> Acceptance group 13 asserts the six files the three services read, with their owners and modes, so a layout change between series fails a test instead of looking like a working install.</li>
   <li><strong>Still yours: judgement.</strong> Whether the Kali apt pin priorities suit your unit's tool set, and whether a given machine is fit to issue.</li>
 </ul>
 

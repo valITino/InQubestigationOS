@@ -92,11 +92,17 @@ Only these files are copied to a new internal `rc-<commit>` directory:
 * `oem/ks.cfg` and `oem/ks.cfg.asc` — the install-time kickstart `write-usb`
   puts on the `QUBES_OEM` partition, signed with the release key; the gate
   verifies that signature and `write-usb` refuses an unsigned one
+* `oem/editions/wired/ks.cfg`, `oem/editions/unwired/ks.cfg` and their `.asc`
+  — one signed kickstart per edition, for `write-usb --edition` and
+  `package-release`; the gate verifies each signature
 
-Unexpected output files fail the allowlist. Work trees, logs, passphrase files,
-key backups and provisioning credentials are never recursively copied or
-uploaded. The candidate is not a release: promotion/publication requires a
-separate explicit owner process after hardware installation testing.
+Unexpected output files, at any depth under `output/`, fail the allowlist. Work
+trees, logs, passphrase files, key backups and provisioning credentials are
+never recursively copied or uploaded. The candidate is not a release:
+promotion requires a separate explicit owner process after hardware
+installation testing. For publication as a download, run
+`./build_iso.py package-release` on the promoted image — see
+[GUIDE §7](GUIDE.md#7-distribute-the-iso).
 
 ## Recovery
 

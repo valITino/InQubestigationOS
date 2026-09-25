@@ -1,5 +1,97 @@
 # Changelog
 
+## 2.5 — 2026-09-25
+
+The first **real build** — `quickstart --usb` on Kali Linux rolling in a
+VirtualBox VM (Docker, tier 1), which built and signed a 7.8 GB image — and
+what it found; two editions from one image; release packaging for downloads;
+progress display; and a full review of the codebase afterwards. Detail in
+[docs/REVIEW.md](docs/REVIEW.md), pass 5.
+
+**Fixed — found by the first real build**
+
+- `setup-host` ran `apt-get install` interactively; a debconf dialog (Kali's
+  libc6 "restart services?") hung it behind a blank blue screen. It installs
+  non-interactively now and keeps existing configuration files.
+- `qb config get-var executor --json` was read with stderr mixed in, so any
+  warning aborted setup with "did not return JSON". Stdout only; a real failure
+  now quotes qb's own last lines.
+- `qb installer init-cache` failed with "No match for argument:
+  lorax-templates-qubes": nothing here builds Qubes components, and the
+  installer plugin enables the signed Qubes repository only when builder.yml
+  sets `use-qubes-repo`. It does now.
+- lorax crashed with "Transaction needs to be run before calling _filelists":
+  `use-kernel-latest` passes `--excludepkgs kernel`, which the libdnf5 lorax
+  in Fedora 41 cannot handle. It is off; the installed system still gets
+  `kernel-latest` from the kickstart.
+
+**Added**
+
+- **Editions.** `wired` (the default, unchanged) builds the templates and the
+  whole design; `unwired` builds the same templates — phases 1, 3, 4 and 5 —
+  and wires nothing: no qube created, no netvm, firewall or policy touched, no
+  credentials, stock templates left as Qubes installed them. One build signs a
+  kickstart per edition under `oem/editions/`; `write-usb --edition` picks one
+  (`make usb EDITION=unwired`). `golden-image-provision --edition wired` wires
+  an unwired machine later and records the change for every later command.
+- `docs/WORKSTATION-GUIDE.md`: the wired design qube by qube, the commands to
+  reproduce it by hand, and best practice. Every install carries it at
+  `/usr/share/doc/inqubestigationos/`, with a copy in the investigator's home.
+- `package-release` (`make release`): the signed image as GitHub release
+  files — parts under 2 GiB, a kit with both signed kickstarts and
+  `make-usb.sh` (joins the parts and runs `write-usb` on the downloader's
+  machine), the public key, a README, and a signed `SHA256SUMS`. Built from an
+  allowlist: the key backup and `iso-build.json` cannot reach it.
+- Progress: bars (percent, rate, ETA) for copying, checksumming, writing and
+  reading back the image; phase timings; builder output under a gutter — all
+  terminal-only. The USB write feeds `dd` through a pipe so it can be measured.
+  First boot writes each phase's position to the journal
+  (`journalctl -t golden-image -f`).
+
+**Fixed — from a review of the whole codebase**
+
+- `verify_builder` counted any master-key signature record as a
+  certification, even one that does not verify; only a valid one counts, and
+  a builder tag signed by a subkey is trusted through its primary.
+- `write-usb` looks for every missing file, the configured key and the
+  partitioning tools **before** erasing anything (a missing `sgdisk` used to
+  surface after `dd`); `/dev/disk/by-id` names are resolved; values compared
+  after the write read stdout only.
+- The dom0 banner and the first-boot runner overwrote each other's motd file;
+  the banner has its own, and says what the edition does.
+- Rewritten kickstarts drop their old signatures, so a failed or unsigned
+  rebuild cannot leave a signature over different contents.
+- `quickstart --set` was silently ignored; it is applied, and every action
+  that does not apply `--set` refuses it.
+- `provisioner_config` may not carry `credentials.fixed` or
+  `use_fixed_defaults` (shared passwords would be embedded in a signed,
+  distributable kickstart); `golden-image.json` is installed mode 600;
+  `install.required_template` is validated; `install.disk` is by-id only.
+- Tier 2: the Wazuh manager's key is pinned before the manager is installed
+  with it, and each pinned keyring must hold exactly one key.
+- `wazuh.mode: auto` was decided only in phase 1's memory, so first boot's
+  `--verify` failed forever on a central setup; every process decides it now.
+- `--rotate-credentials` changed the manager before the step that can abort,
+  then reported that nothing had changed; `--upgrade-wazuh` reported success
+  without checking. Both are fixed.
+- The signing-key expiry watch ran `set -o pipefail` under dash and never
+  worked; it is bash.
+- The release gate and the bootstrap export carry and verify every signed
+  kickstart (both editions), so their output can make provisioning media;
+  `acceptance_runner` counts a check missing from an older report as pending.
+
+**Tests and docs**
+
+- New harness stages for the unwired edition (77 in all), a real-key test for
+  builder trust, and checks for each fix above.
+- Every document brought up to date: README (editions, downloads, the real
+  build), GUIDE (the build steps, the release and download paths, VirtualBox
+  and disk troubleshooting), SIGNING, RELEASE, BOOTSTRAP, REVIEW (pass 5),
+  VERIFICATION and DESIGN.
+- `check-upstream` on 2026-09-25: nothing blocking; Wazuh 4.14.8 is out and
+  upstream's `wazuh-passwords-tool.sh` changed — both left for review, pins
+  unchanged.
+
 ## 2.4 — 2026-09-15
 
 A fourth pass, over the **whole codebase** rather than the quickstart: both

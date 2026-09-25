@@ -42,7 +42,7 @@ from typing import Callable
 # ===========================================================================
 DEFAULT_CONFIG: dict = {
     "image_name": "InQubestigationOS",
-    "image_version": "2.4",
+    "image_version": "2.5",
     "expect_qubes_release": "4.3",
 
     # Which edition this machine is.
@@ -1115,7 +1115,7 @@ an escrow record that no longer matches.
         if self._tier2_ready("proxy"):
             o.skip(f"{self.t['proxy']} payload (baked in)")
         else:
-            o.info(f"{self.t['proxy']}: Squid + unbound")
+            o.info(f"{self.t['proxy']}: Squid")
             self._qrun_apt(self.t["proxy"],
                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && "
                    "(apt-get install -y squid-openssl ca-certificates openssl || "
@@ -2511,9 +2511,10 @@ chown -R wazuh-dashboard:wazuh-dashboard /etc/wazuh-dashboard/certs
             o.ok(f"{name}: qrexec telemetry pipes staged (events + enrollment)")
 
         # --- backup -------------------------------------------------------
-        # qvm-backup has NO --yes flag. Profile mode is the documented
-        # non-interactive path: the profile carries destination, passphrase and
-        # include list, and --profile is mutually exclusive with everything else.
+        # Profile mode is the documented non-interactive path: the profile
+        # carries destination, passphrase and include list. --yes also goes on
+        # the command line — it sits on qvm-backup's top-level parser, outside
+        # the mutually exclusive profile group (docs/REVIEW.md, pass 2 item 4).
         prof_name = "golden-image"
         prof_path = dom0(f"/etc/qubes/backup/{prof_name}.conf")
         bscript = dom0("/usr/local/bin/golden-weekly-backup.sh")
