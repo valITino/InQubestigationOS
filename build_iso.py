@@ -258,6 +258,125 @@ class Fatal(Exception):
     pass
 
 
+# ===========================================================================
+#  Progress display
+# ===========================================================================
+def _on_terminal() -> bool:
+    """Draw live progress only for a person watching a terminal.
+
+    Logs, CI, `| tee` and the test suites read stdout too; a carriage-return
+    animation in any of them is noise at best and breaks parsing at worst.
+    """
+    try:
+        return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+    except (AttributeError, ValueError):
+        return False
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def human_duration(seconds: float) -> str:
+    s = int(max(seconds, 0))
+    if s >= 3600:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 60}:{s % 60:02d}"
+
+
+class Progress:
+    """One-line progress bar for a job whose size is known in bytes.
+
+        with Progress("checksum", size) as bar:
+            bar.update(len(chunk))
+
+    On a terminal it redraws in place (bar, percent, amount, rate, ETA) at
+    most five times a second and leaves one summary line behind. Anywhere
+    else it prints nothing, so captured output is the same as without it.
+    """
+
+    def __init__(self, label: str, total: int, unit_bytes: bool = True):
+        self.label, self.total = label, max(int(total), 1)
+        self.unit_bytes = unit_bytes
+        self.done = 0
+        self.live = _on_terminal()
+        self.start = self._last = time.monotonic()
+
+    def __enter__(self):
+        self._draw(force=True)
+        return self
+
+    def __exit__(self, exc_type, *_):
+        self.close(ok=exc_type is None)
+        return False
+
+    def update(self, n: int) -> None:
+        self.done += n
+        self._draw()
+
+    def _amount(self, n: float) -> str:
+        return human_bytes(n) if self.unit_bytes else f"{int(n)}"
+
+    def _draw(self, force: bool = False) -> None:
+        if not self.live:
+            return
+        now = time.monotonic()
+        if not force and now - self._last < 0.2 and self.done < self.total:
+            return
+        self._last = now
+        frac = min(self.done / self.total, 1.0)
+        elapsed = now - self.start
+        rate = self.done / elapsed if elapsed > 0.5 else 0
+        eta = (self.total - self.done) / rate if rate else 0
+        tail = f" {frac * 100:3.0f}%  {self._amount(self.done)}/{self._amount(self.total)}"
+        if rate:
+            tail += f"  {self._amount(rate)}/s"
+            if self.done < self.total:
+                tail += f"  ETA {human_duration(eta)}"
+        cols = shutil.get_terminal_size((80, 20)).columns
+        label = self.label[:22]
+        width = max(10, min(40, cols - len(label) - len(tail) - 8))
+        full = int(width * frac)
+        bar = "█" * full + "░" * (width - full)
+        sys.stdout.write(f"\r  {C}{label}{RST} ▕{G}{bar}{RST}▏{tail}\033[K")
+        sys.stdout.flush()
+
+    def close(self, ok: bool = True) -> None:
+        if not self.live:
+            return
+        self.done = self.total if ok else self.done
+        self._draw(force=True)
+        took = human_duration(time.monotonic() - self.start)
+        sys.stdout.write(f"  {D}({took}){RST}\n")
+        sys.stdout.flush()
+        self.live = False
+
+
+def sha256_file(path: Path, label: str = "checksum") -> str:
+    """SHA-256 of a (possibly multi-gigabyte) file, with a progress bar."""
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as f, Progress(label, path.stat().st_size) as bar:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+            bar.update(len(chunk))
+    return h.hexdigest()
+
+
+def copy_with_progress(src: Path, dst: Path, label: str = "copy") -> None:
+    """shutil.copy2, with a progress bar for the multi-gigabyte case."""
+    with src.open("rb") as fi, dst.open("wb") as fo, \
+            Progress(label, src.stat().st_size) as bar:
+        for chunk in iter(lambda: fi.read(1 << 22), b""):
+            fo.write(chunk)
+            bar.update(len(chunk))
+    shutil.copystat(src, dst)
+
+
 class Ctx:
     def __init__(self, cfg: dict, args):
         self.c = cfg
@@ -313,6 +432,14 @@ class Ctx:
         self.verify_notes.append(m)
 
     def phase(self, n, name):
+        # How long the previous phase took, for the person at the terminal:
+        # "is this stuck or just slow" is the question a multi-hour build
+        # raises most. Only on a terminal, so logs and tests are unchanged.
+        now = time.monotonic()
+        prev = getattr(self, "_phase_started", None)
+        if prev is not None and _on_terminal():
+            print(f"  {D}\u2514 took {human_duration(now - prev)}{RST}")
+        self._phase_started = now
         print(f"\n{B}{C}\u2550\u2550 {n} \u2014 {name}{RST}")
         self._log(f"PHASE {n} {name}")
 
@@ -328,9 +455,12 @@ class Ctx:
                                  stderr=subprocess.STDOUT, text=True, env=env)
             assert p.stdout
             lf = self.log.open("a") if self.logging else None
+            # On a terminal, indent a tool's own output under a dim gutter so
+            # thousands of builder lines stay visibly inside their phase.
+            gutter = f"  {D}\u2502{RST} " if _on_terminal() else ""
             try:
                 for line in p.stdout:
-                    sys.stdout.write(line)
+                    sys.stdout.write(gutter + line)
                     if lf:
                         lf.write(line)
             finally:
@@ -2927,15 +3057,10 @@ def build_iso(x: Ctx, payload: Path):
     x.info(f"built image: {built}")
 
     target = x.out_dir / x.c["iso_name"]
-    shutil.copy2(built, target)
+    copy_with_progress(built, target, "copying image")
     x.ok(f"-> {target}")
 
-    import hashlib
-    h = hashlib.sha256()
-    with target.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    digest = h.hexdigest()
+    digest = sha256_file(target, "checksum")
     (x.out_dir / f"{x.c['iso_name']}.sha256").write_text(f"{digest}  {x.c['iso_name']}\n")
     x.ok(f"checksum: {digest[:32]}…")
 
@@ -5360,13 +5485,9 @@ def write_usb(x: Ctx) -> int:
     #    exactly as well as the genuine one. It gets the same authentication.
     sha = x.out_dir / f"{x.c['iso_name']}.sha256"
     if sha.is_file():
-        import hashlib
-        h = hashlib.sha256()
-        with iso.open("rb") as f:
-            for chunk in iter(lambda: f.read(1 << 22), b""):
-                h.update(chunk)
+        got = sha256_file(iso, "checksum")
         want = sha.read_text().split()[0]
-        if h.hexdigest() != want:
+        if got != want:
             raise Fatal(f"checksum mismatch for {iso.name} — the image on disk is "
                         f"not the one that was built. Do not distribute it.")
         x.ok("checksum matches the build record")
@@ -5483,8 +5604,7 @@ def write_usb(x: Ctx) -> int:
     if not confirmed(x, f"Write to {dev_path}?"):
         raise Fatal("aborted")
 
-    x.run(*_sudo(["dd", f"if={iso}", f"of={dev_path}", "bs=4M", "status=progress",
-                  "oflag=direct"]), live=True)
+    write_image(x, iso, dev_path)
     x.run(*_sudo(["sync"]))
     x.ok("written")
 
@@ -5496,13 +5616,15 @@ def write_usb(x: Ctx) -> int:
     h = hashlib.sha256()
     remaining = iso.stat().st_size
     try:
-        with open(dev_path, "rb") as dev:
+        with open(dev_path, "rb") as dev, \
+                Progress("reading back", iso.stat().st_size) as bar:
             while remaining > 0:
                 chunk = dev.read(min(1 << 22, remaining))
                 if not chunk:
                     break
                 h.update(chunk)
                 remaining -= len(chunk)
+                bar.update(len(chunk))
     except PermissionError:
         # Elevate, exactly as the write already does. Skipping the readback is
         # skipping the check that a stick wrote without error and reads back
@@ -5515,12 +5637,14 @@ def write_usb(x: Ctx) -> int:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         assert proc.stdout
         remaining = iso.stat().st_size
-        while remaining > 0:
-            chunk = proc.stdout.read(min(1 << 22, remaining))
-            if not chunk:
-                break
-            h.update(chunk)
-            remaining -= len(chunk)
+        with Progress("reading back", remaining) as bar:
+            while remaining > 0:
+                chunk = proc.stdout.read(min(1 << 22, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+                bar.update(len(chunk))
         proc.stdout.close()
         proc.wait()
         if remaining > 0:
@@ -5814,16 +5938,48 @@ def authenticate_signature(status: str, returncode: int, expected: str) -> str:
                 "authenticated.")
 
 
+def write_image(x: Ctx, iso: Path, dev_path: str) -> None:
+    """Copy the image onto the device, showing how far along it is.
+
+    The bytes are fed to `dd` through a pipe rather than letting dd open the
+    image itself: dd's own status=progress is a carriage-return line that a
+    captured, line-buffered stream turns into thousands of lines. dd still
+    does the privileged, O_DIRECT write; iflag=fullblock keeps its 4 MiB
+    blocks whole when a pipe delivers them in pieces.
+    """
+    size = iso.stat().st_size
+    if os.geteuid() != 0:
+        # Ask for the password now, on a clean line: a sudo prompt that
+        # appears under a redrawing progress bar is unreadable.
+        if subprocess.run(["sudo", "-v"]).returncode != 0:
+            raise Fatal("sudo is needed to write to the device")
+    cmd = _sudo(["dd", f"of={dev_path}", "bs=4M", "iflag=fullblock",
+                 "oflag=direct", "status=none"])
+    x._log("EXEC  " + " ".join(cmd) + f" < {iso}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin
+    try:
+        with iso.open("rb") as f, Progress("writing", size) as bar:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                proc.stdin.write(chunk)
+                bar.update(len(chunk))
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+    if proc.wait() != 0:
+        raise Fatal(f"writing {iso.name} to {dev_path} failed (dd exit "
+                    f"{proc.returncode}) — see {x.log}")
+
+
 def want_digest(x: Ctx) -> str:
     sha = x.out_dir / f"{x.c['iso_name']}.sha256"
     if sha.is_file():
         return sha.read_text().split()[0]
-    import hashlib
-    h = hashlib.sha256()
-    with (x.out_dir / x.c["iso_name"]).open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 22), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    return sha256_file(x.out_dir / x.c["iso_name"], "checksum")
 
 
 # ===========================================================================
