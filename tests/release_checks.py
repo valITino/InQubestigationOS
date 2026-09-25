@@ -68,7 +68,9 @@ def main():
         "InQubestigationOS.iso", "InQubestigationOS.iso.sha256",
         "InQubestigationOS.iso.asc", "unit-signing-key.asc", "verify-iso.sh",
         "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt",
-        "oem/ks.cfg", "oem/ks.cfg.asc")
+        "oem/ks.cfg", "oem/ks.cfg.asc",
+        "oem/editions/wired/ks.cfg", "oem/editions/wired/ks.cfg.asc",
+        "oem/editions/unwired/ks.cfg", "oem/editions/unwired/ks.cfg.asc")
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "x"
         p.write_bytes(b"release-candidate")
@@ -120,10 +122,14 @@ def main():
     # compares values, not only paths.
     assert ("a.passphrase_file.read_bytes().strip() == "
             "a.backup_passphrase_file.read_bytes().strip()") in source
-    # The install-time kickstart is staged with the candidate, its signature
-    # is verified by the gate, and a stray file under oem/ fails the allowlist.
-    assert 'verify_signature(output / "oem/ks.cfg", output / "oem/ks.cfg.asc", fingerprint)' in source
-    assert 'present += [f"oem/{p.name}"' in source
+    # Every install-time kickstart (oem/ks.cfg and one per edition) is staged
+    # with the candidate and has its signature verified by the gate, and a
+    # stray file at any depth under output/ fails the allowlist.
+    assert set(rc.KICKSTARTS) == {"oem/ks.cfg", "oem/editions/wired/ks.cfg",
+                                  "oem/editions/unwired/ks.cfg"}
+    assert all(k in rc.ALLOWLIST and f"{k}.asc" in rc.ALLOWLIST for k in rc.KICKSTARTS)
+    assert 'verify_signature(output / ks, output / f"{ks}.asc", fingerprint)' in source
+    assert 'output.rglob("*")' in source
     assert "(candidate / name).parent.mkdir(parents=True, exist_ok=True)" in source
     release_doc = (ROOT / "docs/RELEASE.md").read_text()
     assert "`oem/ks.cfg`" in release_doc and "`oem/ks.cfg.asc`" in release_doc

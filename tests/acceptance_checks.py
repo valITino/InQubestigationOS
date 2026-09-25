@@ -44,6 +44,17 @@ def main():
                                capture_output=True, text=True)
         assert issue.returncode == 2 and "failed or remain pending" in issue.stderr
 
+        # A report written before a check existed has no entry for it. That
+        # check is pending, not passed: everything else passing must not add
+        # up to "hardware-accepted".
+        old = json.loads(report.read_text())
+        old["checks"] = {k: {"status": "pass"} for k in list(ar.CHECKS)[1:]}
+        report.write_text(json.dumps(old))
+        subprocess.run(cmd[:4], capture_output=True, text=True)
+        data = json.loads(report.read_text())
+        assert data["summary"]["pending"] == 1, data["summary"]
+        assert data.get("release_status") != "hardware-accepted-not-issued"
+
     source = (ROOT / "golden_image.py").read_text()
     assert "set -uo pipefail" in source
     assert "full restore remains pending" in source
@@ -53,7 +64,7 @@ def main():
     guide = (ROOT / "docs/ACCEPTANCE.md").read_text()
     assert "never automates a dom0 reboot" in guide
     assert "Never restore over" in guide and "--verify-only" in guide
-    print("  17/17 acceptance evidence checks pass")
+    print("  19/19 acceptance evidence checks pass")
     return 0
 
 

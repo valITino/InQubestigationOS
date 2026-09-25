@@ -529,6 +529,12 @@ def main() -> int:
     utpls = ("tpl-sys", "tpl-proxy", "tpl-ids", "tpl-kali", "tpl-personal", "tpl-wazuh")
     stage("unwired: every template is built", all(t in uworld for t in utpls),
           f"missing: {[t for t in utpls if t not in uworld]}")
+    stock = {"debian-13-xfce", "fedora-43-xfce", "whonix-gateway-18",
+             "whonix-workstation-18"}
+    touched = sorted({v for a in uacts if a["kind"] == "exec" and a["prog"] == "qvm-run"
+                      for v in a["argv"] if v in stock})
+    stage("unwired: nothing runs inside the stock templates", not touched,
+          f"qvm-run into {', '.join(touched)}")
     journal = [" ".join(a["argv"]) for a in uacts
                if a["kind"] == "exec" and a["prog"] == "logger"]
     stage("unwired: every phase reports its progress to the journal",
@@ -548,11 +554,22 @@ def main() -> int:
           and all(f"template {t} exists" in pvt for t in utpls)
           and "sys-proxy" not in pvt,
           f"rc={pv.returncode} " + pvt[-400:])
+    pp = run(ugi, ["--phase", "6"], uenv, usand)
+    stage("unwired: a wiring phase is refused, not run",
+          pp.returncode == 1 and "not part of the unwired edition" in pp.stderr,
+          f"rc={pp.returncode} " + pp.stderr[-300:])
+    ph = run(ugi, ["--handover"], uenv, usand)
+    stage("unwired: credential commands say there are none",
+          ph.returncode == 1 and "generates no credentials" in ph.stderr,
+          f"rc={ph.returncode} " + ph.stderr[-300:])
     pw = run(ugi, ["--edition", "wired"], uenv, usand)
     uworld = json.loads((uwork / "world.json").read_text())["vms"]
     stage("unwired: --edition wired completes the topology later",
           pw.returncode in (0, 2) and "sys-proxy" in uworld,
           f"rc={pw.returncode} " + pw.stderr[-400:])
+    stage("unwired: --edition wired is recorded for every later command",
+          json.loads((usand / "golden-image.json").read_text()).get("edition") == "wired"
+          and "edition: wired" in run(ugi, ["--status"], uenv, usand).stdout)
 
     print("\ngenerated configuration")
     p4 = subprocess.run([sys.executable, str(TESTS / "static_checks.py"),

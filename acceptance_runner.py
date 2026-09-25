@@ -131,8 +131,12 @@ def main() -> int:
         report["checks"][key] = {"description": CHECKS[key], "status": status,
                                  "evidence": redact(evidence), "recorded_utc": now()}
     report["updated_utc"] = now()
-    failures = [k for k, v in report["checks"].items() if v["status"] == "fail"]
-    pending = [k for k, v in report["checks"].items() if v["status"] == "pending"]
+    # Counted over CHECKS, not over the report: a report written before a
+    # check existed has no entry for it, and a missing check is pending, not
+    # passed.
+    status = {k: report["checks"].get(k, {}).get("status", "pending") for k in CHECKS}
+    failures = [k for k, v in status.items() if v == "fail"]
+    pending = [k for k, v in status.items() if v not in ("pass", "fail")]
     report["summary"] = {"pass": len(CHECKS) - len(failures) - len(pending),
                          "fail": len(failures), "pending": len(pending),
                          "failures": failures, "pending_checks": pending}

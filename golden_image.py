@@ -605,9 +605,11 @@ class Provisioner:
         "acceptance tests",
     ]
     # The phases that build and fill templates without wiring anything: no
-    # qube is created, no netvm, firewall or policy is touched, no secret is
-    # generated. Everything else is topology, and the unwired edition leaves
-    # topology to the operator.
+    # qube is created, no firewall or policy is touched, no secret is
+    # generated, and only the new tpl-* templates are changed (a template's
+    # netvm is set only briefly, by _qrun_net's fallback, and restored).
+    # Everything else is topology, and the unwired edition leaves topology to
+    # the operator.
     UNWIRED_PHASES = (1, 3, 4, 5)
     GUIDE_PATH = "/usr/share/doc/inqubestigationos/WORKSTATION-GUIDE.md"
 
@@ -631,6 +633,20 @@ class Provisioner:
         self.t = cfg["tpl"]
         self.q = cfg["qube"]
         self.tests = {"pass": 0, "fail": 0, "warn": 0}
+        # wazuh.mode "auto" used to be decided only inside phase 1, in memory:
+        # every later process (first boot's --verify, a resumed run, the
+        # weekly self-check) then treated "auto" as "local". Decide it here,
+        # from the same fact phase 1 uses, so every process agrees.
+        self.wazuh_auto = cfg["wazuh"]["mode"] == "auto"
+        if self.wazuh_auto and self.edition == "wired" and not args.dry_run:
+            try:
+                gb = physical_memory_gb(self.r)
+            except (OSError, StopIteration, ValueError):
+                gb = None           # phase 1 reports it and refuses
+            if gb is not None and gb >= 16:
+                cfg["wazuh"]["mode"] = "local"
+            elif gb is not None and cfg["wazuh"]["central_address"]:
+                cfg["wazuh"]["mode"] = "central"
 
     def _load_creds(self) -> None:
         """Read credentials.json if it exists.
@@ -695,6 +711,30 @@ class Provisioner:
             self.out.phase_skipped(n, self.PHASES[n - 1])
             return False
         return True
+
+    def _check_wazuh_ip(self) -> None:
+        """The pinned SIEM address must not belong to another qube. Run by
+        phase 1, and again by phase 8 before it pins the address: a machine
+        converted from the unwired edition had phase 1 done long before."""
+        o, r = self.out, self.r
+        wip = self.c["wazuh"]["ip"]
+        if self.args.dry_run or self.c["wazuh"]["mode"] == "central":
+            return
+        # check=True: an empty result from a failed qvm-ls used to be
+        # indistinguishable from "nothing uses this address", and the code
+        # then printed 'free' either way.
+        data = r.run("qvm-ls", "--raw-data", "--fields", "NAME,IP",
+                     check=True, capture=True)
+        if not data.strip():
+            raise Fatal("qvm-ls returned nothing — cannot tell whether "
+                        f"{wip} is free. Refusing to pin the SIEM address on "
+                        "a guess.")
+        for line in data.splitlines():
+            parts = [f.strip() for f in line.split("|")]
+            if len(parts) >= 2 and parts[1] == wip and parts[0] != self.q["wazuh"]:
+                raise Fatal(f"{wip} is already used by '{parts[0]}'. "
+                            "Pick another wazuh.ip in golden-image.json.")
+        o.ok(f"{wip} is free for {self.q['wazuh']}")
 
     # =======================================================================
     #  1 — preflight
@@ -769,7 +809,12 @@ class Provisioner:
             # indexer is viable. Xen's total_memory is physical host memory.
             gb = physical_memory_gb(r)
             o.info(f"physical host RAM reported by Xen: {gb}G")
-            if self.c["wazuh"]["mode"] == "auto":
+            if self.edition == "unwired":
+                pass            # no SIEM is built, so nothing to size for
+            elif self.wazuh_auto and self.c["wazuh"]["mode"] != "auto":
+                o.ok(f"wazuh.mode=auto resolved to '{self.c['wazuh']['mode']}' "
+                     f"({gb}G RAM)")
+            elif self.c["wazuh"]["mode"] == "auto":
                 if gb >= 16:
                     self.c["wazuh"]["mode"] = "local"
                     o.ok(f"wazuh.mode=auto resolved to 'local' ({gb}G RAM)")
@@ -789,30 +834,14 @@ class Provisioner:
                 o.warn("under 16G RAM with a local SIEM qube — consider "
                        "wazuh.mode='central', or 'auto' to decide per machine")
         except (OSError, StopIteration, ValueError):
-            if self.c["wazuh"]["mode"] == "auto":
+            if self.c["wazuh"]["mode"] == "auto" and self.edition == "wired":
                 raise Fatal("wazuh.mode='auto' requires physical memory from "
                             "'xl info'; set mode explicitly when Xen cannot report it")
             o.warn("could not read physical memory from 'xl info'; explicit "
                    f"wazuh.mode={self.c['wazuh']['mode']} is unchanged")
 
-        # Pinned SIEM address collision
-        wip = self.c["wazuh"]["ip"]
-        if not self.args.dry_run:
-            # check=True: an empty result from a failed qvm-ls used to be
-            # indistinguishable from "nothing uses this address", and the code
-            # then printed 'free' either way.
-            data = r.run("qvm-ls", "--raw-data", "--fields", "NAME,IP",
-                         check=True, capture=True)
-            if not data.strip():
-                raise Fatal("qvm-ls returned nothing — cannot tell whether "
-                            f"{wip} is free. Refusing to pin the SIEM address on "
-                            "a guess.")
-            for line in data.splitlines():
-                parts = [f.strip() for f in line.split("|")]
-                if len(parts) >= 2 and parts[1] == wip and parts[0] != self.q["wazuh"]:
-                    raise Fatal(f"{wip} is already used by '{parts[0]}'. "
-                                "Pick another wazuh.ip in golden-image.json.")
-            o.ok(f"{wip} is free for {self.q['wazuh']}")
+        if self.edition == "wired":
+            self._check_wazuh_ip()
 
         # Tier 2 detection
         pre = self.c["prebuilt_templates"]
@@ -1308,6 +1337,10 @@ an escrow record that no longer matches.
         for k in ("base_whonix_gw", "base_whonix_ws"):
             if r.vm_exists(self.c[k]):
                 deb_tpls.append(self.c[k])
+        if self.edition == "unwired":
+            # The stock templates stay as Qubes installed them: the unwired
+            # edition adds tpl-* templates and changes nothing that existed.
+            deb_tpls = [t for t in deb_tpls if t in self.t.values()]
 
         for tpl in deb_tpls:
             if not r.vm_exists(tpl):
@@ -1357,7 +1390,9 @@ an escrow record that no longer matches.
         # The Fedora template is the only thing left needing dnf. If prefer_debian
         # is set, tpl-sys is Debian and was handled in the apt loop above.
         fed = self.c["base_fedora"]
-        if not self.c["use_fedora_template"]:
+        if self.edition == "unwired":
+            pass
+        elif not self.c["use_fedora_template"]:
             o.info(f"{fed} is not part of this estate (use_fedora_template=false) "
                    f"— left untouched")
         elif r.vm_exists(fed) and not r.qtest(fed, "test -d /var/ossec",
@@ -1375,7 +1410,8 @@ an escrow record that no longer matches.
             o.skip(f"{fed} — agent already present")
 
         o.say("")
-        o.info("agent coverage complete across all templates — verified in phase 12")
+        o.info("agent coverage complete — installed disabled, enabled per qube "
+               "when it is enrolled")
         if w["pin_agent"]:
             o.info(f"agents pinned at {w['version']}. Upgrade order when the time comes:")
             o.info("  wazuh-srv FIRST, then release the holds and upgrade agents.")
@@ -1827,8 +1863,9 @@ fi
             "Warn before a third-party signing key expires",
             "/usr/local/sbin/golden-key-expiry", "Mon 05:00",
             condition="/rw/config/golden-image-dpi.sh",
-            body=f"""#!/bin/sh
-# Golden image — third-party signing key expiry watch.
+            body=f"""#!/bin/bash
+# Golden image — third-party signing key expiry watch. bash, not sh: Debian's
+# /bin/sh is dash, which has no pipefail and would exit on this line.
 set -uo pipefail
 now=$(date +%s)
 for kr in {shlex.quote(self.c['zeek']['keyring_path'])} \\
@@ -2085,6 +2122,7 @@ WantedBy=multi-user.target
             r.will_create(q["wazuh"])
             o.ok(f"created {q['wazuh']}")
 
+        self._check_wazuh_ip()
         r.prefs(q["wazuh"], netvm=q["proxy"], memory=w["mem"], maxmem=w["maxmem"],
                 vcpus=w["vcpus"], autostart="True", ip=w["ip"])
         r.run("qvm-volume", "resize", f"{q['wazuh']}:root", f"{w['root_gb']}G",
@@ -2940,7 +2978,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         o, q, w = self.out, self.q, self.c["wazuh"]
         mgr = w["central_address"] if w["mode"] == "central" else w["ip"]
         if not self.creds and self.cred_file.exists():
-            self.creds = json.loads(self.cred_file.read_text())
+            self._load_creds()
 
         # Which transport a qube gets is decided by where it sits in the chain,
         # not by whether it is "clearnet".
@@ -2971,9 +3009,8 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                "attributed telemetry.")
         o.warn("  The qrexec transport keeps that correlation local to this laptop "
                "(nothing beacons")
-        o.warn("  clearnet from an anonymous context). If a case demands zero linkage, "
-               "disable the")
-        o.warn("  For a case that demands zero linkage:")
+        o.warn("  clearnet from an anonymous context). For a case that demands "
+               "zero linkage:")
         o.warn(f"      sudo {Path(sys.argv[0]).name} --case-mode anonymous "
                f"--case <id>")
         o.warn(f"  and --case-mode normal when it closes. Both are recorded in "
@@ -3292,7 +3329,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             self._mark(12)
 
     # -----------------------------------------------------------------------
-    #  11 — the checks that used to be a list in the guide
+    #  Group 13 — the checks that used to be a list in the guide
     #
     #  docs/GUIDE.md section 10 ended with "then confirm by hand the four
     #  things the tests cannot check", and every o.verify() printed one more.
@@ -3514,32 +3551,43 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
 
         # 1. The SIEM manager, first: an agent password change is only useful
         #    once the manager expects the new one.
+        def wazuh_password(user: str, value: str) -> bool:
+            return r.quiet("qvm-run", "--no-gui", "-u", "root", q["wazuh"],
+                           "bash -c " + shlex.quote(
+                               f"/opt/wazuh-passwords-tool.sh -u {user} "
+                               f"-p {shlex.quote(value)}"))
+
         if w["mode"] != "central" and r.vm_exists(q["wazuh"]):
             r.ensure_running(q["wazuh"])
+            # The dashboard password first: it is the one change whose failure
+            # aborts, and until it succeeds nothing anywhere has changed.
+            if r.qtest(q["wazuh"], "test -x /opt/wazuh-passwords-tool.sh"):
+                if not wazuh_password("admin", new["dashboard"]):
+                    raise Fatal("could not set the new dashboard password — nothing "
+                                "has been changed, and credentials.json still holds "
+                                "the valid values.")
+                o.ok("dashboard password rotated")
+                if wazuh_password("wazuh-wui", new["api"]):
+                    o.ok("API password rotated")
+                else:
+                    o.warn("could not set the new API (wazuh-wui) password — the "
+                           "old one stays valid, and stays recorded")
+                    new["api"] = self.creds.get("api", new["api"])
+            else:
+                o.warn("wazuh-passwords-tool.sh not present — the dashboard and "
+                       "API passwords were NOT rotated")
+                new["dashboard"] = self.creds.get("dashboard", new["dashboard"])
+                new["api"] = self.creds.get("api", new["api"])
             r.qwrite(q["wazuh"], "/rw/golden-authd.pass", new["authd"], mode="0600")
             r.qwrite(q["wazuh"], "/var/ossec/etc/authd.pass", new["authd"], mode="0640")
             r.qrun(q["wazuh"], "chown root:wazuh /var/ossec/etc/authd.pass "
                                "2>/dev/null || true", check=False)
             r.qrun(q["wazuh"], "systemctl restart wazuh-manager", check=False)
             o.ok("manager enrollment password rotated")
-            if r.qtest(q["wazuh"], "test -x /opt/wazuh-passwords-tool.sh"):
-                r.quiet("qvm-run", "--no-gui", "-u", "root", q["wazuh"],
-                        "bash -c " + shlex.quote(
-                            f"/opt/wazuh-passwords-tool.sh -u wazuh-wui "
-                            f"-p {shlex.quote(new['api'])}"))
-                if r.quiet("qvm-run", "--no-gui", "-u", "root", q["wazuh"],
-                           "bash -c " + shlex.quote(
-                               f"/opt/wazuh-passwords-tool.sh -u admin "
-                               f"-p {shlex.quote(new['dashboard'])}")):
-                    o.ok("dashboard and API passwords rotated")
-                else:
-                    raise Fatal("could not set the new dashboard password — "
-                                "nothing has been written to credentials.json, so "
-                                "the old values are still valid.")
-            else:
-                o.warn("wazuh-passwords-tool.sh not present — the dashboard "
-                       "password was NOT rotated")
-                new["dashboard"] = self.creds.get("dashboard", new["dashboard"])
+        else:
+            # No local manager: nothing here uses the dashboard or API values.
+            new["dashboard"] = self.creds.get("dashboard", new["dashboard"])
+            new["api"] = self.creds.get("api", new["api"])
 
         # 2. Every enrolled agent gets the new enrollment password.
         for vm in self._enrolled_qubes():
@@ -3747,6 +3795,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         target = self.c["wazuh"]["version"]
         tpls = [self.t["sys"], self.t["proxy"], self.t["ids"], self.t["kali"],
                 self.t["personal"], self.t["wazuh"], self.c["base_debian"]]
+        behind = []
         for tpl in tpls:
             if not r.vm_exists(tpl):
                 continue
@@ -3760,24 +3809,23 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                 r.qrun(tpl, "echo 'wazuh-agent hold' | dpkg --set-selections && "
                             "sed -i 's|^deb |#deb |' "
                             "/etc/apt/sources.list.d/wazuh.list", check=False)
-            o.ok(f"{tpl}: agent at {target}, re-pinned")
+            # Checked, not assumed: the install above is check=False, and a
+            # missing "-1" revision used to be reported as success.
+            if r.qtest(tpl, "dpkg-query -W -f='${Version}' wazuh-agent | "
+                            f"grep -q {shlex.quote('^' + target + '-')}"):
+                o.ok(f"{tpl}: agent at {target}"
+                     + (", re-pinned" if self.c["wazuh"]["pin_agent"] else ""))
+            else:
+                o.warn(f"{tpl}: the agent is NOT at {target}")
+                behind.append(tpl)
+        if behind:
+            raise Fatal(f"the agent did not reach {target} in: {', '.join(behind)}.\n"
+                        f"     wazuh.version is left as it was; fix those templates "
+                        f"and re-run --upgrade-wazuh.")
         # Persist it. Telling the operator to make the same edit by hand was an
         # invitation for the config and the machine to disagree, and the next
         # provisioning run would then re-pin the agents to the old version.
-        if CONF_PATH.exists():
-            try:
-                stored = json.loads(CONF_PATH.read_text())
-            except json.JSONDecodeError:
-                stored = {}
-        else:
-            stored = {}
-        stored.setdefault("wazuh", {})["version"] = target
-        old_umask = os.umask(0o077)
-        try:
-            CONF_PATH.write_text(json.dumps(stored, indent=2) + "\n")
-        finally:
-            os.umask(old_umask)
-        CONF_PATH.chmod(0o600)
+        persist_config({"wazuh": {"version": target}})
         o.say("")
         o.ok(f"wazuh.version set to {target} in {CONF_PATH.name}")
         o.info("commit that change to the provisioning repository — the golden "
@@ -3903,11 +3951,12 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             "host": os.uname().nodename,
             "at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
             "operator": operator,
+            "edition": self.edition,
             "tests": dict(self.tests),
         }, indent=2) + "\n")
         o.ok(f"recorded in {rec}")
         print(f"""
-  {self.c['image_name']} v{self.c['image_version']} on {os.uname().nodename}
+  {self.c['image_name']} v{self.c['image_version']} ({self.edition} edition) on {os.uname().nodename}
   All {self.tests['pass']} acceptance checks passed, {self.tests['warn']} warnings.
   Released by {operator} at {datetime.now():%Y-%m-%d %H:%M}.
 
@@ -3943,6 +3992,12 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if complete < len(wanted):
             print(f"\n  {complete}/{len(wanted)} phases complete — "
                   f"resume with:  sudo {Path(sys.argv[0]).name}")
+
+        if self.edition == "unwired":
+            print(f"\n  Templates only: no credentials, SIEM or maintenance timers "
+                  f"on this edition.\n  Guide: {self.GUIDE_PATH}\n"
+                  f"\n  Template checks:  sudo {Path(sys.argv[0]).name} --verify\n")
+            return 0
 
         print(f"\n{Out.B}  Credentials{Out.RST}")
         rec = self.build_dir / self.ESCROW_RECORD
@@ -4288,9 +4343,11 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             else:
                 self._t("fail", f"phase {n} ({self.PHASES[n - 1]}) not complete — "
                                 "run: sudo golden-image-provision")
-        # The same probes phase 12 uses for templates (groups 4-6), so the two
-        # editions cannot disagree about what "a finished template" means.
+        # Probes taken from phase 12's template groups (4-6), so the two
+        # editions agree about what "a finished template" means.
         k = self.c["kali"]
+        was_running = {t for t in self.t.values()
+                       if not self.args.dry_run and r.vm_exists(t) and r.vm_running(t)}
         for tpl in self.t.values():
             if not (r.vm_exists(tpl) or self.args.dry_run):
                 self._t("fail", f"template {tpl} is missing")
@@ -4298,9 +4355,17 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             self._t("pass", f"template {tpl} exists")
             agent = r.qtest(tpl, "test -d /var/ossec")
             self._t("pass" if agent else "fail",
-                    f"{tpl} carries the (disabled) Wazuh agent" if agent
+                    f"{tpl} carries the Wazuh agent" if agent
                     else f"{tpl} has no /var/ossec — sudo golden-image-provision "
                          "--from-phase 5")
+            # Enabled in a template, every qube cloned from it would report as
+            # one host. It is meant to be installed, and off.
+            if agent:
+                off = r.qtest(tpl, "! systemctl is-enabled --quiet wazuh-agent")
+                self._t("pass" if off else "fail",
+                        f"{tpl}: the agent is disabled in the template" if off
+                        else f"{tpl}: the agent is ENABLED in the template — "
+                             "sudo systemctl disable wazuh-agent there")
             if self.c["prefer_debian"]:
                 deb = r.qtest(tpl, "test -f /etc/debian_version")
                 self._t("pass" if deb else "fail", f"{tpl} is Debian-based")
@@ -4319,14 +4384,16 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             good = r.qtest(self.t["ids"], f"test -x {zp}/bin/zeek")
             self._t("pass" if good else "fail",
                     f"Zeek present at {zp}" if good else f"Zeek binary missing at {zp}")
-        # Each probe started its template; leave them halted, as found.
+        # Each probe started its template: stop the ones that were not
+        # already running, and leave the rest (an update, say) alone.
         for tpl in self.t.values():
-            r.shutdown(tpl)
+            if tpl not in was_running:
+                r.shutdown(tpl)
         o.say("")
         print(f"  {Out.G}{self.tests['pass']} passed{Out.RST}   "
               f"{Out.R}{self.tests['fail']} failed{Out.RST}   "
               f"{Out.Y}{self.tests['warn']} warnings{Out.RST}")
-        return 2 if self.tests["fail"] else 0
+        return self.tests["fail"]
 
     def handover_unwired(self) -> None:
         if self.args.dry_run:
@@ -4378,7 +4445,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
     golden-restore-test.timer      monthly restore verification (dom0)
     golden-staleness.timer         daily "is this image too old" (dom0)
     golden-suricata-update.timer   weekly IPS rules             ({self.q['ids']})
-    golden-key-expiry.timer        monthly signing-key expiry   ({self.q['dpi']})
+    golden-key-expiry.timer        weekly signing-key expiry    ({self.q['dpi']})
     golden-backup.timer            weekly encrypted backup      (dom0)
   Failures raise a banner on the login screen and a line in the journal.
 """)
@@ -4400,26 +4467,36 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                    f"{', '.join(map(str, self.UNWIRED_PHASES))}); nothing is wired")
             if self.args.verify:
                 return self.verify_unwired()
+            if self.args.phase is not None and self.args.phase not in self.UNWIRED_PHASES:
+                # Running a wiring phase here used to rewire the machine (or
+                # write credentials) and then report "nothing wired".
+                raise Fatal(f"phase {self.args.phase} is not part of the unwired "
+                            f"edition. To build the whole design:  sudo "
+                            f"{Path(sys.argv[0]).name} --edition wired")
 
+        wanted = [i for i in range(1, len(self.PHASES) + 1)
+                  if self.edition == "wired" or i in self.UNWIRED_PHASES]
         if self.args.from_phase > 1 and self.args.phase is None and not self.args.verify:
             self._clear_marks_from(self.args.from_phase)
-            o.info(f"resuming: completion marks for phases "
-                   f"{self.args.from_phase}-12 cleared, they will run again")
+            again = [i for i in wanted if i >= self.args.from_phase]
+            o.info("resuming: phases " + (", ".join(map(str, again)) or "none")
+                   + " will run again")
 
         phases: list[Callable] = [
             self.p01, self.p02, self.p03, self.p04, self.p05, self.p06,
             self.p07, self.p08, self.p09, self.p10, self.p11, self.p12,
         ]
-        wanted = [i for i in range(1, len(phases) + 1)
-                  if self.edition == "wired" or i in self.UNWIRED_PHASES]
+        # The meter and the journal describe a provisioning run; --verify and
+        # a single --phase are not one.
+        provisioning = not self.args.verify and self.args.phase is None
         started = time.monotonic()
         for i, fn in enumerate(phases, start=1):
             if self._should_run(i):
-                pos = wanted.index(i) + 1 if i in wanted else None
+                pos = wanted.index(i) + 1 if provisioning and i in wanted else None
                 o.phase(i, self.PHASES[i - 1], pos, len(wanted))
                 fn()
         took = Out._duration(time.monotonic() - started)
-        if not self.args.dry_run:
+        if provisioning and not self.args.dry_run:
             o.journal(f"provisioning run finished in {took} ({self.edition} edition)")
         if self.edition == "unwired":
             self.handover_unwired()
@@ -4447,6 +4524,23 @@ def deep_merge(base: dict, over: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def persist_config(updates: dict) -> None:
+    """Merge `updates` into golden-image.json, keeping it mode 600."""
+    stored: dict = {}
+    if CONF_PATH.exists():
+        try:
+            stored = json.loads(CONF_PATH.read_text())
+        except json.JSONDecodeError:
+            stored = {}
+    stored = deep_merge(stored, updates)
+    old_umask = os.umask(0o077)
+    try:
+        CONF_PATH.write_text(json.dumps(stored, indent=2) + "\n")
+    finally:
+        os.umask(old_umask)
+    CONF_PATH.chmod(0o600)
 
 
 def load_config(write_only: bool = False, dry_run: bool = False) -> dict:
@@ -4560,6 +4654,29 @@ def main() -> int:
     try:
         cfg = load_config(write_only=args.write_config, dry_run=args.dry_run)
         prov = Provisioner(cfg, args)
+
+        if prov.edition == "unwired":
+            wired_only = [flag for flag, on in (
+                ("--handover", args.handover), ("--rotate-credentials", args.rotate_credentials),
+                ("--escrow-credentials", args.escrow_credentials),
+                ("--shred-credentials", args.shred_credentials),
+                ("--case-mode", args.case_mode)) if on]
+            if wired_only:
+                raise Fatal(f"{wired_only[0]}: the unwired edition has no SIEM and "
+                            f"generates no credentials. To build the whole design:\n"
+                            f"     sudo {Path(sys.argv[0]).name} --edition wired")
+        # --edition on a provisioning run changes what this machine IS, so it
+        # is recorded: otherwise --status, --verify, --issue and the weekly
+        # self-check would go on treating a wired machine as unwired.
+        lifecycle = any((args.handover, args.issue, args.status, args.initial_setup,
+                         args.case_mode, args.prepare_backup_media is not None,
+                         args.refresh_repo_keys, args.rotate_credentials,
+                         args.escrow_credentials, args.shred_credentials,
+                         args.upgrade_wazuh, args.verify))
+        if (args.edition and args.edition != cfg.get("edition", "wired")
+                and not lifecycle and not args.dry_run):
+            persist_config({"edition": args.edition})
+            prov.out.ok(f"edition recorded as '{args.edition}' in {CONF_PATH}")
 
         if args.handover:
             return prov.handover_sequence(args.handover)

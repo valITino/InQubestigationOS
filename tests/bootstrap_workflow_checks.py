@@ -85,6 +85,7 @@ def main() -> int:
             flow.stage("onboarding", "complete", "ready")
             for name in bw.EXPORT_ALLOWLIST:
                 mapped = name.replace("InQubestigationOS.iso", "image with space.iso")
+                (x.out_dir / mapped).parent.mkdir(parents=True, exist_ok=True)
                 (x.out_dir / mapped).write_bytes((mapped + "\n").encode())
             iso = x.out_dir / "image with space.iso"
             (x.out_dir / "image with space.iso.sha256").write_text(
