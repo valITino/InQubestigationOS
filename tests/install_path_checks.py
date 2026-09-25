@@ -265,7 +265,28 @@ def main():
         runner = SimpleNamespace(run=lambda *a, **k: "total_memory : 32768\n")
         assert gi.physical_memory_gb(runner) == 32
 
-    print("  48/48 installation-path checks pass")
+        # package-release publishes only a complete, signed set, and never a
+        # part GitHub would reject (2 GiB and up).
+        fatal(lambda: bi.package_release(x), "cannot package a release without")
+        fatal(lambda: bi.package_release(x), "InQubestigationOS.iso.asc")
+        for ed in bi.EDITIONS:
+            eks = bi.edition_kickstart_path(x, ed)
+            eks.parent.mkdir(parents=True, exist_ok=True)
+            eks.write_text("%post\n%end\n")
+            eks.with_name("ks.cfg.asc").write_text("sig")
+        for f in (f"{x.c['iso_name']}.asc", "unit-signing-key.asc",
+                  "FINGERPRINT.txt", "verify-iso.sh", "oem/ks.cfg.asc"):
+            (x.out_dir / f).write_text("fixture")
+        x.c["iso_sign_key"] = "A" * 40
+        x.args.part_size = 2048
+        fatal(lambda: bi.package_release(x), "--part-size")
+        x.args.part_size = None
+        # The download kit's writer must at least be valid bash.
+        mk = Path(td) / "make-usb.sh"
+        mk.write_text(bi.MAKE_USB_SH.replace("@ISO@", "x.iso"))
+        assert subprocess.run(["bash", "-n", str(mk)]).returncode == 0
+
+    print("  51/51 installation-path checks pass")
     return 0
 
 

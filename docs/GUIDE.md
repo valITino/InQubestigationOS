@@ -388,6 +388,7 @@ The settings that matter:
 | `mock_config` | `auto` (default) — derived from the fetched builder for your release |
 | `work_dir` | Somewhere with 100 GB free, or 250 GB for tier 2 |
 | `auto_provision` | `true` — first boot configures itself |
+| `edition` | `wired` (default) — templates plus the whole design, wired and tested. `unwired` — the same templates only; the operator wires them using [WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md). Both editions' kickstarts are always built and signed, so this only picks the default for `oem/ks.cfg` |
 | `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
 
 To transport provisioner settings, create a reviewed JSON file containing only
@@ -548,6 +549,18 @@ Rather than a `dd` line you have to get right at four in the afternoon, this:
 
 With one removable device plugged in, `--device` can be omitted.
 
+**Pick the edition at write time.** One build signs a kickstart for each
+edition under `oem/editions/`, and the ISO is the same for both:
+
+```bash
+./build_iso.py write-usb --device /dev/sdX --edition unwired
+```
+
+Without `--edition` the stick gets `oem/ks.cfg`, the configured `edition`.
+Every install, of either edition, carries
+[WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md) in dom0 at
+`/usr/share/doc/inqubestigationos/`.
+
 Colleagues verify before installing — one command, shipped beside the image:
 
 ```bash
@@ -571,6 +584,36 @@ gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
 > is formatted for exactly that, and `write-usb` reminds you to carry it
 > separately. **This is the one step in the whole guide that must stay manual**:
 > its entire value is that it does not travel with the image.
+
+### Publishing a download (GitHub Releases)
+
+GitHub rejects release files of 2 GiB or more and stores files, not folders.
+`package-release` turns a signed build into files it accepts:
+
+```bash
+./build_iso.py package-release                 # into <work_dir>/release/
+./build_iso.py package-release --to /mnt/big --part-size 1900
+```
+
+It first re-verifies the checksum and every signature, then writes:
+
+- the image split into parts (`InQubestigationOS.iso.part01`, ...), each
+  under 2 GiB;
+- `...-kit.tar.gz`: the whole-image checksum and signature, both editions'
+  signed kickstarts, the verification scripts, and `make-usb.sh`, which joins
+  the parts and runs this script's own `write-usb` checks on the downloader's
+  machine;
+- `unit-signing-key.asc`, `README.txt` (the downloader's instructions; use it as
+  the release notes), and `SHA256SUMS` with its signature `SHA256SUMS.asc`.
+
+Upload every file in that folder as the assets of one release. The kit is built
+from an allowlist: the key backup, `iso-build.json` and anything else in
+`output/` never go into it. **The signing passphrase is never published**:
+downloaders need only the fingerprint, which you give them separately, exactly
+as above. Compression is not used, because an ISO is mostly compressed packages
+already and would barely shrink. Downloaders on Windows can join the parts and
+write a plain Qubes installer, but only `make-usb.sh` on Linux adds the
+`QUBES_OEM` partition that makes the install provision itself.
 
 ---
 

@@ -5975,6 +5975,256 @@ def write_image(x: Ctx, iso: Path, dev_path: str) -> None:
                     f"{proc.returncode}) — see {x.log}")
 
 
+# ===========================================================================
+#  package-release — the image as downloadable release assets
+# ===========================================================================
+#  GitHub caps every release asset at 2 GiB and a release holds files, not
+#  folders. So the image is split into parts below that cap, and everything
+#  else a downloader needs travels as one small tarball: the checksum and
+#  signature of the whole image, both editions' signed kickstarts, the public
+#  key, the verification scripts, and this script to write the stick with the
+#  same checks write-usb runs here. SHA256SUMS covers every asset and is
+#  signed, so the download is authenticated before any of it is run.
+RELEASE_PART_LIMIT_MIB = 2048
+
+
+MAKE_USB_SH = r'''#!/usr/bin/env bash
+# make-usb.sh — write a downloaded InQubestigationOS release to a USB stick.
+#
+# Run it from the folder holding every downloaded release file, AFTER
+# verifying SHA256SUMS (see README.txt). It joins the image parts, then hands
+# over to `build_iso.py write-usb`, which re-checks the image's checksum and
+# signature, refuses a non-removable or mounted device, writes, reads the
+# stick back, and adds the QUBES_OEM partition with the edition's signed
+# kickstart.
+#
+#   ./make-usb.sh --fingerprint <40 hex> [--device /dev/sdX] [--edition wired|unwired]
+set -euo pipefail
+ISO=@ISO@
+FPR="" DEV="" EDITION=wired
+die() { echo "make-usb.sh: $*" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fingerprint) FPR=${2:-}; shift 2 ;;
+        --device)      DEV=${2:-}; shift 2 ;;
+        --edition)     EDITION=${2:-}; shift 2 ;;
+        -h|--help)     sed -n '2,12p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+cd "$(dirname "$(readlink -f "$0")")"
+FPR=$(printf '%s' "$FPR" | tr -d ' ' | tr 'a-f' 'A-F')
+[[ $FPR =~ ^[0-9A-F]{40}$ ]] || die "--fingerprint needs the 40-character key
+    fingerprint you received SEPARATELY from this download (phone, internal page).
+    The one in output/FINGERPRINT.txt came with the download and proves nothing."
+case "$EDITION" in wired|unwired) ;; *) die "--edition is wired or unwired" ;; esac
+for tool in python3 gpg sgdisk blkid; do
+    command -v "$tool" >/dev/null || die "$tool is missing (Debian/Kali: sudo apt install python3 gnupg gdisk dosfstools)"
+done
+command -v mkfs.vfat >/dev/null || die "mkfs.vfat is missing (sudo apt install dosfstools)"
+
+if [ ! -f "output/$ISO" ]; then
+    parts=( "$ISO".part* )
+    [ -e "${parts[0]}" ] || die "no output/$ISO and no $ISO.part* files here"
+    echo "joining ${#parts[@]} parts into output/$ISO ..."
+    if command -v pv >/dev/null; then
+        cat "${parts[@]}" | pv -s "$(stat -c %s "${parts[@]}" | awk '{t+=$1} END {print t}')" \
+            > "output/$ISO.partial"
+    else
+        cat "${parts[@]}" > "output/$ISO.partial"
+    fi
+    mv "output/$ISO.partial" "output/$ISO"
+fi
+
+gpg --batch --quiet --import output/unit-signing-key.asc
+python3 - "$FPR" <<'PY'
+import json, sys
+json.dump({"work_dir": ".", "iso_sign_key": sys.argv[1]},
+          open("iso-build.json", "w"), indent=2)
+PY
+args=(write-usb --edition "$EDITION")
+[ -n "$DEV" ] && args+=(--device "$DEV")
+exec python3 ./build_iso.py "${args[@]}"
+'''
+
+
+def release_readme(x: Ctx, iso_name: str, parts: list[str], kit: str, fpr: str) -> str:
+    first = parts[0] if parts else f"{iso_name}.part01"
+    return f"""\
+{Path(iso_name).stem} — release files
+{'=' * (len(Path(iso_name).stem) + 16)}
+
+Files
+  {kit:<40} scripts, signatures, both editions' kickstarts
+  unit-signing-key.asc                     the public key everything is signed with
+  {first:<40} ...the image, split into {len(parts)} parts (GitHub caps a file at 2 GiB)
+  SHA256SUMS / SHA256SUMS.asc              checksums of every file, signed
+
+Editions (same image; the kickstart decides)
+  wired     the investigator templates AND the full design wired and tested:
+            inspection chain, SIEM, app qubes, policy, backups
+  unwired   the same templates only; you decide the topology. Every install
+            carries /usr/share/doc/inqubestigationos/WORKSTATION-GUIDE.md
+
+1. Authenticate the download (before running anything from it)
+   Get the signing key's fingerprint through a channel you already trust —
+   NOT from this download. It must be:
+       {fpr or '(unsigned build — do not distribute)'}
+
+     gpg --import unit-signing-key.asc
+     gpg --verify SHA256SUMS.asc SHA256SUMS  -> "Good signature", that fingerprint
+     sha256sum -c SHA256SUMS                  -> every line OK
+
+2. Write the stick (Linux; needs python3, gnupg, gdisk, dosfstools)
+     tar xzf {kit}
+     ./make-usb.sh --fingerprint <that fingerprint> --edition wired
+   It joins the parts, re-verifies the image and the kickstart, writes the
+   stick, reads it back, and adds the QUBES_OEM partition the installer
+   reads. Use --device /dev/sdX when more than one stick is plugged in.
+
+   Windows / Rufus / Etcher can write the joined image
+   (copy /b {iso_name}.part01+{iso_name}.part02+... {iso_name}),
+   but only as a PLAIN Qubes installer: without the QUBES_OEM partition
+   nothing is provisioned.
+
+3. Install
+   Boot the stick; the "OEM installation" entry is selected automatically.
+   You choose the disk encryption passphrase during the install; you set
+   the investigator login password at the console on first boot. Neither
+   is part of this download.
+"""
+
+
+def package_release(x: Ctx) -> int:
+    x.phase("release", "package the image as downloadable release files")
+    iso = x.out_dir / x.c["iso_name"]
+    fpr = (x.c.get("iso_sign_key") or "").strip()
+    need = [iso, x.out_dir / f"{iso.name}.sha256", x.out_dir / f"{iso.name}.asc",
+            x.out_dir / "unit-signing-key.asc", x.out_dir / "FINGERPRINT.txt",
+            x.out_dir / "verify-iso.sh", oem_kickstart_path(x),
+            oem_kickstart_signature_path(x)]
+    for ed in EDITIONS:
+        eks = edition_kickstart_path(x, ed)
+        need += [eks, eks.with_name("ks.cfg.asc")]
+    missing = [str(p.relative_to(x.out_dir)) for p in need if not p.is_file()]
+    if missing:
+        raise Fatal("cannot package a release without:\n       "
+                    + "\n       ".join(missing)
+                    + "\n     Build and sign first:  ./build_iso.py iso")
+    if not fpr:
+        raise Fatal("iso_sign_key is empty — a published image must be signed")
+    part_mib = int(getattr(x.args, "part_size", None) or 1900)
+    if not 16 <= part_mib < RELEASE_PART_LIMIT_MIB:
+        raise Fatal(f"--part-size must be 16..{RELEASE_PART_LIMIT_MIB - 1} MiB "
+                    "(GitHub rejects a release file of 2 GiB or more)")
+
+    stamp = f"{datetime.fromtimestamp(iso.stat().st_mtime):%Y%m%d}"
+    name = f"{iso.stem}-{stamp}"
+    dest = Path(getattr(x.args, "to", None) or (x.work / "release")) / name
+    if dest.exists() and any(dest.iterdir()):
+        raise Fatal(f"{dest} already has files in it — remove it or pass --to")
+    if x.args.dry_run:
+        x.info(f"[dry-run] verify, split {iso.name} into {part_mib} MiB parts, "
+               f"write the kit and SHA256SUMS(.asc) into {dest}")
+        return 0
+
+    # 1. Publish only what verifies here: the same checks write-usb makes.
+    want = (x.out_dir / f"{iso.name}.sha256").read_text().split()[0]
+    if sha256_file(iso, "checksum") != want:
+        raise Fatal(f"{iso.name} no longer matches its .sha256 — do not publish it")
+    x.ok("checksum matches the build record")
+    x.info("verifying the image signature (gpg hashes the whole image)")
+    verify_detached_signature(x.out_dir / f"{iso.name}.asc", iso, fpr)
+    x.ok(f"image signature verifies against {fpr}")
+    for p in [oem_kickstart_path(x)] + [edition_kickstart_path(x, e) for e in EDITIONS]:
+        verify_detached_signature(p.with_name("ks.cfg.asc"), p, fpr)
+    x.ok("every kickstart signature verifies")
+
+    # 2. The kit: an allowlist, so nothing else in output/ (let alone the
+    #    key backup beside it) can end up in a public release by accident.
+    dest.mkdir(parents=True)
+    kit_root = dest / ".kit"
+    out = kit_root / "output"
+    (out / "oem").mkdir(parents=True)
+    for f in (f"{iso.name}.sha256", f"{iso.name}.asc", "unit-signing-key.asc",
+              "FINGERPRINT.txt", "verify-iso.sh", "verify-iso.ps1",
+              "BUILD-RECORD.txt"):
+        if (x.out_dir / f).is_file():
+            shutil.copy2(x.out_dir / f, out / f)
+    shutil.copytree(x.out_dir / "oem", out / "oem",
+                    ignore=shutil.ignore_patterns("*.b64", "*~"),
+                    dirs_exist_ok=True)
+    shutil.copy2(Path(__file__).resolve(), kit_root / "build_iso.py")
+    mk = kit_root / "make-usb.sh"
+    mk.write_text(MAKE_USB_SH.replace("@ISO@", shlex.quote(iso.name)))
+    mk.chmod(0o755)
+    kit_name = f"{name}-kit.tar.gz"
+
+    # 3. The parts.
+    size, part_bytes = iso.stat().st_size, part_mib * 1024 * 1024
+    # Zero-padded to the part count, so a shell glob (make-usb.sh) and
+    # `cat *.part*` put part100 after part99, not after part10.
+    digits = max(2, len(str(-(-size // part_bytes))))
+    parts: list[str] = []
+    with iso.open("rb") as src, Progress("splitting", size) as bar:
+        n = 0
+        while True:
+            n += 1
+            pname = f"{iso.name}.part{n:0{digits}d}"
+            written = 0
+            with (dest / pname).open("wb") as dst:
+                while written < part_bytes:
+                    chunk = src.read(min(1 << 22, part_bytes - written))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+                    bar.update(len(chunk))
+            if written == 0:
+                (dest / pname).unlink()
+                break
+            parts.append(pname)
+    x.ok(f"{len(parts)} parts of at most {part_mib} MiB")
+
+    (kit_root / "README.txt").write_text(
+        release_readme(x, iso.name, parts, kit_name, fpr))
+    import tarfile
+    with tarfile.open(dest / kit_name, "w:gz") as tar:
+        for f in sorted(kit_root.rglob("*")):
+            tar.add(f, arcname=str(f.relative_to(kit_root)), recursive=False)
+    shutil.copy2(kit_root / "README.txt", dest / "README.txt")
+    shutil.copy2(x.out_dir / "unit-signing-key.asc", dest / "unit-signing-key.asc")
+    shutil.rmtree(kit_root)
+    x.ok(f"kit: {kit_name}")
+
+    # 4. SHA256SUMS over every asset, signed with the release key.
+    sums = dest / "SHA256SUMS"
+    lines = [f"{sha256_file(dest / f, f[-22:])}  {f}"
+             for f in [kit_name, "README.txt", "unit-signing-key.asc", *parts]]
+    sums.write_text("\n".join(lines) + "\n")
+    x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
+          "--detach-sign", "--armor", "--output", str(dest / "SHA256SUMS.asc"),
+          str(sums))
+    x.ok("SHA256SUMS signed")
+
+    total = sum((dest / f).stat().st_size for f in os.listdir(dest))
+    print(f"""
+{B}{G}══ Release ready{RST}  {dest}  ({human_bytes(total)})
+
+  Upload every file in that folder as the assets of one GitHub release
+  (Releases → Draft a new release → drag them in), or with the GitHub CLI:
+
+    gh release create {stamp} {shlex.quote(str(dest))}/* --title {shlex.quote(name)} \\
+        --notes-file {shlex.quote(str(dest / 'README.txt'))}
+
+  Never upload the key-backup folder or iso-build.json. The signing
+  passphrase stays with you; downloaders need only the fingerprint:
+    {fpr}
+  — given to them through a channel other than the release itself.
+""")
+    return 0
+
+
 def want_digest(x: Ctx) -> str:
     sha = x.out_dir / f"{x.c['iso_name']}.sha256"
     if sha.is_file():
@@ -6089,13 +6339,14 @@ lifecycle
   backup-key       export the signing key, its revocation certificate and public key
   restore-key      import a signing-key backup on another machine
   write-usb        verify the image and write it to removable media
+  package-release  split and sign the image as downloadable release files
   list-kickstarts  show what the fetched Qubes sources offer
 """)
     p.add_argument("action", nargs="?", default="iso",
                    choices=["quickstart", "iso", "templates", "all",
                             "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
-                            "write-usb", "config", "sign",
+                            "write-usb", "package-release", "config", "sign",
                             "backup-key", "restore-key", "bootstrap",
                             "bootstrap-status"],
                    help="what to do (default: iso)")
@@ -6147,8 +6398,14 @@ lifecycle
                    help=f"do not write the {OEM_LABEL} partition; the installer "
                         f"will then find no kickstart and nothing provisions the "
                         f"machine")
-    b = p.add_argument_group("backup-key / restore-key")
-    b.add_argument("--to", metavar="DIR", help="where to write the key backup")
+    r = p.add_argument_group("package-release")
+    r.add_argument("--part-size", type=int, metavar="MIB",
+                   help="size of each image part in MiB (default 1900; "
+                        "GitHub rejects release files of 2 GiB or more)")
+    b = p.add_argument_group("backup-key / restore-key / package-release")
+    b.add_argument("--to", metavar="DIR",
+                   help="where to write the key backup (backup-key) or the "
+                        "release files (package-release)")
     b.add_argument("--from", dest="from_dir", metavar="DIR",
                    help="the key backup to restore from")
     b.add_argument("--passphrase-file", metavar="PATH",
@@ -6264,6 +6521,8 @@ lifecycle
             return restore_key(x)
         if args.action == "write-usb":
             return write_usb(x)
+        if args.action == "package-release":
+            return package_release(x)
 
         if args.action == "list-kickstarts":
             for k in list_kickstarts(x):
