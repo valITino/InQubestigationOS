@@ -6189,7 +6189,7 @@ def signing_key_url(remote: str | None = None) -> str:
 def check_published_fingerprint(x: Ctx, fpr: str) -> str:
     """A release must be checkable against the fingerprint the repository
     publishes. Fills the placeholder on first use; refuses a different key.
-    Returns "filled", "matches" or "absent"."""
+    Returns "filled", "would-fill" (dry run), "matches" or "absent"."""
     published = published_fingerprint()
     if published is None:
         if SIGNING_KEY_PAGE.exists():
@@ -6199,8 +6199,10 @@ def check_published_fingerprint(x: Ctx, fpr: str) -> str:
                "fingerprint to compare against")
         return "absent"
     if published == "":
-        if not x.args.dry_run:
-            publish_fingerprint(fpr)
+        if x.args.dry_run:
+            x.info(f"[dry-run] would record {fpr.upper()} in {SIGNING_KEY_PAGE.name}")
+            return "would-fill"
+        publish_fingerprint(fpr)
         x.ok(f"{SIGNING_KEY_PAGE.name}: fingerprint recorded — commit and push it "
              "BEFORE publishing the release")
         return "filled"
@@ -6236,6 +6238,9 @@ Editions (same image; the kickstart decides)
 1. Authenticate the download (before running anything from it)
    Get the signing key's fingerprint from a source you already trust, NOT
    from this download.{chr(10) + '   It is published at  ' + url if url else ''}
+   Compare it with the "Primary key fingerprint" gpg prints below (a
+   "Subkey fingerprint" may differ; that is normal). A key that signed an
+   older release stays listed there under "Previous keys".
    This release was signed by (compare, do not just copy):
        {fpr or '(unsigned build — do not distribute)'}
 

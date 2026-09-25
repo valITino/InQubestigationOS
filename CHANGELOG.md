@@ -12,7 +12,10 @@
   other key: a new key is a deliberate edit of that page.
 - The release `README.txt` now names the page's GitHub URL, derived from the
   clone's `origin`. It still shows the fingerprint it was signed with, labelled
-  "compare, do not just copy".
+  "compare, do not just copy". It says to compare the *primary* key
+  fingerprint, since a signing subkey shows a different one. Keys that signed
+  older releases stay listed under "Previous keys", so a key rotation does not
+  make old releases look forged.
 - GUIDE §3, README and SIGNING.md point to the new page. `doc_checks` fails
   if the page cannot be parsed.
 

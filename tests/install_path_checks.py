@@ -284,9 +284,13 @@ def main():
         # The repository's SIGNING-KEY.md is what downloaders compare against:
         # its placeholder is filled on first use, a different key is refused.
         page = Path(td) / "SIGNING-KEY.md"
-        page.write_text((ROOT / "SIGNING-KEY.md").read_text())
+        page.write_text("# key\n\n```\nFingerprint:  NOT-YET-PUBLISHED\n```\n")
         assert bi.published_fingerprint(page) == ""
         with mock.patch.object(bi, "SIGNING_KEY_PAGE", page):
+            x.args.dry_run = True
+            assert bi.check_published_fingerprint(x, "a" * 40) == "would-fill"
+            assert bi.published_fingerprint() == ""
+            x.args.dry_run = False
             assert bi.check_published_fingerprint(x, "a" * 40) == "filled"
             assert bi.published_fingerprint() == "A" * 40
             assert "AAAA AAAA AAAA AAAA AAAA  AAAA" in page.read_text()
@@ -311,7 +315,7 @@ def main():
         mk.write_text(bi.MAKE_USB_SH.replace("@ISO@", "x.iso"))
         assert subprocess.run(["bash", "-n", str(mk)]).returncode == 0
 
-    print("  61/61 installation-path checks pass")
+    print("  63/63 installation-path checks pass")
     return 0
 
 
