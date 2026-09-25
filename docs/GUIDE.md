@@ -252,10 +252,10 @@ guided first run that needs none of the above typed by hand, is in
 
 > **The fingerprint travels separately. Always.** A public key on the same stick
 > or download as the image proves nothing: whoever can swap the image can swap
-> the key. Read the fingerprint out over the phone, or publish it somewhere
-> people already trust. `FINGERPRINT.txt` is laid out for that. This is the one
-> step that must stay manual. **The signing passphrase is never shared with
-> anyone.**
+> the key. The fingerprint is published in
+> [SIGNING-KEY.md](../SIGNING-KEY.md) in this repository's root, and every
+> release points there. Name a second place on that page too (an intranet
+> page, the phone). **The signing passphrase is never shared with anyone.**
 
 ### 3.1 From your own build
 
@@ -294,6 +294,18 @@ It writes:
 | `SHA256SUMS`, `SHA256SUMS.asc` | checksums of every file, signed |
 | `README.txt` | the downloader's instructions: paste it as the release notes |
 
+**The first time**, `package-release` also writes your fingerprint into
+[SIGNING-KEY.md](../SIGNING-KEY.md) in the repository root. Commit and push
+that file **before** you publish the release, because the release's README
+tells downloaders to check against it:
+
+```bash
+git add SIGNING-KEY.md && git commit -m "Publish the image signing key fingerprint" && git push
+```
+
+From then on it refuses to package a release signed by any other key. A new
+key is a deliberate edit of that file.
+
 Create **one** release and upload every file in that folder as its assets.
 Nothing secret is in it: the kit is built from an allowlist, so the key backup
 and `iso-build.json` never go in. Signing `SHA256SUMS` asks for your passphrase
@@ -301,8 +313,9 @@ on *your* machine. Downloaders never need it.
 
 ### 3.3 From a downloaded release
 
-On Linux, with `python3`, `gnupg`, `gdisk` and `dosfstools` installed, and the
-fingerprint obtained **separately**:
+On Linux, with `python3`, `gnupg`, `gdisk` and `dosfstools` installed. Take
+the fingerprint from [SIGNING-KEY.md](../SIGNING-KEY.md) in the repository,
+**not** from the download:
 
 ```bash
 # all release files in one folder, then:

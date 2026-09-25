@@ -69,7 +69,8 @@ with what each step does and what to do when one fails, is
   Pick one per stick: `./build_iso.py write-usb --edition unwired`.
 - **Publishing a download.** `./build_iso.py package-release` turns a build into
   GitHub release files, see [GUIDE §3.2](docs/GUIDE.md#32-publish-a-download-github-releases).
-  Downloaders need only your fingerprint, never your passphrase.
+  Downloaders check it against the fingerprint in [SIGNING-KEY.md](SIGNING-KEY.md).
+  Your passphrase is never shared.
 - **Production release.** `./build_iso.py bootstrap` adds a separate key-backup
   medium and a verified export, see [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md).
 
@@ -79,6 +80,7 @@ with what each step does and what to do when one fails, is
 |---|---|
 | Build, install and issue a laptop, start to finish | [docs/GUIDE.md](docs/GUIDE.md) |
 | Wire an unwired machine, or understand the wired layout | [docs/WORKSTATION-GUIDE.md](docs/WORKSTATION-GUIDE.md), also shipped on every laptop |
+| Check a download's signing fingerprint | [SIGNING-KEY.md](SIGNING-KEY.md) |
 | Know what to share about the signing key, and what never to | [docs/SIGNING.md](docs/SIGNING.md) |
 | Run the production `bootstrap` path | [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md) |
 | Set up the trusted CI runner for release candidates | [docs/RELEASE.md](docs/RELEASE.md) |
@@ -100,6 +102,7 @@ InQubestigationOS/
 ├── supply-chain.lock.json     what upstream offered at the last check-upstream
 ├── requirements-dev.txt       lint and test tools for contributors and CI only
 ├── CHANGELOG.md               what changed in each version
+├── SIGNING-KEY.md             the published fingerprint every release is checked against
 ├── docs/
 │   ├── GUIDE.md               the guide: build host to issued laptop
 │   ├── WORKSTATION-GUIDE.md   the wired design and best practice (shipped in dom0)

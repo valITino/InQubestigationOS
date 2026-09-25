@@ -42,7 +42,7 @@ from typing import Callable
 # ===========================================================================
 DEFAULT_CONFIG: dict = {
     "image_name": "InQubestigationOS",
-    "image_version": "2.7",
+    "image_version": "2.8",
     "expect_qubes_release": "4.3",
 
     # Which edition this machine is.

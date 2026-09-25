@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8 — 2026-09-25
+
+**Added**
+
+- **`SIGNING-KEY.md` in the repository root**: the one place a release's
+  signing fingerprint is published. Downloaders compare against it, never
+  against the key inside the download.
+- `package-release` fills in its placeholder the first time and says to commit
+  and push it before publishing. After that it refuses a release signed by any
+  other key: a new key is a deliberate edit of that page.
+- The release `README.txt` now names the page's GitHub URL, derived from the
+  clone's `origin`. It still shows the fingerprint it was signed with, labelled
+  "compare, do not just copy".
+- GUIDE §3, README and SIGNING.md point to the new page. `doc_checks` fails
+  if the page cannot be parsed.
+
 ## 2.7 — 2026-09-25
 
 Documentation restructured for readability. No behaviour change.

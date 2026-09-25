@@ -6138,7 +6138,84 @@ exec python3 ./build_iso.py "${args[@]}"
 '''
 
 
-def release_readme(iso_name: str, parts: list[str], kit: str, fpr: str) -> str:
+SIGNING_KEY_PAGE = Path(__file__).resolve().parent / "SIGNING-KEY.md"
+FPR_PLACEHOLDER = "NOT-YET-PUBLISHED"
+_FPR_LINE = re.compile(r"^(Fingerprint:[ \t]*)(.*)$", re.M)
+
+
+def published_fingerprint(page: Path | None = None) -> str | None:
+    """The fingerprint the repository publishes in SIGNING-KEY.md: 40 hex
+    characters, "" while it still holds the placeholder, None if the page or
+    its fingerprint line is missing or unreadable."""
+    try:
+        m = _FPR_LINE.search((page or SIGNING_KEY_PAGE).read_text())
+    except OSError:
+        return None
+    if not m:
+        return None
+    value = m.group(2).strip()
+    if value == FPR_PLACEHOLDER:
+        return ""
+    compact = value.replace(" ", "").upper()
+    return compact if re.fullmatch(r"[0-9A-F]{40}", compact) else None
+
+
+def publish_fingerprint(fpr: str, page: Path | None = None) -> None:
+    """Fill the placeholder in SIGNING-KEY.md, grouped the way gpg prints it."""
+    g = [fpr.upper()[i:i + 4] for i in range(0, 40, 4)]
+    grouped = " ".join(g[:5]) + "  " + " ".join(g[5:])
+    page = page or SIGNING_KEY_PAGE
+    text = page.read_text()
+    page.write_text(_FPR_LINE.sub(lambda m: m.group(1) + grouped, text, count=1))
+
+
+def signing_key_url(remote: str | None = None) -> str:
+    """Where SIGNING-KEY.md can be read on GitHub, from the clone's origin
+    (https or ssh form). Empty when that is not a GitHub remote."""
+    if remote is None:
+        try:
+            remote = subprocess.run(
+                ["git", "-C", str(SIGNING_KEY_PAGE.parent), "remote", "get-url",
+                 "origin"], capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    m = re.match(r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                 r"([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", (remote or "").strip())
+    if not m:
+        return ""
+    return f"https://github.com/{m.group(1)}/{m.group(2)}/blob/HEAD/SIGNING-KEY.md"
+
+
+def check_published_fingerprint(x: Ctx, fpr: str) -> str:
+    """A release must be checkable against the fingerprint the repository
+    publishes. Fills the placeholder on first use; refuses a different key.
+    Returns "filled", "matches" or "absent"."""
+    published = published_fingerprint()
+    if published is None:
+        if SIGNING_KEY_PAGE.exists():
+            raise Fatal(f"{SIGNING_KEY_PAGE.name} has no readable 'Fingerprint:' line.\n"
+                        f"     Restore it from git, or set it to {FPR_PLACEHOLDER}.")
+        x.warn(f"{SIGNING_KEY_PAGE.name} is missing: downloaders have no published "
+               "fingerprint to compare against")
+        return "absent"
+    if published == "":
+        if not x.args.dry_run:
+            publish_fingerprint(fpr)
+        x.ok(f"{SIGNING_KEY_PAGE.name}: fingerprint recorded — commit and push it "
+             "BEFORE publishing the release")
+        return "filled"
+    if published != fpr.upper():
+        raise Fatal(f"{SIGNING_KEY_PAGE.name} publishes {published},\n"
+                    f"     but this release is signed by {fpr.upper()}.\n"
+                    "     Downloaders would reject it. If the key really changed,\n"
+                    f"     edit {SIGNING_KEY_PAGE.name} by hand (see its 'If the key "
+                    "changes' section).")
+    x.ok(f"{SIGNING_KEY_PAGE.name} publishes this key")
+    return "matches"
+
+
+def release_readme(iso_name: str, parts: list[str], kit: str, fpr: str,
+                   url: str = "") -> str:
     first = parts[0] if parts else f"{iso_name}.part01"
     return f"""\
 {Path(iso_name).stem} — release files
@@ -6157,8 +6234,9 @@ Editions (same image; the kickstart decides)
             carries /usr/share/doc/inqubestigationos/WORKSTATION-GUIDE.md
 
 1. Authenticate the download (before running anything from it)
-   Get the signing key's fingerprint through a channel you already trust —
-   NOT from this download. It must be:
+   Get the signing key's fingerprint from a source you already trust, NOT
+   from this download.{chr(10) + '   It is published at  ' + url if url else ''}
+   This release was signed by (compare, do not just copy):
        {fpr or '(unsigned build — do not distribute)'}
 
      gpg --import unit-signing-key.asc
@@ -6214,6 +6292,7 @@ def package_release(x: Ctx) -> int:
     if dest.exists() and any(dest.iterdir()):
         raise Fatal(f"{dest} already has files in it — remove it or pass --to")
     if x.args.dry_run:
+        check_published_fingerprint(x, fpr)
         x.info(f"[dry-run] verify, split {iso.name} into {part_mib} MiB parts, "
                f"write the kit and SHA256SUMS(.asc) into {dest}")
         return 0
@@ -6241,6 +6320,8 @@ def package_release(x: Ctx) -> int:
         raise Fatal(f"output/unit-signing-key.asc does not contain {fpr}.\n"
                     f"     Re-export it:  ./build_iso.py sign")
     x.ok("unit-signing-key.asc is the release key")
+    published = check_published_fingerprint(x, fpr)
+    url = signing_key_url()
 
     # 2. The kit: an allowlist, so nothing else in output/ (let alone the
     #    key backup beside it) can end up in a public release by accident.
@@ -6291,7 +6372,7 @@ def package_release(x: Ctx) -> int:
     x.ok(f"{len(parts)} parts of at most {part_mib} MiB")
 
     (kit_root / "README.txt").write_text(
-        release_readme(iso.name, parts, kit_name, fpr))
+        release_readme(iso.name, parts, kit_name, fpr, url))
     import tarfile
     with tarfile.open(dest / kit_name, "w:gz") as tar:
         for f in sorted(kit_root.rglob("*")):
@@ -6324,8 +6405,13 @@ def package_release(x: Ctx) -> int:
   Never upload the key-backup folder or iso-build.json. The signing
   passphrase stays with you; downloaders need only the fingerprint:
     {fpr}
-  — given to them through a channel other than the release itself.
+  — published in {SIGNING_KEY_PAGE.name}{' (' + url + ')' if url else ''}.
 """)
+    if published == "filled":
+        x.warn(f"{SIGNING_KEY_PAGE.name} now holds this fingerprint. Commit and push it "
+               "before you publish the release:")
+        x.warn(f"  git add {SIGNING_KEY_PAGE.name} && git commit -m 'Publish the image "
+               "signing key fingerprint' && git push")
     return 0
 
 
