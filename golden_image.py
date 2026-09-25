@@ -189,8 +189,9 @@ DEFAULT_CONFIG: dict = {
         "port_events": 1514,
         "port_enroll": 1515,
         # The two vendor scripts phase 8 runs as root inside wazuh-srv. Pinned
-        # by checksum, confirmed 2026-09-08 for the 4.14 series; blank disables
-        # the check and says so. check-upstream reports drift.
+        # by checksum for the 4.14 series: the certs tool confirmed 2026-09-08,
+        # the passwords tool re-reviewed and re-pinned 2026-09-25 (4.14.8).
+        # Blank disables the check and says so. check-upstream reports drift.
         "certs_tool_sha256": "8c93ed36d7b956a6e97a906aed6b6bc636d7cb55a15a41fd6e9c2aa825164216",
         "passwords_tool_sha256": "ef4f8900f93ee40f9d7b6ee066535fb30044df643fe3ceb703a300d710b11d92",
         "mem": 4096, "maxmem": 8192, "vcpus": 2, "root_gb": 60,
