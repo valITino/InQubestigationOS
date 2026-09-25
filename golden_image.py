@@ -2162,6 +2162,15 @@ WantedBy=multi-user.target
             # operator a three-line instruction.
             o.info("the Wazuh stack is not in this qube (Tier 1) — installing it "
                    "from the configured repository")
+            # This qube is a clone of tpl-wazuh, which phase 5 gave a held
+            # wazuh-agent like every template. The vendor packages declare
+            # wazuh-manager and wazuh-agent as conflicting, and apt refuses to
+            # remove a held package, so the install below would fail every
+            # time. The manager monitors its own host; the agent goes.
+            r.qrun(q["wazuh"], "export DEBIAN_FRONTEND=noninteractive; "
+                               "if dpkg -s wazuh-agent >/dev/null 2>&1; then "
+                               "apt-mark unhold wazuh-agent && "
+                               "apt-get purge -y wazuh-agent; fi")
             r.qrun(q["wazuh"], "export DEBIAN_FRONTEND=noninteractive; "
                                "apt-get update && apt-get install -y "
                                f"wazuh-indexer={shlex.quote(w['version'])}-1 "

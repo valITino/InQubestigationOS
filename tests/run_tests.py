@@ -292,6 +292,14 @@ def main() -> int:
     def qrun_in(vm, needle):
         return lambda a: a["kind"] == "qrun" and a["vm"] == vm and needle in a["script"]
 
+    # wazuh-srv is cloned from tpl-wazuh, which carries a held wazuh-agent;
+    # wazuh-manager conflicts with it, so the agent must go first.
+    purge = first(qrun_in("wazuh-srv", "apt-get purge -y wazuh-agent"))
+    mgr = first(qrun_in("wazuh-srv", "wazuh-manager="))
+    stage("wazuh-srv drops the conflicting, held agent before installing the manager",
+          purge is not None and mgr is not None and purge < mgr,
+          f"purge at {purge}, manager install at {mgr}")
+
     last_install = last(qrun_in("tpl-proxy", "apt-get install"))
     first_chain = first(qrun_in("sys-proxy", ""))
     committed = next((i for i, a in enumerate(actions) if shutdown_of("tpl-proxy")(a)

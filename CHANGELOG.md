@@ -16,6 +16,18 @@
 - GUIDE §3, README and SIGNING.md point to the new page. `doc_checks` fails
   if the page cannot be parsed.
 
+**Fixed**
+
+- **Wired first boot would have stopped at phase 8.** Phase 5 gives every
+  template, `tpl-wazuh` included, a held `wazuh-agent`, and `wazuh-srv` is
+  cloned from `tpl-wazuh`. Wazuh's own packages declare `wazuh-manager` and
+  `wazuh-agent` as conflicting (checked in the 4.14.8 apt index), and apt will
+  not remove a held package, so installing the manager failed with a misleading
+  "needs network" error. Phase 8 now unholds and purges the agent in `wazuh-srv`
+  first. The manager monitors its own host. The stub cannot model apt
+  conflicts, so the harness asserts the order instead, and that stage fails
+  without the fix.
+
 ## 2.7 — 2026-09-25
 
 Documentation restructured for readability. No behaviour change.
