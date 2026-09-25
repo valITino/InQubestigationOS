@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.6 — 2026-09-25
+
+**Changed**
+
+- Wazuh pinned to **4.14.8** (was 4.14.7), resolving both `check-upstream`
+  warnings from 2.5. The new `wazuh-passwords-tool.sh` was reviewed against
+  wazuh-installation-assistant v4.14.7→v4.14.8 before its checksum was
+  re-pinned: it only adds retries around the API user lookup and waits for
+  services to come back active after a restart, with no new network endpoints.
+  `wazuh-certs-tool.sh` is unchanged. `supply-chain.lock.json` updated.
+
 ## 2.5 — 2026-09-25
 
 The first **real build** — `quickstart --usb` on Kali Linux rolling in a

@@ -240,7 +240,7 @@ DEFAULT_CONFIG: dict = {
     "wazuh": {
         # Kept in step with golden_image.py's wazuh.version by tests/doc_checks.py;
         # 'check-upstream' compares it against the current upstream release.
-        "version": "4.14.7",
+        "version": "4.14.8",
         "key_url": "https://packages.wazuh.com/key/GPG-KEY-WAZUH",
         # Wazuh.com (Wazuh Signing Key) <support@wazuh.com>, rsa4096.
         "key_fpr": "0DCFCA5547B19D2A6099506096B3EE5F29111145",
@@ -1381,7 +1381,7 @@ def gen_component(x: Ctx):
     (comp / ".qubesbuilder").write_text("")
 
     k, z, w = x.c["kali"], x.c["zeek"], x.c["wazuh"]
-    # e.g. "4.14" from "4.14.7" — the vendor publishes tooling per series.
+    # e.g. "4.14" from "4.14.8" — the vendor publishes tooling per series.
     # Derived from wazuh.version, which IS a documented config key and which
     # 'check-upstream' compares against the repository. The old code read a
     # "wazuh_version" key that appeared in no DEFAULT_CONFIG, so --write-config
