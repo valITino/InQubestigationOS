@@ -38,7 +38,7 @@ builds the same templates and leaves the wiring to you.
 | **Five-hop inspected chain** | `qube → sys-proxy → sys-ids → sys-dpi → sys-firewall → sys-net` — no clearnet qube can bypass it |
 | **Separate Tor branch** | Joins at the firewall; never inspected, never logged against your identity |
 | **Forced DNS** | All clearnet DNS captured and sent to Quad9 over TLS; Whonix exempt by design |
-| **SIEM in every compartment** | Wazuh agent in all nine templates in service, version-held, per-qube identity |
+| **SIEM in every compartment** | Wazuh agent in every template in service (the SIEM's own carries the manager), version-held, per-qube identity |
 | **Investigator tooling** | Kali + Maltego, LibreOffice, Suricata, Zeek, Squid — built on the target at first boot (`tier=1`, the default), or baked into the ISO with `tier=2` |
 | **Weekly encrypted backups** | Profile-mode `qvm-backup` on a timer, with a monthly archive integrity check |
 | **Acceptance tests** | Fourteen groups, re-runnable, that prove the design is actually in force |

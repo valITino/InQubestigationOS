@@ -1274,6 +1274,14 @@ prepareChroot
 mount --bind /dev "${INSTALL_DIR}/dev"
 """
 
+AGENT_INSTALL = """aptInstall wazuh-agent
+chroot_cmd systemctl disable wazuh-agent || true
+chroot_cmd bash -c "echo 'wazuh-agent hold' | dpkg --set-selections"
+"""
+MANAGER_NOTE = """# No agent here: this template carries wazuh-manager, which conflicts with it.
+"""
+MANAGER_FLAVORS = {"investigator-wazuh"}
+
 HOOK_FOOTER = """
 #### '----------------------------------------------------------------------
 info ' Wazuh agent — installed, DISABLED, and version-held'
@@ -1535,11 +1543,16 @@ uninstallQubesRepo
     footer = (HOOK_FOOTER.replace("@WAZUH_KEY@", w["key_url"])
                          .replace("@WAZUH_KEY_FPR@", w["key_fpr"])
                          .replace("@WAZUH_REPO@", w["apt_repo_line"]))
+    # investigator-wazuh carries the manager, which the vendor packages declare
+    # as conflicting with the agent, and it is held: installing the agent after
+    # it would fail the whole template build. The manager watches its own host.
+    manager_footer = footer.replace(AGENT_INSTALL, MANAGER_NOTE)
     for flavor, body in bodies.items():
         d = comp / flavor
         d.mkdir(exist_ok=True)
         hook = d / "04_install_qubes_post.sh"
-        hook.write_text(HOOK_HEADER + body + footer)
+        hook.write_text(HOOK_HEADER + body
+                        + (manager_footer if flavor in MANAGER_FLAVORS else footer))
         hook.chmod(0o755)
 
         m = comp / f"appmenus_{dist}_{flavor}"

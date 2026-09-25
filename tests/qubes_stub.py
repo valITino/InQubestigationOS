@@ -90,8 +90,9 @@ def answer(w: dict, name: str, script: str) -> int:
     if "test -d /var/ossec" in script:
         here = vm(w, name)
         tpl = here.get("prefs", {}).get("template", "")
-        if "wazuh-agent" in here.get("pkgs", []) or (
-                tpl and "wazuh-agent" in vm(w, tpl).get("pkgs", [])):
+        # wazuh-manager lays out /var/ossec too (a Tier 2 tpl-wazuh).
+        mine = set(here.get("pkgs", [])) | (set(vm(w, tpl).get("pkgs", [])) if tpl else set())
+        if mine & {"wazuh-agent", "wazuh-manager"}:
             return 0
     for rule in w.get("qtest", []):
         if rule.get("vm") not in (None, name):
@@ -146,6 +147,11 @@ def cmd_qvm_run(w: dict, argv: list[str]) -> int:
                 print(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {path}")
                 return 0
             return 1
+        # The installed version of a package the fake qube carries, for the
+        # read-backs --upgrade-wazuh makes after it upgrades something.
+        m = re.search(r"dpkg-query -W -f='\$\{Version\}' (?P<pkg>[a-z0-9.+-]+)", inner)
+        if m and m.group("pkg") in vm(w, name).get("pkgs", []):
+            print(w.get("pkg_version", "0.0.0-1"), end="")
         record("qvm-run-passio", vm=name, cmd=inner, stdin_bytes=len(data))
         return 0
 

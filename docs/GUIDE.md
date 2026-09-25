@@ -306,6 +306,16 @@ git add SIGNING-KEY.md && git commit -m "Publish the image signing key fingerpri
 From then on it refuses to package a release signed by any other key. A new
 key is a deliberate edit of that file.
 
+Also publish the key somewhere outside GitHub, so that one compromised account
+cannot change every copy. keys.openpgp.org is free and takes one command. It
+then emails the address in the key once to confirm it:
+
+```bash
+gpg --keyserver hkps://keys.openpgp.org --send-keys <your fingerprint>
+```
+
+Then list it under "Also published at" in `SIGNING-KEY.md`.
+
 Create **one** release and upload every file in that folder as its assets.
 Nothing secret is in it: the kit is built from an allowlist, so the key backup
 and `iso-build.json` never go in. Signing `SHA256SUMS` asks for your passphrase
@@ -702,13 +712,20 @@ Two sets of names exist, and they are not a contradiction:
 - **`investigator-*`**: tier 2 only. The build host builds them into the image
   (`investigator-kali`, `investigator-office`, `investigator-ids`,
   `investigator-proxy`, `investigator-wazuh`). When they are present, phase 3
-  clones `tpl-kali`, `tpl-personal`, `tpl-ids` and `tpl-proxy` from them
-  instead, and phase 4 skips what they already contain. That is what saves
-  hours at first boot.
+  clones `tpl-kali`, `tpl-personal`, `tpl-ids`, `tpl-proxy` and `tpl-wazuh`
+  from them instead, and phase 4 skips what they already contain. That is what
+  saves hours at first boot. The SIEM itself (indexer, manager, dashboard)
+  then comes from the image, with no download.
 
 Every template carries the Wazuh agent **installed but disabled**. A template
 is shared: an enabled agent would report during updates, and every qube cloned
 from it would share one identity. Phase 11 enables it per qube.
+
+The one exception is the SIEM. Wazuh's packages do not allow the manager and
+the agent on the same system, and the manager watches its own host. So
+`investigator-wazuh`, and a tier 2 `tpl-wazuh` cloned from it, carry the
+manager instead of the agent. At tier 1, `wazuh-srv` removes the agent it
+inherited from `tpl-wazuh` before it installs the manager.
 
 ### `./build_iso.py templates` (tier 2)
 

@@ -122,6 +122,9 @@ DEFAULT_CONFIG: dict = {
         "personal": "investigator-office",
         "ids": "investigator-ids",
         "proxy": "investigator-proxy",
+        # Carries the manager, indexer and dashboard instead of the agent: the
+        # vendor packages conflict, and wazuh-srv is cloned from tpl-wazuh.
+        "wazuh": "investigator-wazuh",
     },
 
     # --- supply chain, verified 2026-09-01 against vendor primary sources ---
@@ -1048,6 +1051,8 @@ an escrow record that no longer matches.
     #  tpl-kali could be a plain Debian clone from an earlier run while the
     #  prebuilt template sat beside it untouched, and phase 4 would then skip
     #  the payload install and leave a Kali qube with no Kali in it.
+    WAZUH_STACK = "wazuh-manager wazuh-indexer wazuh-dashboard"
+
     PAYLOAD_PROBE = {
         "kali": "test -f /etc/apt/sources.list.d/kali.list && command -v maltego",
         "personal": "command -v libreoffice",
@@ -1345,6 +1350,12 @@ an escrow record that no longer matches.
 
         for tpl in deb_tpls:
             if not r.vm_exists(tpl):
+                continue
+            if r.qtest(tpl, "dpkg -s wazuh-manager >/dev/null 2>&1", dry_default=False):
+                # A Tier 2 tpl-wazuh carries the SIEM stack. wazuh-manager and
+                # wazuh-agent conflict, and the manager watches its own host.
+                o.skip(f"{tpl} — carries the Wazuh manager (Tier 2); the agent "
+                       "conflicts with it")
                 continue
             if r.qtest(tpl, "test -d /var/ossec", dry_default=False):
                 o.skip(f"{tpl} — agent already present (Tier 2)")
@@ -3148,8 +3159,12 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             # Once, not twice: each qtest is a qvm-run round trip that starts a
             # halted template, and two independent calls could disagree.
             has_agent = r.qtest(tpl, "test -d /var/ossec")
+            what = "the agent"
+            if has_agent and tpl == self.t["wazuh"] and r.qtest(
+                    tpl, "dpkg -s wazuh-manager >/dev/null 2>&1"):
+                what = "the Wazuh manager (Tier 2)"
             self._t("pass" if has_agent else "fail",
-                    f"{tpl} carries the agent" if has_agent
+                    f"{tpl} carries {what}" if has_agent
                     else f"{tpl} has no /var/ossec")
 
         if self.c["prefer_debian"]:
@@ -3796,11 +3811,17 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
                             "upgraded")
         elif r.vm_exists(q["wazuh"]):
             r.ensure_running(q["wazuh"])
+            # A Tier 2 stack arrives version-held from its template; apt will
+            # not move a held package, and the version read back below would
+            # then report the OLD manager as upgraded.
             r.qrun(q["wazuh"], "export DEBIAN_FRONTEND=noninteractive; "
+                               f"apt-mark unhold {self.WAZUH_STACK} >/dev/null 2>&1; "
                                "sed -i 's|^#deb |deb |' "
                                "/etc/apt/sources.list.d/wazuh.list; "
                                "apt-get update && apt-get install -y "
-                               "wazuh-manager wazuh-indexer wazuh-dashboard")
+                               f"{self.WAZUH_STACK}")
+            if w["pin_agent"]:
+                r.qrun(q["wazuh"], f"apt-mark hold {self.WAZUH_STACK}", check=False)
             ver = r.run("qvm-run", "--no-gui", "--pass-io", "-u", "root", q["wazuh"],
                         "dpkg-query -W -f='${Version}' wazuh-manager",
                         check=False, capture=True).strip().split("-")[0]
@@ -3818,6 +3839,26 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             if not r.vm_exists(tpl):
                 continue
             r.ensure_running(tpl)
+            if r.qtest(tpl, "dpkg -s wazuh-manager >/dev/null 2>&1"):
+                # A Tier 2 tpl-wazuh: the stack, not an agent (they conflict).
+                # Upgraded to the same version, so a wazuh-srv re-created from it
+                # matches the one just upgraded.
+                pkgs = " ".join(f"{p}={shlex.quote(target)}-1"
+                                for p in self.WAZUH_STACK.split())
+                r.qrun(tpl, "export DEBIAN_FRONTEND=noninteractive; "
+                            f"apt-mark unhold {self.WAZUH_STACK} >/dev/null 2>&1; "
+                            "sed -i 's|^#deb |deb |' /etc/apt/sources.list.d/wazuh.list && "
+                            f"apt-get update && apt-get install -y {pkgs}; "
+                            f"apt-mark hold {self.WAZUH_STACK}; "
+                            "sed -i 's|^deb |#deb |' /etc/apt/sources.list.d/wazuh.list",
+                       check=False)
+                if r.qtest(tpl, "dpkg-query -W -f='${Version}' wazuh-manager | "
+                                f"grep -q {shlex.quote('^' + target + '-')}"):
+                    o.ok(f"{tpl}: manager stack at {target}")
+                else:
+                    o.warn(f"{tpl}: the manager stack is NOT at {target}")
+                    behind.append(tpl)
+                continue
             r.qrun(tpl, "export DEBIAN_FRONTEND=noninteractive; "
                         "echo 'wazuh-agent install' | dpkg --set-selections && "
                         "sed -i 's|^#deb |deb |' /etc/apt/sources.list.d/wazuh.list && "

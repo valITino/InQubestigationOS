@@ -584,6 +584,62 @@ def main() -> int:
           and json.loads((usand / "golden-image.json").read_text()).get("edition") == "wired",
           f"rc={pd.returncode} " + pd.stderr[-300:])
 
+    # ------------------------------------------------------------------
+    # Tier 2: the investigator-* templates are already installed from the
+    # ISO. investigator-wazuh carries the manager stack, which conflicts with
+    # the agent; first boot must clone tpl-wazuh from it and never try to add
+    # an agent there, and wazuh-srv must use the baked stack.
+    print("\ntier 2 (prebuilt templates)")
+    twork = work / "tier2"
+    tsand = twork / "repo"
+    tsand.mkdir(parents=True)
+    shutil.copy2(ROOT / "golden_image.py", tsand / "golden_image.py")
+    tgi = tsand / "golden_image.py"
+    build_world(twork / "world.json")
+    tw = json.loads((twork / "world.json").read_text())
+    stack = ["wazuh-manager", "wazuh-indexer", "wazuh-dashboard"]
+    for name, pkgs in (("investigator-kali", ["wazuh-agent"]),
+                       ("investigator-office", ["wazuh-agent"]),
+                       ("investigator-ids", ["wazuh-agent"]),
+                       ("investigator-proxy", ["wazuh-agent"]),
+                       ("investigator-wazuh", stack)):
+        tw["vms"][name] = {"prefs": {"netvm": "", "label": "black"}, "running": False,
+                           "class": "TemplateVM", "pkgs": list(pkgs)}
+    tw["pkg_version"] = "4.14.8-1"
+    (twork / "world.json").write_text(json.dumps(tw, indent=2) + "\n")
+    tenv = make_env(twork)
+    pt = run(tgi, [], tenv, tsand)
+    stage("tier 2: the run completes", pt.returncode in (0, 2),
+          f"rc={pt.returncode} " + pt.stderr[-400:])
+    tacts = [json.loads(line) for line in
+             (twork / "actions.jsonl").read_text().splitlines() if line.strip()]
+    clone = [a["argv"] for a in tacts if a["kind"] == "exec" and a["prog"] == "qvm-clone"
+             and "tpl-wazuh" in a["argv"]]
+    stage("tier 2: tpl-wazuh is cloned from investigator-wazuh",
+          bool(clone) and "investigator-wazuh" in clone[0], str(clone))
+    agent_in_wazuh = [a["script"] for a in tacts if a["kind"] == "qrun"
+                      and a["vm"] == "tpl-wazuh" and "wazuh-agent" in a["script"]]
+    stage("tier 2: no agent is installed next to the manager in tpl-wazuh",
+          not agent_in_wazuh, "; ".join(agent_in_wazuh)[:300])
+    srv = [a["script"] for a in tacts if a["kind"] == "qrun" and a["vm"] == "wazuh-srv"]
+    stage("tier 2: wazuh-srv uses the baked stack (no download, no agent purge)",
+          srv and not any("wazuh-manager=" in s or "purge -y wazuh-agent" in s for s in srv),
+          "; ".join(s for s in srv if "wazuh-manager" in s)[:300])
+    (twork / "actions.jsonl").write_text("")
+    pu2 = run(tgi, ["--upgrade-wazuh"], tenv, tsand)
+    uacts2 = [json.loads(line) for line in
+              (twork / "actions.jsonl").read_text().splitlines() if line.strip()]
+    tw_up = [a["script"] for a in uacts2 if a["kind"] == "qrun" and a["vm"] == "tpl-wazuh"]
+    stage("tier 2: --upgrade-wazuh upgrades tpl-wazuh's manager stack, not an agent",
+          pu2.returncode == 0
+          and any("wazuh-manager=4.14.8-1" in s for s in tw_up)
+          and not any("wazuh-agent=" in s for s in tw_up),
+          f"rc={pu2.returncode} " + pu2.stderr[-300:] + " | " + "; ".join(tw_up)[:300])
+    srv_up = [a["script"] for a in uacts2 if a["kind"] == "qrun" and a["vm"] == "wazuh-srv"]
+    stage("tier 2: --upgrade-wazuh releases the stack's holds before upgrading it",
+          any("apt-mark unhold wazuh-manager" in s and "apt-get install" in s
+              for s in srv_up), "; ".join(srv_up)[:300])
+
     print("\ngenerated configuration")
     p4 = subprocess.run([sys.executable, str(TESTS / "static_checks.py"),
                          str(work / "capture")], capture_output=True, text=True)

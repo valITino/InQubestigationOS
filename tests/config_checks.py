@@ -109,7 +109,8 @@ EXPECTED_UNREAD = {
         "qube.usb", "qube.whonix", "qube.wazuh", "qube.kali_clear",
         "qube.kali_tor", "qube.dvm_offline",                    # read via self.q
         "prebuilt_templates.kali", "prebuilt_templates.personal",
-        "prebuilt_templates.ids", "prebuilt_templates.proxy",   # read via pre[key]
+        "prebuilt_templates.ids", "prebuilt_templates.proxy",
+        "prebuilt_templates.wazuh",                             # read via pre[key]
         "wazuh.central_address",                                # central mode only
         # read as w.get(key) with key from a loop over (tool, key) pairs
         "wazuh.certs_tool_sha256", "wazuh.passwords_tool_sha256",
