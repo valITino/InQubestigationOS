@@ -281,12 +281,48 @@ def main():
         x.args.part_size = 2048
         fatal(lambda: bi.package_release(x), "--part-size")
         x.args.part_size = None
+        # The repository's SIGNING-KEY.md is what downloaders compare against:
+        # its placeholder is filled on first use, a different key is refused.
+        page = Path(td) / "SIGNING-KEY.md"
+        page.write_text("# key\n\n```\nFingerprint:  NOT-YET-PUBLISHED\n```\n")
+        assert bi.published_fingerprint(page) == ""
+        with mock.patch.object(bi, "SIGNING_KEY_PAGE", page):
+            x.args.dry_run = True
+            assert bi.check_published_fingerprint(x, "a" * 40) == "would-fill"
+            assert bi.published_fingerprint() == ""
+            x.args.dry_run = False
+            assert bi.check_published_fingerprint(x, "a" * 40) == "filled"
+            assert bi.published_fingerprint() == "A" * 40
+            assert "AAAA AAAA AAAA AAAA AAAA  AAAA" in page.read_text()
+            assert bi.check_published_fingerprint(x, "A" * 40) == "matches"
+            fatal(lambda: bi.check_published_fingerprint(x, "B" * 40),
+                  "publishes " + "A" * 40)
+            page.write_text("no fingerprint line\n")
+            fatal(lambda: bi.check_published_fingerprint(x, "A" * 40),
+                  "no readable 'Fingerprint:' line")
+            page.unlink()
+            assert bi.check_published_fingerprint(x, "A" * 40) == "absent"
+        # A signing subkey resolves to its primary key; that is what gpg shows
+        # downloaders as "Primary key fingerprint", so that is what is published.
+        colons = ("pub:u:4096:1:AAAA:1::::::scESC:\nfpr:::::::::" + "P" * 40 + ":\n"
+                  "sub:u:4096:1:BBBB:1::::::s:\nfpr:::::::::" + "S" * 40 + ":\n")
+        assert bi.primary_fingerprint(colons, "s" * 40) == "P" * 40
+        assert bi.primary_fingerprint(colons, "P" * 40) == "P" * 40
+        assert bi.primary_fingerprint(colons, "C" * 40) == ""
+        for remote, want in (
+                ("https://github.com/o/r.git", "https://github.com/o/r/blob/HEAD/SIGNING-KEY.md"),
+                ("git@github.com:o/r.git", "https://github.com/o/r/blob/HEAD/SIGNING-KEY.md"),
+                ("https://gitlab.example/o/r", "")):
+            assert bi.signing_key_url(remote) == want, remote
+        readme = bi.release_readme("I.iso", ["I.iso.part01"], "k.tar.gz", "A" * 40,
+                                   "https://github.com/o/r/blob/HEAD/SIGNING-KEY.md")
+        assert "published at  https://github.com/o/r/blob/HEAD/SIGNING-KEY.md" in readme
         # The download kit's writer must at least be valid bash.
         mk = Path(td) / "make-usb.sh"
         mk.write_text(bi.MAKE_USB_SH.replace("@ISO@", "x.iso"))
         assert subprocess.run(["bash", "-n", str(mk)]).returncode == 0
 
-    print("  51/51 installation-path checks pass")
+    print("  66/66 installation-path checks pass")
     return 0
 
 

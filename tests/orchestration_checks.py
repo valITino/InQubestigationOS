@@ -460,6 +460,14 @@ def main():
             hook = x2.component / name / bi.HOOK_NAME
             parsed = subprocess.run(["bash", "-n", str(hook)], capture_output=True, text=True)
             assert parsed.returncode == 0, (name, parsed.stderr[-300:])
+            # wazuh-manager and wazuh-agent conflict, and the manager is held:
+            # an agent installed after it would fail the template build.
+            text = hook.read_text()
+            if name == "investigator-wazuh":
+                assert "aptInstall wazuh-indexer wazuh-manager wazuh-dashboard" in text
+                assert "aptInstall wazuh-agent" not in text, name
+            else:
+                assert "aptInstall wazuh-agent" in text, name
         base2 = bi.template_flavor_content_dir(x2, "flavor").parent
         runs = []
         with mock.patch.object(x2, "run", side_effect=lambda *a, **k: runs.append(a)):

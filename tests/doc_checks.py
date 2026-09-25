@@ -453,6 +453,21 @@ def check_no_secrets() -> None:
             check(f".gitignore excludes {pat}", pat in gi)
 
 
+def check_signing_key_page() -> None:
+    """Every release README points downloaders at SIGNING-KEY.md, and
+    package-release reads its 'Fingerprint:' line. A page it cannot parse
+    stops a release."""
+    page = ROOT / "SIGNING-KEY.md"
+    check("SIGNING-KEY.md exists", page.is_file())
+    if page.is_file():
+        m = re.search(r"^Fingerprint:[ \t]*(.*)$", page.read_text(), re.M)
+        value = (m.group(1).strip() if m else "")
+        compact = value.replace(" ", "").upper()
+        check("SIGNING-KEY.md has a placeholder or a 40-hex fingerprint",
+              value == "NOT-YET-PUBLISHED" or bool(re.fullmatch(r"[0-9A-F]{40}", compact)),
+              f"Fingerprint line reads {value!r}")
+
+
 def main() -> int:
     check_paths()
     check_html_docs()
@@ -465,6 +480,7 @@ def main() -> int:
     check_markdown_structure()
     check_stdlib_claim()
     check_no_secrets()
+    check_signing_key_page()
 
     for f in FAILED:
         print(f"  FAIL  {f}")

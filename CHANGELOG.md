@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.8 — 2026-09-25
+
+**Added**
+
+- **`SIGNING-KEY.md` in the repository root**: the one place a release's
+  signing fingerprint is published. Downloaders compare against it, never
+  against the key inside the download.
+- `package-release` fills in its placeholder the first time and says to commit
+  and push it before publishing. After that it refuses a release signed by any
+  other key: a new key is a deliberate edit of that page.
+- The release `README.txt` now names the page's GitHub URL, derived from the
+  clone's `origin`. It still shows the fingerprint it was signed with, labelled
+  "compare, do not just copy". It says to compare the *primary* key
+  fingerprint, since a signing subkey shows a different one. Keys that signed
+  older releases stay listed under "Previous keys", so a key rotation does not
+  make old releases look forged. When `iso_sign_key` names a signing subkey,
+  the primary key's fingerprint is what gets published and compared.
+- GUIDE §3, README and SIGNING.md point to the new page. `doc_checks` fails
+  if the page cannot be parsed.
+
+**Fixed**
+
+- **Wired first boot would have stopped at phase 8.** Phase 5 gives every
+  template, `tpl-wazuh` included, a held `wazuh-agent`, and `wazuh-srv` is
+  cloned from `tpl-wazuh`. Wazuh's own packages declare `wazuh-manager` and
+  `wazuh-agent` as conflicting (checked in the 4.14.8 apt index), and apt will
+  not remove a held package, so installing the manager failed with a misleading
+  "needs network" error. Phase 8 now unholds and purges the agent in `wazuh-srv`
+  first. The manager monitors its own host. The stub cannot model apt
+  conflicts, so the harness asserts the order instead, and that stage fails
+  without the fix.
+- **Tier 2 wires in `investigator-wazuh`.** The build made the template, but
+  first boot never used it, and the build itself could not have finished
+  making it:
+  - The template hook installed the agent after the held manager, and the two
+    conflict. `investigator-wazuh` now gets no agent.
+  - `prebuilt_templates` lacked the Wazuh entry, so `tpl-wazuh` was always
+    plain Debian and the SIEM was downloaded at first boot. It is now cloned
+    from `investigator-wazuh`, and `wazuh-srv` uses the stack from the image.
+  - Phase 5 skips a template that carries the manager instead of adding an
+    agent that conflicts with it.
+  - `--upgrade-wazuh` upgrades the manager stack in such a template to the
+    same version, rather than trying to add an agent. It also releases the
+    holds on a baked stack before upgrading it; before, it would have read
+    back the old version and called it upgraded.
+- A new tier 2 scenario in the harness covers all of this, and each of its
+  stages fails against the previous code.
+
 ## 2.7 — 2026-09-25
 
 Documentation restructured for readability. No behaviour change.

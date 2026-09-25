@@ -1274,6 +1274,14 @@ prepareChroot
 mount --bind /dev "${INSTALL_DIR}/dev"
 """
 
+AGENT_INSTALL = """aptInstall wazuh-agent
+chroot_cmd systemctl disable wazuh-agent || true
+chroot_cmd bash -c "echo 'wazuh-agent hold' | dpkg --set-selections"
+"""
+MANAGER_NOTE = """# No agent here: this template carries wazuh-manager, which conflicts with it.
+"""
+MANAGER_FLAVORS = {"investigator-wazuh"}
+
 HOOK_FOOTER = """
 #### '----------------------------------------------------------------------
 info ' Wazuh agent — installed, DISABLED, and version-held'
@@ -1535,11 +1543,16 @@ uninstallQubesRepo
     footer = (HOOK_FOOTER.replace("@WAZUH_KEY@", w["key_url"])
                          .replace("@WAZUH_KEY_FPR@", w["key_fpr"])
                          .replace("@WAZUH_REPO@", w["apt_repo_line"]))
+    # investigator-wazuh carries the manager, which the vendor packages declare
+    # as conflicting with the agent, and it is held: installing the agent after
+    # it would fail the whole template build. The manager watches its own host.
+    manager_footer = footer.replace(AGENT_INSTALL, MANAGER_NOTE)
     for flavor, body in bodies.items():
         d = comp / flavor
         d.mkdir(exist_ok=True)
         hook = d / "04_install_qubes_post.sh"
-        hook.write_text(HOOK_HEADER + body + footer)
+        hook.write_text(HOOK_HEADER + body
+                        + (manager_footer if flavor in MANAGER_FLAVORS else footer))
         hook.chmod(0o755)
 
         m = comp / f"appmenus_{dist}_{flavor}"
@@ -6138,7 +6151,113 @@ exec python3 ./build_iso.py "${args[@]}"
 '''
 
 
-def release_readme(iso_name: str, parts: list[str], kit: str, fpr: str) -> str:
+SIGNING_KEY_PAGE = Path(__file__).resolve().parent / "SIGNING-KEY.md"
+FPR_PLACEHOLDER = "NOT-YET-PUBLISHED"
+_FPR_LINE = re.compile(r"^(Fingerprint:[ \t]*)(.*)$", re.M)
+
+
+def published_fingerprint(page: Path | None = None) -> str | None:
+    """The fingerprint the repository publishes in SIGNING-KEY.md: 40 hex
+    characters, "" while it still holds the placeholder, None if the page or
+    its fingerprint line is missing or unreadable."""
+    try:
+        m = _FPR_LINE.search((page or SIGNING_KEY_PAGE).read_text())
+    except OSError:
+        return None
+    if not m:
+        return None
+    value = m.group(2).strip()
+    if value == FPR_PLACEHOLDER:
+        return ""
+    compact = value.replace(" ", "").upper()
+    return compact if re.fullmatch(r"[0-9A-F]{40}", compact) else None
+
+
+def publish_fingerprint(fpr: str, page: Path | None = None) -> None:
+    """Fill the placeholder in SIGNING-KEY.md, grouped the way gpg prints it."""
+    g = [fpr.upper()[i:i + 4] for i in range(0, 40, 4)]
+    grouped = " ".join(g[:5]) + "  " + " ".join(g[5:])
+    page = page or SIGNING_KEY_PAGE
+    text = page.read_text()
+    page.write_text(_FPR_LINE.sub(lambda m: m.group(1) + grouped, text, count=1))
+
+
+def signing_key_url(remote: str | None = None) -> str:
+    """Where SIGNING-KEY.md can be read on GitHub, from the clone's origin
+    (https or ssh form). Empty when that is not a GitHub remote."""
+    if remote is None:
+        try:
+            remote = subprocess.run(
+                ["git", "-C", str(SIGNING_KEY_PAGE.parent), "remote", "get-url",
+                 "origin"], capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    m = re.match(r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                 r"([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", (remote or "").strip())
+    if not m:
+        return ""
+    return f"https://github.com/{m.group(1)}/{m.group(2)}/blob/HEAD/SIGNING-KEY.md"
+
+
+def primary_fingerprint(colons: str, fpr: str) -> str:
+    """The primary key's fingerprint for `fpr`, which may name the primary key
+    or one of its subkeys, from `gpg --with-colons` output. "" if absent.
+
+    Downloaders compare what gpg labels "Primary key fingerprint"; publishing a
+    signing subkey's fingerprint instead would make every genuine release look
+    forged."""
+    want, primary, next_is_primary = fpr.upper(), "", False
+    for ln in colons.splitlines():
+        f = ln.split(":")
+        if f[0] == "pub":
+            next_is_primary = True
+        elif f[0] == "fpr" and len(f) > 9:
+            if next_is_primary:
+                primary, next_is_primary = f[9].upper(), False
+            if f[9].upper() == want and primary:
+                return primary
+    return ""
+
+
+def release_key_listing(x: Ctx) -> str:
+    return subprocess.run(
+        ["gpg", "--batch", "--with-colons", "--show-keys",
+         str(x.out_dir / "unit-signing-key.asc")],
+        capture_output=True, text=True).stdout
+
+
+def check_published_fingerprint(x: Ctx, fpr: str) -> str:
+    """A release must be checkable against the fingerprint the repository
+    publishes. Fills the placeholder on first use; refuses a different key.
+    Returns "filled", "would-fill" (dry run), "matches" or "absent"."""
+    published = published_fingerprint()
+    if published is None:
+        if SIGNING_KEY_PAGE.exists():
+            raise Fatal(f"{SIGNING_KEY_PAGE.name} has no readable 'Fingerprint:' line.\n"
+                        f"     Restore it from git, or set it to {FPR_PLACEHOLDER}.")
+        x.warn(f"{SIGNING_KEY_PAGE.name} is missing: downloaders have no published "
+               "fingerprint to compare against")
+        return "absent"
+    if published == "":
+        if x.args.dry_run:
+            x.info(f"[dry-run] would record {fpr.upper()} in {SIGNING_KEY_PAGE.name}")
+            return "would-fill"
+        publish_fingerprint(fpr)
+        x.ok(f"{SIGNING_KEY_PAGE.name}: fingerprint recorded — commit and push it "
+             "BEFORE publishing the release")
+        return "filled"
+    if published != fpr.upper():
+        raise Fatal(f"{SIGNING_KEY_PAGE.name} publishes {published},\n"
+                    f"     but this release is signed by {fpr.upper()}.\n"
+                    "     Downloaders would reject it. If the key really changed,\n"
+                    f"     edit {SIGNING_KEY_PAGE.name} by hand (see its 'If the key "
+                    "changes' section).")
+    x.ok(f"{SIGNING_KEY_PAGE.name} publishes this key")
+    return "matches"
+
+
+def release_readme(iso_name: str, parts: list[str], kit: str, fpr: str,
+                   url: str = "") -> str:
     first = parts[0] if parts else f"{iso_name}.part01"
     return f"""\
 {Path(iso_name).stem} — release files
@@ -6157,8 +6276,12 @@ Editions (same image; the kickstart decides)
             carries /usr/share/doc/inqubestigationos/WORKSTATION-GUIDE.md
 
 1. Authenticate the download (before running anything from it)
-   Get the signing key's fingerprint through a channel you already trust —
-   NOT from this download. It must be:
+   Get the signing key's fingerprint from a source you already trust, NOT
+   from this download.{chr(10) + '   It is published at  ' + url if url else ''}
+   Compare it with the "Primary key fingerprint" gpg prints below (a
+   "Subkey fingerprint" may differ; that is normal). A key that signed an
+   older release stays listed there under "Previous keys".
+   This release was signed by (compare, do not just copy):
        {fpr or '(unsigned build — do not distribute)'}
 
      gpg --import unit-signing-key.asc
@@ -6214,6 +6337,8 @@ def package_release(x: Ctx) -> int:
     if dest.exists() and any(dest.iterdir()):
         raise Fatal(f"{dest} already has files in it — remove it or pass --to")
     if x.args.dry_run:
+        check_published_fingerprint(
+            x, primary_fingerprint(release_key_listing(x), fpr) or fpr)
         x.info(f"[dry-run] verify, split {iso.name} into {part_mib} MiB parts, "
                f"write the kit and SHA256SUMS(.asc) into {dest}")
         return 0
@@ -6232,15 +6357,17 @@ def package_release(x: Ctx) -> int:
 
     # The public key downloaders import must be the key that signed: a stale
     # or replaced export would leave them nothing to verify SHA256SUMS with.
-    listed = subprocess.run(
-        ["gpg", "--batch", "--with-colons", "--show-keys",
-         str(x.out_dir / "unit-signing-key.asc")],
-        capture_output=True, text=True).stdout
+    listed = release_key_listing(x)
     if fpr.upper() not in {ln.split(":")[9].upper() for ln in listed.splitlines()
                            if ln.startswith("fpr:")}:
         raise Fatal(f"output/unit-signing-key.asc does not contain {fpr}.\n"
                     f"     Re-export it:  ./build_iso.py sign")
     x.ok("unit-signing-key.asc is the release key")
+    # iso_sign_key may name a signing subkey; what is published and compared
+    # is always the primary key's fingerprint.
+    primary = primary_fingerprint(listed, fpr) or fpr.upper()
+    published = check_published_fingerprint(x, primary)
+    url = signing_key_url()
 
     # 2. The kit: an allowlist, so nothing else in output/ (let alone the
     #    key backup beside it) can end up in a public release by accident.
@@ -6291,7 +6418,7 @@ def package_release(x: Ctx) -> int:
     x.ok(f"{len(parts)} parts of at most {part_mib} MiB")
 
     (kit_root / "README.txt").write_text(
-        release_readme(iso.name, parts, kit_name, fpr))
+        release_readme(iso.name, parts, kit_name, primary, url))
     import tarfile
     with tarfile.open(dest / kit_name, "w:gz") as tar:
         for f in sorted(kit_root.rglob("*")):
@@ -6323,9 +6450,14 @@ def package_release(x: Ctx) -> int:
 
   Never upload the key-backup folder or iso-build.json. The signing
   passphrase stays with you; downloaders need only the fingerprint:
-    {fpr}
-  — given to them through a channel other than the release itself.
+    {primary}
+  — published in {SIGNING_KEY_PAGE.name}{' (' + url + ')' if url else ''}.
 """)
+    if published == "filled":
+        x.warn(f"{SIGNING_KEY_PAGE.name} now holds this fingerprint. Commit and push it "
+               "before you publish the release:")
+        x.warn(f"  git add {SIGNING_KEY_PAGE.name} && git commit -m 'Publish the image "
+               "signing key fingerprint' && git push")
     return 0
 
 
