@@ -218,6 +218,37 @@ def main() -> int:
                       "the tampered payload verified")
         finally:
             del os.environ["GNUPGHOME"]
+    # Builder trust (verify_builder): a developer key counts only when the
+    # master key's certification on it is VALID. A tampered secpack can carry
+    # a sig record that names the master key but does not verify ("sig:-").
+    with tempfile.TemporaryDirectory(dir="/tmp") as td:
+        home = Path(td) / "g"
+        home.mkdir(mode=0o700)
+
+        def new_key(uid: str) -> str:
+            gpg(home, "--passphrase", "", "--pinentry-mode", "loopback",
+                "--quick-generate-key", uid, "ed25519", "sign", "never")
+            return next(ln.split(":")[9] for ln in gpg(
+                home, "--list-keys", "--with-colons", uid).stdout.splitlines()
+                if ln.startswith("fpr:"))
+
+        master = new_key("Master <m@example.invalid>")
+        dev = new_key("Dev <d@example.invalid>")
+        other = new_key("Other <o@example.invalid>")
+        gpg(home, "--passphrase", "", "--pinentry-mode", "loopback",
+            "--default-key", master, "--quick-sign-key", dev)
+        colons = gpg(home, "--with-colons", "--check-signatures").stdout
+        devs, certified = bi.master_certified(colons, master)
+        check("every non-master key is seen", devs == {dev, other}, str(devs))
+        check("a valid master certification is trusted", certified == {dev},
+              str(certified))
+        forged = "\n".join(
+            ln.replace("sig:!:", "sig:-:", 1)
+            if ln.startswith("sig:!:") and ln.split(":")[4] == master[-16:] else ln
+            for ln in colons.splitlines())
+        _, certified = bi.master_certified(forged, master)
+        check("a master certification that does not verify is not trusted",
+              dev not in certified, str(certified))
     print(f"  {CHECKS}/{CHECKS} signature authentication checks pass")
     return 0
 

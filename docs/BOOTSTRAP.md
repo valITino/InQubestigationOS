@@ -117,8 +117,12 @@ directory and separate onboarding, backup, build, and export. A process lock
 rejects concurrent runs. The generated location inventory records actual work/output/
 log/GNUPG paths, fingerprint, backup identity, guest export, known or unknown
 host mapping, sizes, hashes, and verification—never secret values. The sanitized
-release contains only the allowlist; private backup, revocation data,
-credentials, config, and logs are excluded. A bundled public key is not an
+release contains only the allowlist — the image with its checksum and
+signature, the public key, the verification scripts, `FINGERPRINT.txt`,
+`BUILD-RECORD.txt`, and every signed install-time kickstart (`oem/ks.cfg` and
+`oem/editions/{wired,unwired}/ks.cfg`, each signature verified at the
+destination), so the export can make provisioning media; private backup,
+revocation data, credentials, config, and logs are excluded. A bundled public key is not an
 independent trust anchor; distribute its fingerprint independently.
 
 Correct a reported mount/authentication/supply-chain failure and repeat

@@ -496,6 +496,86 @@ def main() -> int:
                                           for a in again),
           pi2.stderr[-300:])
 
+    # ------------------------------------------------------------------
+    # The unwired edition: the same templates and payloads, and nothing
+    # wired. Run in its own world so nothing above can satisfy it.
+    print("\nunwired edition")
+    uwork = work / "unwired"
+    usand = uwork / "repo"
+    usand.mkdir(parents=True)
+    shutil.copy2(ROOT / "golden_image.py", usand / "golden_image.py")
+    (usand / "golden-image.json").write_text(json.dumps({"edition": "unwired"}))
+    ugi = usand / "golden_image.py"
+    build_world(uwork / "world.json")
+    uenv = make_env(uwork)
+    pu = run(ugi, [], uenv, usand)
+    stage("unwired: the run exits 0", pu.returncode == 0,
+          f"rc={pu.returncode} " + pu.stderr[-400:] + pu.stdout[-400:])
+    ustate = Path(uenv["HOME"]) / "golden-image" / ".build-state"
+    umarks = sorted(ustate.read_text().split()) if ustate.exists() else []
+    stage("unwired: exactly phases 1, 3, 4 and 5 ran",
+          umarks == ["phase:1", "phase:3", "phase:4", "phase:5"], " ".join(umarks))
+    stage("unwired: no credentials are generated",
+          not (Path(uenv["HOME"]) / "golden-image" / "credentials.json").exists())
+    uacts = [json.loads(line) for line in
+             (uwork / "actions.jsonl").read_text().splitlines() if line.strip()]
+    wiring = [" ".join([a["prog"], *a["argv"]]) for a in uacts
+              if a["kind"] == "exec" and (
+                  a["prog"] in ("qvm-create", "qvm-firewall")
+                  or (a["prog"] == "qvm-prefs" and "netvm" in a["argv"]))]
+    stage("unwired: no qube is created and no netvm or firewall is touched",
+          not wiring, "; ".join(wiring[:5]))
+    uworld = json.loads((uwork / "world.json").read_text())["vms"]
+    utpls = ("tpl-sys", "tpl-proxy", "tpl-ids", "tpl-kali", "tpl-personal", "tpl-wazuh")
+    stage("unwired: every template is built", all(t in uworld for t in utpls),
+          f"missing: {[t for t in utpls if t not in uworld]}")
+    stock = {"debian-13-xfce", "fedora-43-xfce", "whonix-gateway-18",
+             "whonix-workstation-18"}
+    touched = sorted({v for a in uacts if a["kind"] == "exec" and a["prog"] == "qvm-run"
+                      for v in a["argv"] if v in stock})
+    stage("unwired: nothing runs inside the stock templates", not touched,
+          f"qvm-run into {', '.join(touched)}")
+    journal = [" ".join(a["argv"]) for a in uacts
+               if a["kind"] == "exec" and a["prog"] == "logger"]
+    stage("unwired: every phase reports its progress to the journal",
+          any("phase 1 (1/4, 0% done)" in j for j in journal)
+          and any("phase 5 (4/4, 75% done)" in j for j in journal)
+          and any("provisioning run finished" in j for j in journal),
+          "; ".join(journal[:6]))
+    stage("unwired: the handover points at the workstation guide",
+          "WORKSTATION-GUIDE.md" in pu.stdout, pu.stdout[-400:])
+    pv = run(ugi, ["--verify"], uenv, usand)
+    # The stub reports /var/ossec absent in every template (see build_world),
+    # so this asserts the unwired checks RUN — phase completion and every
+    # template's presence — not that stub qubes carry real payloads.
+    pvt = re.sub(r"\x1b\[[0-9;]*m", "", pv.stdout)
+    stage("unwired: --verify checks the templates, not the wired estate",
+          pv.returncode in (0, 2) and "not complete" not in pvt
+          and all(f"template {t} exists" in pvt for t in utpls)
+          and "sys-proxy" not in pvt,
+          f"rc={pv.returncode} " + pvt[-400:])
+    pp = run(ugi, ["--phase", "6"], uenv, usand)
+    stage("unwired: a wiring phase is refused, not run",
+          pp.returncode == 1 and "not part of the unwired edition" in pp.stderr,
+          f"rc={pp.returncode} " + pp.stderr[-300:])
+    ph = run(ugi, ["--handover"], uenv, usand)
+    stage("unwired: credential commands say there are none",
+          ph.returncode == 1 and "generates no credentials" in ph.stderr,
+          f"rc={ph.returncode} " + ph.stderr[-300:])
+    pw = run(ugi, ["--edition", "wired"], uenv, usand)
+    uworld = json.loads((uwork / "world.json").read_text())["vms"]
+    stage("unwired: --edition wired completes the topology later",
+          pw.returncode in (0, 2) and "sys-proxy" in uworld,
+          f"rc={pw.returncode} " + pw.stderr[-400:])
+    stage("unwired: --edition wired is recorded for every later command",
+          json.loads((usand / "golden-image.json").read_text()).get("edition") == "wired"
+          and "edition: wired" in run(ugi, ["--status"], uenv, usand).stdout)
+    pd = run(ugi, ["--edition", "unwired"], uenv, usand)
+    stage("a wired machine cannot be relabelled unwired (nothing would be removed)",
+          pd.returncode == 1 and "cannot turn a wired machine back" in pd.stderr
+          and json.loads((usand / "golden-image.json").read_text()).get("edition") == "wired",
+          f"rc={pd.returncode} " + pd.stderr[-300:])
+
     print("\ngenerated configuration")
     p4 = subprocess.run([sys.executable, str(TESTS / "static_checks.py"),
                          str(work / "capture")], capture_output=True, text=True)

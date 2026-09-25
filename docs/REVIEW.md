@@ -1,14 +1,41 @@
 # Review and fixes
 
-Four verification passes against primary sources, and what they found. Defects
-are recorded here rather than quietly patched, so nobody reintroduces them.
+Five verification passes — four against primary sources, one on a real build
+host — and what they found. Defects are recorded here rather than quietly
+patched, so nobody reintroduces them.
 
+- [Pass 5 — 2026-09-25, the first real build](#pass-5--2026-09-25-the-first-real-build)
 - [Pass 4 — 2026-09-15](#pass-4--2026-09-15)
 - [Pass 3 — 2026-09-14](#pass-3--2026-09-14)
 - [Pass 2 — v2.2, 2026-09-08](#pass-2--v22-2026-09-08)
 - [Pass 1 — v2.1, 2026-09-01](#pass-1--v21-2026-09-01)
 - [What is actually tested](#what-is-actually-tested)
 - [Still not verified](#still-not-verified--requires-real-hardware)
+
+---
+
+## Pass 5 — 2026-09-25, the first real build
+
+`./build_iso.py quickstart --usb` ran on **Kali Linux rolling** in a VirtualBox
+VM, with the Docker executor at tier 1, and built and signed a 7.8 GB
+`InQubestigationOS.iso`. Four defects stopped it on the way, each a place where
+the build assumed what the host or upstream does:
+
+| # | Where | Symptom | Cause | Fix |
+|---|---|---|---|---|
+| 1 | `setup-host` | the terminal turned solid blue and the install hung | `apt-get install` ran interactively, and a package (Kali's libc6 "restart services?") opened a debconf whiptail dialog that never drew | `DEBIAN_FRONTEND=noninteractive`, keeping existing configuration files |
+| 2 | builder setup | "`qb config get-var executor --json` did not return JSON" | the answer was read with stderr mixed in | stdout only; on a real failure the error quotes qb's own last lines |
+| 3 | `qb installer init-cache` | `No match for argument: lorax-templates-qubes` | nothing here builds Qubes components, so builder-local is empty; the installer plugin enables the signed Qubes repository only when `use-qubes-repo` is set | the iso block sets `use-qubes-repo` to the release |
+| 4 | lorax, in the ISO step | `RuntimeError: Transaction needs to be run before calling _filelists` | `use-kernel-latest` makes the installer Makefile pass `--excludepkgs kernel`; lorax's libdnf5 port (40+, still in 46.1) runs that `removepkg` before any transaction exists | `use-kernel-latest: false`; the installed system still gets `kernel-latest` from the kickstart |
+
+The same pass added the **unwired** edition, `package-release`, and progress
+display, and then reviewed the whole codebase again; what that review found and
+fixed is in the [CHANGELOG](../CHANGELOG.md) under 2.5 — among it a builder
+verification that counted a master-key certification without checking that it
+verified.
+
+Not verified by this pass: writing the image to a stick and reading it back on
+real hardware, installing it, and first boot.
 
 ---
 
@@ -177,7 +204,8 @@ ones needed a code change to pass; they were simply never asked.
 
 ### Still true after this pass
 
-Neither script has been run end to end on real hardware, and that is the one
+Neither script had been run end to end on real hardware at this pass — see
+pass 5 for the first build; an install is still outstanding, and that is the one
 thing no amount of tooling closes. What changed is that the failures waiting
 there are now hardware failures rather than failures that a careful reading of
 upstream would have predicted. Specifically, the first real boot is what
@@ -525,6 +553,7 @@ yourself rather than trusting this table.
 | `--verify` | The acceptance tests run, and the exit code matches the summary — a machine that failed its tests must not look like one that passed |
 | Static config | Every generated file: nftables brace balance, chain types and hooks against the valid sets, `redirect` only in a nat prerouting context, no `custom-prerouting`, nft set spacing, the add-then-delete idiom and `dstnat` priority in the DNS script, Squid peek-then-splice with no `bump`/`terminate` and `%>a` attribution, unbound DoT with no cleartext fallback and no open-resolver posture, Suricata `queue num` with no `bypass` in any executable line under fail-closed, the IPS unit in the template rather than the AppVM, and no unsubstituted placeholders anywhere |
 | Documentation | Every path, flag, subcommand, config key, version stamp and fingerprint in the docs resolves against the code |
+| Unwired edition | Only phases 1, 3, 4 and 5 run; no qube is created, no netvm or firewall is touched, nothing runs inside the stock templates, no credentials are generated; wiring phases and credential commands are refused; `--edition wired` completes the design and is recorded for every later command |
 
 Three bugs were found *by* the harness rather than by reading: `/usr/local/bin`
 and `/etc/systemd/system` were assumed to exist before being written into; a
@@ -577,8 +606,10 @@ Everything that could become an automated check has: see acceptance-test group 1
 and the table in [VERIFICATION.md](VERIFICATION.md). What is left needs a live
 Qubes 4.3.1 install and a decision:
 
-- an end-to-end run on real hardware — neither script has had one. This is the
-  one thing on this page that no amount of tooling closes.
+- an install on real hardware — `build_iso.py` has built and signed an image
+  end to end (pass 5), but nobody has installed one, so `golden_image.py` has
+  never run on a live system. This is the one thing on this page that no amount
+  of tooling closes.
 - the Kali dist-upgrade of a live Qubes Debian 13 template: upstream runs the
   same sequence in a build chroot; whether it completes cleanly in a running
   template, and how long `kali-linux-default` takes through the update proxy,

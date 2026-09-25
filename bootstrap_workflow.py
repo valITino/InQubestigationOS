@@ -20,7 +20,15 @@ EXPORT_ALLOWLIST = (
     "InQubestigationOS.iso", "InQubestigationOS.iso.sha256",
     "InQubestigationOS.iso.asc", "unit-signing-key.asc", "verify-iso.sh",
     "verify-iso.ps1", "FINGERPRINT.txt", "BUILD-RECORD.txt",
+    # The install-time kickstarts and their signatures. Without them an
+    # exported release can only make a plain installer: write-usb refuses to
+    # provision from an unsigned or missing kickstart.
+    "oem/ks.cfg", "oem/ks.cfg.asc",
+    "oem/editions/wired/ks.cfg", "oem/editions/wired/ks.cfg.asc",
+    "oem/editions/unwired/ks.cfg", "oem/editions/unwired/ks.cfg.asc",
 )
+EXPORT_KICKSTARTS = ("oem/ks.cfg", "oem/editions/wired/ks.cfg",
+                     "oem/editions/unwired/ks.cfg")
 
 
 class BootstrapWorkflow:
@@ -545,6 +553,7 @@ class BootstrapWorkflow:
             staging.mkdir(mode=0o755)
             for name in names:
                 source, target = self.x.out_dir / name, staging / name
+                target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
                 if self._hash(source) != self._hash(target):
                     raise ValueError(f"destination readback mismatch: {name}")
@@ -582,15 +591,20 @@ class BootstrapWorkflow:
         if not fields or fields[0].lower() != self._hash(iso):
             raise ValueError("ISO checksum authentication failed")
         expected = self.x.c["iso_sign_key"].replace(" ", "").upper()
-        p = subprocess.run(["gpg", "--batch", "--status-fd", "1", "--verify",
-                            str(signature), str(iso)], capture_output=True, text=True)
-        valid = []
-        for line in p.stdout.splitlines():
-            parts = line.split()
-            if line.startswith("[GNUPG:] VALIDSIG "):
-                valid.extend([parts[2].upper(), parts[-1].upper()])
-        if p.returncode or expected not in valid:
-            raise ValueError(f"ISO signature is not authenticated by configured identity {expected}")
+        # The image, and every install-time kickstart: each runs as root on
+        # the target, so each is authenticated by the same key.
+        for sig, payload in [(signature, iso)] + [
+                (directory / f"{ks}.asc", directory / ks) for ks in EXPORT_KICKSTARTS]:
+            p = subprocess.run(["gpg", "--batch", "--status-fd", "1", "--verify",
+                                str(sig), str(payload)], capture_output=True, text=True)
+            valid = []
+            for line in p.stdout.splitlines():
+                parts = line.split()
+                if line.startswith("[GNUPG:] VALIDSIG "):
+                    valid.extend([parts[2].upper(), parts[-1].upper()])
+            if p.returncode or expected not in valid:
+                raise ValueError(f"{payload.name} signature is not authenticated by "
+                                 f"configured identity {expected}")
 
     def finish(self) -> None:
         detail = ("build complete; export not requested" if self.cfg.get("build_only") else

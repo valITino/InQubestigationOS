@@ -41,10 +41,13 @@ April 2025 and had to roll a new one; every Kali system worldwide failed `apt up
 until users installed the new key by hand. Kali state this was not a compromise —
 the old key is still shipped in the keyring rather than revoked. The practical
 lesson for this image: a Kali key roll will break `tpl-kali` updates without warning.
-When that happens, confirm the new fingerprint at the source, then:
+When that happens, confirm the new fingerprint at the source. Each laptop checks
+against its own configuration, so on each one set `"kali": {"key_fpr": "<new
+fingerprint>"}` in `/usr/local/sbin/golden-image.json` (as root) and refresh the
+key there; on the build host, record it for the next image:
 
-    ./build_iso.py --set kali.key_fpr=<new fingerprint>
-    sudo ./golden_image.py --phase 4
+    sudo golden-image-provision --refresh-repo-keys        # on each laptop
+    ./build_iso.py --set kali.key_fpr=<new fingerprint>    # on the build host
 
 **Independent cross-check.** Kali developers signed the 2025 key and published those
 signatures on the Ubuntu keyserver:
@@ -210,6 +213,7 @@ What is left for a person is genuinely a matter of judgement, not verification:
 | Date | Image version | What was re-verified | By |
 |---|---|---|---|
 | 2026-09-01 | 2.1 | Kali key + checksum, Zeek Debian_13 repo, Wazuh 4.14.7 and pinning requirement | initial research |
+| 2026-09-25 | 2.5 | Pins re-checked by `check-upstream`: 11 ok, 0 blocking, 2 warnings left for review — Wazuh 4.14.8 is available (pinned 4.14.7) and upstream's `wazuh-passwords-tool.sh` changed; neither pin moved. Read directly: qubes-builderv2's installer plugin and Makefile (`use-qubes-repo`, `ISO_USE_KERNEL_LATEST` → `--excludepkgs`), lorax's source (the libdnf5 `removepkg` before any transaction, still in 46.1) and qubes-lorax-templates `release4.3`. First end-to-end build on a real host: Kali rolling, VirtualBox, Docker, tier 1 — built and signed; see [REVIEW.md](REVIEW.md) pass 5 | `check-upstream`; upstream sources read directly; the build itself |
 | 2026-09-15 | 2.4 | Pins unchanged. The whole codebase — both tiers, the provisioner's twelve phases, the lifecycle commands — was read against qubes-core-agent-linux (update proxy, bind-dirs), qubes-anaconda-addon (initial setup), fepitre/qubes-template-kali (the Kali recipe) and qubes-builderv2's template plugin; seven provisioner defects and five build-side ones fixed, see [REVIEW.md](REVIEW.md) Pass 4 | upstream sources read directly; the fake-dom0 harness now asserts on the recorded in-qube actions |
 | 2026-09-14 | 2.3 | Pins re-checked and unchanged (13 ok, 0 blocking). Separately, the repository was read against the BUILDER it drives — qubes-builderv2 `mm_db047c1c`, `qubes-release` and `qubes-lorax-templates` at `release4.3` — which is where this pass's findings came from; see [REVIEW.md](REVIEW.md) | `check-upstream`, plus upstream sources read directly |
 | 2026-09-08 | 2.2 | All of the above re-checked against primary sources by `./build_iso.py check-upstream`: Kali `827C…E4C5` present and valid for 586 days, published keyring SHA1 unchanged, Zeek OBS key `F9FA…85CA` recorded (85 days to expiry), Wazuh 4.14.7 confirmed current in the stable apt repository, Wazuh signing key `0DCF…1145` pinned, Qubes bulletin baseline at qsb-118-2026 | `check-upstream`, recorded in `supply-chain.lock.json` |

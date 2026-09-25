@@ -76,7 +76,7 @@ DEFAULT_CONFIG: dict = {
     "qubes_master_key": "427F11FD0FAA4B080123F01CDDFA1A3E36879494",
     "secpack_url": "https://github.com/QubesOS/qubes-secpack.git",
 
-    # TIER 2 IS THE DEFAULT AND THE INTENDED PATH.
+    # TIER 2 IS THE INTENDED PATH; TIER 1 IS THE DEFAULT (see below why).
     #   1 = stock templates only; the investigator templates are built on the
     #       target by golden_image.py. 1-3 hours of first-boot work and a hard
     #       dependency on connectivity at install time.
@@ -130,6 +130,13 @@ DEFAULT_CONFIG: dict = {
     "cache_templates": [],
 
     "auto_provision": True,
+    # Which edition oem/ks.cfg installs. Both are always generated and signed
+    # under oem/editions/, so write-usb --edition can pick either from one
+    # build; the ISO itself is identical for both.
+    #   "wired":   templates AND the full topology (chain, SIEM, policy), tested.
+    #   "unwired": the same templates only; the operator wires them, guided by
+    #              docs/WORKSTATION-GUIDE.md, which every install carries.
+    "edition": "wired",
     # How stale the recorded supply-chain baseline may be before a build
     # re-checks it automatically. 0 disables the automatic check entirely.
     "check_upstream_max_age_days": 7,
@@ -251,6 +258,125 @@ class Fatal(Exception):
     pass
 
 
+# ===========================================================================
+#  Progress display
+# ===========================================================================
+def _on_terminal() -> bool:
+    """Draw live progress only for a person watching a terminal.
+
+    Logs, CI, `| tee` and the test suites read stdout too; a carriage-return
+    animation in any of them is noise at best and breaks parsing at worst.
+    """
+    try:
+        return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+    except (AttributeError, ValueError):
+        return False
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def human_duration(seconds: float) -> str:
+    s = int(max(seconds, 0))
+    if s >= 3600:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 60}:{s % 60:02d}"
+
+
+class Progress:
+    """One-line progress bar for a job whose size is known in bytes.
+
+        with Progress("checksum", size) as bar:
+            bar.update(len(chunk))
+
+    On a terminal it redraws in place (bar, percent, amount, rate, ETA) at
+    most five times a second and leaves one summary line behind. Anywhere
+    else it prints nothing, so captured output is the same as without it.
+    """
+
+    def __init__(self, label: str, total: int, unit_bytes: bool = True):
+        self.label, self.total = label, max(int(total), 1)
+        self.unit_bytes = unit_bytes
+        self.done = 0
+        self.live = _on_terminal()
+        self.start = self._last = time.monotonic()
+
+    def __enter__(self):
+        self._draw(force=True)
+        return self
+
+    def __exit__(self, exc_type, *_):
+        self.close(ok=exc_type is None)
+        return False
+
+    def update(self, n: int) -> None:
+        self.done += n
+        self._draw()
+
+    def _amount(self, n: float) -> str:
+        return human_bytes(n) if self.unit_bytes else f"{int(n)}"
+
+    def _draw(self, force: bool = False) -> None:
+        if not self.live:
+            return
+        now = time.monotonic()
+        if not force and now - self._last < 0.2 and self.done < self.total:
+            return
+        self._last = now
+        frac = min(self.done / self.total, 1.0)
+        elapsed = now - self.start
+        rate = self.done / elapsed if elapsed > 0.5 else 0
+        eta = (self.total - self.done) / rate if rate else 0
+        tail = f" {frac * 100:3.0f}%  {self._amount(self.done)}/{self._amount(self.total)}"
+        if rate:
+            tail += f"  {self._amount(rate)}/s"
+            if self.done < self.total:
+                tail += f"  ETA {human_duration(eta)}"
+        cols = shutil.get_terminal_size((80, 20)).columns
+        label = self.label[:22]
+        width = max(10, min(40, cols - len(label) - len(tail) - 8))
+        full = int(width * frac)
+        bar = "█" * full + "░" * (width - full)
+        sys.stdout.write(f"\r  {C}{label}{RST} ▕{G}{bar}{RST}▏{tail}\033[K")
+        sys.stdout.flush()
+
+    def close(self, ok: bool = True) -> None:
+        if not self.live:
+            return
+        self.done = self.total if ok else self.done
+        self._draw(force=True)
+        took = human_duration(time.monotonic() - self.start)
+        sys.stdout.write(f"  {D}({took}){RST}\n")
+        sys.stdout.flush()
+        self.live = False
+
+
+def sha256_file(path: Path, label: str = "checksum") -> str:
+    """SHA-256 of a (possibly multi-gigabyte) file, with a progress bar."""
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as f, Progress(label, path.stat().st_size) as bar:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+            bar.update(len(chunk))
+    return h.hexdigest()
+
+
+def copy_with_progress(src: Path, dst: Path, label: str = "copy") -> None:
+    """shutil.copy2, with a progress bar for the multi-gigabyte case."""
+    with src.open("rb") as fi, dst.open("wb") as fo, \
+            Progress(label, src.stat().st_size) as bar:
+        for chunk in iter(lambda: fi.read(1 << 22), b""):
+            fo.write(chunk)
+            bar.update(len(chunk))
+    shutil.copystat(src, dst)
+
+
 class Ctx:
     def __init__(self, cfg: dict, args):
         self.c = cfg
@@ -306,6 +432,14 @@ class Ctx:
         self.verify_notes.append(m)
 
     def phase(self, n, name):
+        # How long the previous phase took, for the person at the terminal:
+        # "is this stuck or just slow" is the question a multi-hour build
+        # raises most. Only on a terminal, so logs and tests are unchanged.
+        now = time.monotonic()
+        prev = getattr(self, "_phase_started", None)
+        if prev is not None and _on_terminal():
+            print(f"  {D}\u2514 took {human_duration(now - prev)}{RST}")
+        self._phase_started = now
         print(f"\n{B}{C}\u2550\u2550 {n} \u2014 {name}{RST}")
         self._log(f"PHASE {n} {name}")
 
@@ -317,15 +451,27 @@ class Ctx:
             return ""
         self._log("EXEC  " + " ".join(cmd))
         if live:
+            # errors="replace": one undecodable byte in a builder's output
+            # must not raise mid-stream and leave the child running.
             p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, env=env)
+                                 stderr=subprocess.STDOUT, text=True,
+                                 errors="replace", env=env)
             assert p.stdout
             lf = self.log.open("a") if self.logging else None
+            # On a terminal, indent a tool's own output under a dim gutter so
+            # thousands of builder lines stay visibly inside their phase.
+            gutter = f"  {D}\u2502{RST} " if _on_terminal() else ""
             try:
                 for line in p.stdout:
-                    sys.stdout.write(line)
+                    sys.stdout.write(gutter + line)
                     if lf:
                         lf.write(line)
+            except BaseException:
+                # Ctrl-C or a failed write here must not leave the builder
+                # running behind a script that has already given up.
+                p.kill()
+                p.wait()
+                raise
             finally:
                 if lf:
                     lf.close()
@@ -334,7 +480,7 @@ class Ctx:
                 raise Fatal(f"failed: {' '.join(cmd)} — see {self.log}")
             return ""
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, env=env)
+                           errors="replace", stdin=subprocess.DEVNULL, env=env)
         self._log(f"      rc={p.returncode}\n{p.stdout[-4000:]}{p.stderr[-4000:]}")
         if check and p.returncode != 0:
             raise Fatal(f"failed: {' '.join(cmd)} — see {self.log}")
@@ -533,7 +679,7 @@ def preflight(x: Ctx, tier2: bool):
         if input("  Type UNDERSTOOD to continue: ").strip() != "UNDERSTOOD":
             raise Fatal("aborted at the warnings (use --yes to skip)")
     elif not x.args.dry_run:
-        x._log("ACK   warnings acknowledged non-interactively (--yes/--force)")
+        x._log("ACK   warnings acknowledged non-interactively (--yes)")
 
     need = 250 if tier2 else 100
     # Measure the nearest existing ancestor. statvfs on a directory that does
@@ -882,8 +1028,7 @@ def bootstrap(x: Ctx, args) -> int:
             # process.  Enter only the docker group for subsequent children; sg
             # retains the unprivileged user's HOME/GNUPGHOME and therefore their
             # signing keyring. Never elevate the whole build.
-            if i > 0 and x.c["container_engine"] == "docker" \
-                    and not x.quiet("docker", "ps"):
+            if x.c["container_engine"] == "docker" and not x.quiet("docker", "ps"):
                 if shutil.which("sg") and x.quiet("sg", "docker", "-c", "docker ps"):
                     child = ["sg", "docker", "-c", shlex.join(child)]
                 else:
@@ -942,6 +1087,28 @@ def bootstrap(x: Ctx, args) -> int:
 #  So exactly ONE fingerprint needs pinning here — the master key — and the
 #  developer keys are trusted because it says so.
 # ---------------------------------------------------------------------------
+def master_certified(colons: str, master_fpr: str) -> tuple[set, set]:
+    """(every non-master primary key, those the master key validly certified),
+    read from `gpg --with-colons --check-signatures` output."""
+    master_longid = master_fpr[-16:]
+    dev_fprs, certified, current = set(), set(), None
+    for ln in colons.splitlines():
+        f = ln.split(":")
+        if f[0] == "pub":
+            current = None
+        elif f[0] == "fpr" and current is None:
+            current = f[9]
+            if current != master_fpr:
+                dev_fprs.add(current)
+        # f[1] is the validity gpg computed: "!" good, "-" bad, "?" no key,
+        # "%" error. Only a good certification makes a key trusted — a
+        # tampered secpack can carry a sig record naming the master key.
+        elif (f[0] == "sig" and current in dev_fprs and len(f) > 4
+              and f[1] == "!" and f[4] == master_longid):
+            certified.add(current)
+    return dev_fprs, certified
+
+
 def verify_builder(x: Ctx) -> None:
     if not x.c["verify_builder"]:
         x.warn("verify_builder is off. Nothing is checking the tool that builds "
@@ -994,19 +1161,9 @@ def verify_builder(x: Ctx) -> None:
 
     x.run("gpg", "--batch", "--quiet", "--import",
           *[str(f) for f in sorted(devs_dir.glob("*.asc"))], env=env)
-    master_longid = pinned[-16:]
-    dev_fprs, current, certified = set(), None, set()
-    for ln in x.run("gpg", "--with-colons", "--check-signatures", capture=True,
-                    check=False, env=env).splitlines():
-        f = ln.split(":")
-        if f[0] == "pub":
-            current = None
-        elif f[0] == "fpr" and current is None:
-            current = f[9]
-            if current != pinned:
-                dev_fprs.add(current)
-        elif f[0] == "sig" and current and len(f) > 4 and f[4] == master_longid:
-            certified.add(current)
+    dev_fprs, certified = master_certified(
+        x.run("gpg", "--with-colons", "--check-signatures", capture="stdout",
+              check=False, env=env), pinned)
     uncertified = dev_fprs - certified
     if not dev_fprs:
         raise Fatal(f"no developer keys found in {devs_dir}")
@@ -1020,7 +1177,7 @@ def verify_builder(x: Ctx) -> None:
     x.ok(f"{len(trusted)} developer key(s) certified by the master key")
 
     tags = x.run("git", "-C", str(x.builder), "tag", "--points-at", "HEAD",
-                 check=False, capture=True).split()
+                 check=False, capture="stdout").split()
     if not tags:
         raise Fatal(
             "the builder checkout has no tag on HEAD, so there is nothing to "
@@ -1030,10 +1187,14 @@ def verify_builder(x: Ctx) -> None:
             "an unverified builder.")
     raw = x.run("git", "-C", str(x.builder), "verify-tag", "--raw", tags[0],
                 check=False, capture=True, env=env)
-    signer = next((ln.split()[2] for ln in raw.splitlines()
-                   if ln.startswith("[GNUPG:] VALIDSIG")), "")
+    valid = next((ln.split() for ln in raw.splitlines()
+                  if ln.startswith("[GNUPG:] VALIDSIG")), [])
+    # VALIDSIG names the key that signed (field 2) and, last, its primary:
+    # a tag made by a signing subkey is trusted through its primary.
+    signer = valid[2] if len(valid) > 2 else ""
+    primary = valid[11] if len(valid) > 11 else signer
     good = any(ln.startswith("[GNUPG:] GOODSIG") for ln in raw.splitlines())
-    if not good or signer.upper() not in trusted:
+    if not good or not ({signer.upper(), primary.upper()} & trusted):
         raise Fatal(
             f"the builder tag {tags[0]} does not verify against a Qubes "
             f"developer key.\n     Signer: {signer or 'none'}\n"
@@ -1129,6 +1290,9 @@ chroot_cmd bash -c "curl -fsSL '@WAZUH_KEY@' | gpg --no-default-keyring --keyrin
 # network and trusting it via signed-by= is not a check.
 chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{print toupper(\\$10)}' | grep -qxF '@WAZUH_KEY_FPR@'" \\
     || { error 'Wazuh signing key is not @WAZUH_KEY_FPR@ — refusing to bake an unverified key into the image'; exit 1; }
+# And nothing beside it: signed-by= trusts every key in the file.
+chroot_cmd bash -c "[ \\$(gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --list-keys | grep -c '^pub:') -eq 1 ]" \\
+    || { error 'the Wazuh keyring holds more than the pinned key — refusing'; exit 1; }
 echo '@WAZUH_REPO@' > "${INSTALL_DIR}/etc/apt/sources.list.d/wazuh.list"
 aptUpdate
 aptInstall wazuh-agent
@@ -1295,6 +1459,8 @@ chroot_cmd mkdir -p /usr/share/keyrings
 chroot_cmd bash -c "curl -fsSL '{z['key_url']}' | gpg --dearmor > /usr/share/keyrings/security_zeek.gpg && chmod 644 /usr/share/keyrings/security_zeek.gpg"
 chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/security_zeek.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{{print toupper(\\$10)}}' | grep -qxF '{z['key_fpr']}'" \\
     || {{ error 'openSUSE Build Service key is not {z['key_fpr']} — refusing to bake an unverified key into the image'; exit 1; }}
+chroot_cmd bash -c "[ \\$(gpg --no-default-keyring --keyring /usr/share/keyrings/security_zeek.gpg --with-colons --list-keys | grep -c '^pub:') -eq 1 ]" \\
+    || {{ error 'the Zeek keyring holds more than the pinned key — refusing'; exit 1; }}
 aptUpdate
 aptInstall {z['package']}
 uninstallQubesRepo
@@ -1321,7 +1487,12 @@ installQubesRepo
 aptUpdate
 aptInstall curl gnupg apt-transport-https ca-certificates lsb-release
 
-chroot_cmd bash -c "curl -s '{w['key_url']}' | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import && chmod 644 /usr/share/keyrings/wazuh.gpg"
+chroot_cmd bash -c "curl -fsSL '{w['key_url']}' | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import && chmod 644 /usr/share/keyrings/wazuh.gpg"
+# Pinned before the manager is installed with it, not after.
+chroot_cmd bash -c "gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --fingerprint | awk -F: '\\$1==\\"fpr\\"{{print toupper(\\$10)}}' | grep -qxF '{w['key_fpr']}'" \\
+    || {{ error 'Wazuh signing key is not {w['key_fpr']} — refusing to bake an unverified key into the image'; exit 1; }}
+chroot_cmd bash -c "[ \\$(gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --with-colons --list-keys | grep -c '^pub:') -eq 1 ]" \\
+    || {{ error 'the Wazuh keyring holds more than the pinned key — refusing'; exit 1; }}
 echo '{w['apt_repo_line']}' > "${{INSTALL_DIR}}/etc/apt/sources.list.d/wazuh.list"
 aptUpdate
 
@@ -2065,7 +2236,7 @@ def write_builder_iso_config(x: Ctx, base_ks: str, iso_tpls: list[str], kickstar
     merge_builder_config(x, updates, "iso block")
 
 
-def provisioner_config_bytes(x: Ctx, payload: Path) -> bytes:
+def provisioner_config_bytes(x: Ctx, payload: Path, edition: str | None = None) -> bytes:
     """Validate and serialize the non-secret target configuration."""
     source = x.c.get("provisioner_config") or ""
     if source:
@@ -2093,12 +2264,26 @@ def provisioner_config_bytes(x: Ctx, payload: Path) -> bytes:
                 walk(value, prefix)
 
     walk(cfg)
+    # credentials.fixed holds shared passwords under names the pattern above
+    # cannot know (dashboard, api, authd, backup). The kickstart is signed and
+    # handed out — package-release publishes it — so they never go into it.
+    creds = cfg.get("credentials") if isinstance(cfg.get("credentials"), dict) else {}
+    fixed = creds.get("fixed") if isinstance(creds.get("fixed"), dict) else {}
+    if creds.get("use_fixed_defaults") or any(v not in ("", None) for v in fixed.values()):
+        raise Fatal("provisioner_config sets credentials.use_fixed_defaults or "
+                    "credentials.fixed: shared passwords would be embedded in the "
+                    "signed, distributable kickstart.\n     Leave credentials out; "
+                    "each machine generates its own at first boot.")
     # Keep the transported config and provisioner implementation on the same
     # schema/version. A mismatch must be resolved at build time, not on dom0.
     match = re.search(rb'"image_version"\s*:\s*"([^"]+)"', payload.read_bytes())
     embedded_version = match.group(1).decode() if match else ""
     if cfg.get("image_version", embedded_version) != embedded_version:
         raise Fatal("provisioner_config image_version does not match golden_image.py")
+    if edition:
+        # The kickstart decides the edition; a provisioner_config that says
+        # otherwise would make one signed file install two different things.
+        cfg["edition"] = edition
     return (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode()
 
 
@@ -2249,20 +2434,68 @@ def write_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
     runs.
     """
     x.phase("2b", "generate the install-time (QUBES_OEM) kickstart")
-    oem_dir = x.out_dir / "oem"
-    ks = oem_dir / "ks.cfg"
+    ks = oem_kickstart_path(x)
+    edition = x.c.get("edition", "wired")
+    if edition not in EDITIONS:
+        raise Fatal(f"edition must be one of {', '.join(EDITIONS)}, not {edition!r}")
     if x.args.dry_run:
-        x.info(f"[dry-run] write {ks} (installer answers + %post payload)")
+        x.info(f"[dry-run] write {ks} ({edition} edition: installer answers + "
+               f"%post payload), and one kickstart per edition under oem/editions/")
         return ks
     conf = release_dir(x) / "conf"
     if not (conf / base_ks).is_file():
         raise Fatal(f"base kickstart {base_ks} is not in {conf}")
-    oem_dir.mkdir(parents=True, exist_ok=True)
+    # A signature is only ever made over the file it sits beside. Rewriting
+    # the kickstarts leaves the old .asc files describing the old contents:
+    # if the build then fails, or runs --allow-unsigned, they would read as
+    # "tampered" (or be recorded as signed). They go now; signing remakes them.
+    for asc in [oem_kickstart_signature_path(x)] + [
+            edition_kickstart_path(x, ed).with_name("ks.cfg.asc") for ed in EDITIONS]:
+        asc.unlink(missing_ok=True)
+    for ed in EDITIONS:
+        render_oem_kickstart(x, base_ks, payload, extra_packages, ed,
+                             edition_kickstart_path(x, ed), report=(ed == edition))
+    shutil.copy2(edition_kickstart_path(x, edition), ks)
+    x.ok(f"oem/ks.cfg is the {edition} edition "
+         f"(every edition is in oem/editions/ — write-usb --edition picks one)")
+    return ks
+
+
+def render_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
+                         extra_packages: list[str], edition: str, ks: Path,
+                         report: bool = True) -> Path:
+    """Write one edition's install-time kickstart to `ks`. `report` prints
+    the summary lines, which are the same for every edition."""
+    ks.parent.mkdir(parents=True, exist_ok=True)
     stock_pkgs = stock_package_block(x, base_ks)
     b64 = base64.b64encode(payload.read_bytes()).decode()
     b64 = "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))
-    cfg64 = base64.b64encode(provisioner_config_bytes(x, payload)).decode()
+    cfg64 = base64.b64encode(provisioner_config_bytes(x, payload, edition)).decode()
     cfg64 = "\n".join(cfg64[i:i + 76] for i in range(0, len(cfg64), 76))
+    # The workstation guide travels with every install: for the unwired
+    # edition it is the map of what to wire, for the wired one the reference.
+    guide_src = Path(__file__).resolve().parent / "docs" / "WORKSTATION-GUIDE.md"
+    if guide_src.is_file():
+        g64 = base64.b64encode(guide_src.read_bytes()).decode()
+        g64 = "\n".join(g64[i:i + 76] for i in range(0, len(g64), 76))
+        user = shlex.quote(x.c["install"]["username"])
+        guide_block = f"""
+# --- workstation guide ---------------------------------------------------
+mkdir -p {GUIDE_DIR}
+cat > {GUIDE_DIR}/WORKSTATION-GUIDE.md.b64 <<'GUIDE_B64_EOF'
+{g64}
+GUIDE_B64_EOF
+base64 -d {GUIDE_DIR}/WORKSTATION-GUIDE.md.b64 > {GUIDE_DIR}/WORKSTATION-GUIDE.md
+rm -f {GUIDE_DIR}/WORKSTATION-GUIDE.md.b64
+chmod 644 {GUIDE_DIR}/WORKSTATION-GUIDE.md
+if [ -d /home/{user} ]; then
+    cp {GUIDE_DIR}/WORKSTATION-GUIDE.md /home/{user}/WORKSTATION-GUIDE.md
+    chown {user}: /home/{user}/WORKSTATION-GUIDE.md
+fi
+"""
+    else:
+        x.warn(f"{guide_src} not found — this kickstart carries no workstation guide")
+        guide_block = ""
 
     # One %packages block: the stock dom0 selection plus our templates. A
     # kickstart's %packages REPLACES the default selection, so the stock list
@@ -2274,10 +2507,6 @@ def write_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
                        + "\n".join(f"qubes-template-{p}" for p in extra_packages))
     pkgs = f"%packages\n{stock_pkgs}{extra_lines}\n%end\n"
 
-    auto_setup = "yes" if x.c["install"]["auto_initial_setup"] else "no"
-    autotimer = ("systemctl enable golden-image-firstboot.timer"
-                 if x.c["auto_provision"] else
-                 "# auto_provision is off — no retry timer")
     autoline = ("systemctl enable golden-image-firstboot.service"
                 if x.c["auto_provision"]
                 else "# auto_provision disabled — operator runs it manually")
@@ -2286,6 +2515,13 @@ def write_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
                  if x.c["auto_provision"]
                  else "# auto_provision disabled — no retry timer")
     installer = build_installer_directives(x)
+    motd_tail = ("""
+  Credentials are written to ~/golden-image/credentials.json (mode 600).
+  Change them, escrow them, then shred that file.
+""" if edition == "wired" else """
+  Templates only: nothing is wired and no credentials are generated.
+  To build the whole design after all:  sudo golden-image-provision --edition wired
+""")
 
     ks.write_text(f"""\
 # =============================================================================
@@ -2319,8 +2555,8 @@ cat > /usr/local/sbin/golden-image.json.b64 <<'CONFIG_B64_EOF'
 CONFIG_B64_EOF
 base64 -d /usr/local/sbin/golden-image.json.b64 > /usr/local/sbin/golden-image.json
 rm -f /usr/local/sbin/golden-image.json.b64
-chmod 644 /usr/local/sbin/golden-image.json
-
+chmod 600 /usr/local/sbin/golden-image.json
+{guide_block}
 cat > /usr/local/sbin/golden-image-provision <<'WRAP_EOF'
 #!/bin/bash
 # Provision this machine into the investigator golden image.
@@ -2491,6 +2727,7 @@ fi
 # password. Until then the timer keeps this running, and each run asks again.
 if [ -e "$ACCOUNT_MARKER" ]; then
     touch "$MARKER"
+    rm -f /etc/motd.d/golden-image
     note "complete: provisioned and login password enrolled"
     systemctl disable golden-image-firstboot.timer >/dev/null 2>&1 || true
     exit 0
@@ -2506,18 +2743,19 @@ chmod 755 /usr/local/sbin/golden-image-firstboot
 {autoline}
 {autotimer}
 
+# The banner. Its own file: /etc/motd.d/golden-image is the first-boot
+# runner's status line, which it rewrites and removes as provisioning moves on.
 mkdir -p /etc/motd.d
-cat > /etc/motd.d/golden-image <<'MOTD_EOF'
+cat > /etc/motd.d/inqubestigationos <<'MOTD_EOF'
 
-  {x.c['iso_flavor']}
-  {'-' * len(x.c['iso_flavor'])}
+  {x.c['iso_flavor']} ({edition} edition)
+  {'-' * len(x.c['iso_flavor'] + edition) + '-' * 11}
+    Guide: {GUIDE_DIR}/WORKSTATION-GUIDE.md
+    sudo golden-image-provision --status     # where this machine is
     sudo golden-image-provision --dry-run    # see the plan
     sudo golden-image-provision              # run or resume
     sudo golden-image-provision --verify     # acceptance tests
-
-  Credentials are written to ~/golden-image/credentials.json (mode 600).
-  Change them, escrow them, then shred that file.
-
+{motd_tail}
 MOTD_EOF
 
 %end
@@ -2525,10 +2763,12 @@ MOTD_EOF
     ks.chmod(0o644)
     x.ok(f"wrote {ks}")
     validate_install_contract(x, ks)
-    if extra_packages:
+    if extra_packages and report:
         x.info(f"installs templates: "
                f"{', '.join('qubes-template-'+p for p in extra_packages)}")
     validate_kickstart(x, ks, extra_packages, require_post=True)
+    if not report:
+        return ks
     x.info(f"auto-provision on first boot: {x.c['auto_provision']}")
     x.info("the runner records deferred, failed and complete attempts in "
            "/var/lib/golden-image/firstboot-status; a real boot remains a "
@@ -2611,10 +2851,11 @@ def build_installer_directives(x: Ctx) -> str:
     if not target:
         raise Fatal("install.unattended requires install.disk with a stable target "
                     "identity; refusing to generate unrestricted clearpart --all")
-    if not (target.startswith("/dev/disk/by-id/")
-            or target.startswith("/dev/disk/by-path/")):
-        raise Fatal("install.disk must be /dev/disk/by-id/... or /dev/disk/by-path/... "
-                    "so the target is identified on the installation machine")
+    # by-id only, as validate_config enforces when the configuration loads: a
+    # by-path name follows the port, not the disk.
+    if not target.startswith("/dev/disk/by-id/"):
+        raise Fatal("install.disk must be /dev/disk/by-id/... so the target is "
+                    "identified on the installation machine")
     if not inst["encrypt_disk"]:
         raise Fatal("unattended destructive installation requires disk encryption")
     lines = account + [
@@ -2875,15 +3116,10 @@ def build_iso(x: Ctx, payload: Path):
     x.info(f"built image: {built}")
 
     target = x.out_dir / x.c["iso_name"]
-    shutil.copy2(built, target)
+    copy_with_progress(built, target, "copying image")
     x.ok(f"-> {target}")
 
-    import hashlib
-    h = hashlib.sha256()
-    with target.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    digest = h.hexdigest()
+    digest = sha256_file(target, "checksum")
     (x.out_dir / f"{x.c['iso_name']}.sha256").write_text(f"{digest}  {x.c['iso_name']}\n")
     x.ok(f"checksum: {digest[:32]}…")
 
@@ -4396,9 +4632,15 @@ store other private key material — not beside the ISOs it signs.
 
 def restore_key(x: Ctx) -> int:
     x.phase("restore-key", "restore the signing key")
-    src = Path(getattr(x.args, "from_dir", None) or (x.out_dir / "key-backup"))
+    given = getattr(x.args, "from_dir", None)
+    # backup-key defaults to output/key-backup; quickstart puts it in the work
+    # directory, beside output/ rather than in it. Look in both.
+    candidates = [Path(given)] if given else [x.out_dir / "key-backup",
+                                              x.work / "key-backup"]
+    src = next((c for c in candidates if c.is_dir()), candidates[0])
     if not src.is_dir():
-        raise Fatal(f"no backup directory at {src} — pass --from <directory>")
+        raise Fatal(f"no backup directory at {' or '.join(map(str, candidates))} "
+                    f"— pass --from <directory>")
     enc = sorted(src.glob("*-secret.asc.gpg"))
     if not enc:
         raise Fatal(f"no *-secret.asc.gpg in {src}")
@@ -5102,12 +5344,7 @@ def sign_iso(x: Ctx) -> int:
     if iso.parent != x.out_dir:
         x.out_dir = iso.parent
 
-    import hashlib
-    h = hashlib.sha256()
-    with iso.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 22), b""):
-            h.update(chunk)
-    digest = h.hexdigest()
+    digest = sha256_file(iso, "checksum")
     sha = iso.parent / f"{iso.name}.sha256"
     if sha.is_file() and sha.read_text().split()[0] != digest:
         raise Fatal(f"{iso.name} does not match {sha.name}. The image changed "
@@ -5131,7 +5368,7 @@ def sign_iso(x: Ctx) -> int:
     print(f"""
   Copy back to the build host, or hand out from here:
     {iso.name}, {sha.name}, {sig.name}
-    unit-signing-key.asc, verify-iso.sh{', oem/ks.cfg, oem/ks.cfg.asc' if ks_sig else ''}
+    unit-signing-key.asc, verify-iso.sh{', the oem/ folder (ks.cfg and editions/, each with its .asc)' if ks_sig else ''}
   And, through a channel independent of all of those:
     {iso.parent / 'FINGERPRINT.txt'}
 """)
@@ -5306,24 +5543,20 @@ def write_usb(x: Ctx) -> int:
     #    beside the image, not inside it, so the image's checksum and
     #    signature say nothing about it: a replaced oem/ks.cfg would verify
     #    exactly as well as the genuine one. It gets the same authentication.
+    #    Everything that can be missing is looked for first, so a missing file
+    #    is reported in seconds rather than after two passes over the image.
     sha = x.out_dir / f"{x.c['iso_name']}.sha256"
-    if sha.is_file():
-        import hashlib
-        h = hashlib.sha256()
-        with iso.open("rb") as f:
-            for chunk in iter(lambda: f.read(1 << 22), b""):
-                h.update(chunk)
-        want = sha.read_text().split()[0]
-        if h.hexdigest() != want:
-            raise Fatal(f"checksum mismatch for {iso.name} — the image on disk is "
-                        f"not the one that was built. Do not distribute it.")
-        x.ok("checksum matches the build record")
-    else:
+    if not sha.is_file():
         raise Fatal("no .sha256 beside the image — refusing destructive write")
 
     no_oem = bool(getattr(x.args, "no_oem", False))
     ks = oem_kickstart_path(x)
     ks_sig = oem_kickstart_signature_path(x)
+    chosen = getattr(x.args, "edition", None)
+    if chosen and not no_oem:
+        ks = edition_kickstart_path(x, chosen)
+        ks_sig = ks.with_name("ks.cfg.asc")
+        x.info(f"edition: {chosen} ({ks.relative_to(x.out_dir)})")
     if no_oem:
         pass
     elif not ks.is_file():
@@ -5343,19 +5576,28 @@ def write_usb(x: Ctx) -> int:
             f"deliberately.")
 
     asc = x.out_dir / f"{x.c['iso_name']}.asc"
-    if asc.is_file():
-        x.info("verifying the signature (gpg hashes the whole image)")
-        # --status-fd, not a bare --verify: `gpg --verify` exits 0 for a good
-        # signature from ANY key in the keyring, so reporting "verifies against
-        # <the unit key>" after it asserted a binding that was never tested —
-        # on the last checkpoint before an image reaches removable media.
-        signer = verify_detached_signature(asc, iso, x.c["iso_sign_key"])
-        x.ok(f"signature verifies, signed by {signer}")
-    else:
+    if not asc.is_file():
         raise Fatal("no detached signature beside the image — refusing destructive write")
     if not (x.c.get("iso_sign_key") or "").strip():
         raise Fatal("iso_sign_key is not configured, so the expected signer cannot "
                     "be authenticated before writing")
+    if not no_oem:
+        # Checked before anything is erased: a missing partitioning tool used
+        # to surface only after dd, leaving a plain installer stick behind.
+        oem_tools_present(x)
+
+    want = sha.read_text().split()[0]
+    if sha256_file(iso, "checksum") != want:
+        raise Fatal(f"checksum mismatch for {iso.name} — the image on disk is "
+                    f"not the one that was built. Do not distribute it.")
+    x.ok("checksum matches the build record")
+    x.info("verifying the signature (gpg hashes the whole image)")
+    # --status-fd, not a bare --verify: `gpg --verify` exits 0 for a good
+    # signature from ANY key in the keyring, so reporting "verifies against
+    # <the unit key>" after it asserted a binding that was never tested —
+    # on the last checkpoint before an image reaches removable media.
+    signer = verify_detached_signature(asc, iso, x.c["iso_sign_key"])
+    x.ok(f"signature verifies, signed by {signer}")
     if not no_oem:
         signer = verify_detached_signature(ks_sig, ks, x.c["iso_sign_key"])
         x.ok(f"install-time kickstart signature verifies, signed by {signer}")
@@ -5395,6 +5637,9 @@ def write_usb(x: Ctx) -> int:
                         "with --device")
         dev_path = devs[0]["dev"]
         x.info(f"selected the only removable device: {dev_path}")
+    # /dev/disk/by-id/usb-... names the same stick as /dev/sdb; the removable
+    # list, the mount check and the size check all speak kernel names.
+    dev_path = os.path.realpath(dev_path)
 
     match = next((d for d in devs if d["dev"] == dev_path), None)
     if match is None:
@@ -5421,13 +5666,13 @@ def write_usb(x: Ctx) -> int:
     x.warn(f"  writing {iso.name} ({size_gb:.1f} GB)")
     print()
     if x.args.dry_run:
-        x.info(f"[dry-run] dd if={iso} of={dev_path} bs=4M oflag=direct")
+        x.info(f"[dry-run] {iso.name} -> dd of={dev_path} bs=4M iflag=fullblock "
+               f"oflag=direct, then read back and compare")
         return 0
     if not confirmed(x, f"Write to {dev_path}?"):
         raise Fatal("aborted")
 
-    x.run(*_sudo(["dd", f"if={iso}", f"of={dev_path}", "bs=4M", "status=progress",
-                  "oflag=direct"]), live=True)
+    write_image(x, iso, dev_path)
     x.run(*_sudo(["sync"]))
     x.ok("written")
 
@@ -5439,13 +5684,15 @@ def write_usb(x: Ctx) -> int:
     h = hashlib.sha256()
     remaining = iso.stat().st_size
     try:
-        with open(dev_path, "rb") as dev:
+        with open(dev_path, "rb") as dev, \
+                Progress("reading back", iso.stat().st_size) as bar:
             while remaining > 0:
                 chunk = dev.read(min(1 << 22, remaining))
                 if not chunk:
                     break
                 h.update(chunk)
                 remaining -= len(chunk)
+                bar.update(len(chunk))
     except PermissionError:
         # Elevate, exactly as the write already does. Skipping the readback is
         # skipping the check that a stick wrote without error and reads back
@@ -5458,18 +5705,20 @@ def write_usb(x: Ctx) -> int:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         assert proc.stdout
         remaining = iso.stat().st_size
-        while remaining > 0:
-            chunk = proc.stdout.read(min(1 << 22, remaining))
-            if not chunk:
-                break
-            h.update(chunk)
-            remaining -= len(chunk)
+        with Progress("reading back", remaining) as bar:
+            while remaining > 0:
+                chunk = proc.stdout.read(min(1 << 22, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+                bar.update(len(chunk))
         proc.stdout.close()
         proc.wait()
         if remaining > 0:
             raise Fatal("could not read the device back even with sudo; USB "
                         "verification failed and the media must not be distributed")
-    if h.hexdigest() == want_digest(x):
+    if h.hexdigest() == want:
         x.ok("readback matches the image byte for byte")
     else:
         raise Fatal("readback does NOT match the image. The write failed silently "
@@ -5504,10 +5753,16 @@ def write_usb(x: Ctx) -> int:
 #  `if search --set=oem -l QUBES_OEM` in templates/config_files/x86/grub2-bios.cfg
 #  and grub2-efi.cfg. It is not a name this project is free to choose.
 OEM_LABEL = "QUBES_OEM"
+EDITIONS = ("wired", "unwired")
+GUIDE_DIR = "/usr/share/doc/inqubestigationos"
 
 
 def oem_kickstart_path(x: Ctx) -> Path:
     return x.out_dir / "oem" / "ks.cfg"
+
+
+def edition_kickstart_path(x: Ctx, edition: str) -> Path:
+    return x.out_dir / "oem" / "editions" / edition / "ks.cfg"
 
 
 def oem_kickstart_signature_path(x: Ctx) -> Path:
@@ -5515,7 +5770,8 @@ def oem_kickstart_signature_path(x: Ctx) -> Path:
 
 
 def sign_oem_kickstart(x: Ctx, fpr: str) -> Path | None:
-    """Detach-sign oem/ks.cfg with the release key.
+    """Detach-sign oem/ks.cfg, and each edition's oem/editions/*/ks.cfg, with
+    the release key.
 
     The kickstart is executed as root by the installer, and it travels beside
     the image rather than inside it, so the image's signature says nothing
@@ -5531,6 +5787,15 @@ def sign_oem_kickstart(x: Ctx, fpr: str) -> Path | None:
     x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
           "--detach-sign", "--armor", "--output", str(sig), str(ks))
     x.ok(f"signed: oem/{sig.name} (the install-time kickstart)")
+    for ed in EDITIONS:
+        eks = edition_kickstart_path(x, ed)
+        if not eks.is_file():
+            continue
+        esig = eks.with_name("ks.cfg.asc")
+        esig.unlink(missing_ok=True)
+        x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
+              "--detach-sign", "--armor", "--output", str(esig), str(eks))
+        x.ok(f"signed: oem/editions/{ed}/ks.cfg.asc")
     return sig
 
 
@@ -5590,6 +5855,26 @@ def guard_second_device(x: Ctx, target: str) -> None:
         raise Fatal("aborted")
 
 
+def oem_tools_present(x: Ctx) -> None:
+    """The tools the QUBES_OEM partition needs, or Fatal.
+
+    Looked up with /usr/sbin and /sbin added: Debian's default PATH for a
+    normal user has neither, while the tools live there and run under sudo.
+    """
+    fstype = x.c["install"]["oem_fstype"]
+    if fstype not in ("vfat", "ext4"):
+        raise Fatal(f"install.oem_fstype must be vfat or ext4, not {fstype!r}")
+    search = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
+    mkfs_tool = "mkfs.vfat" if fstype == "vfat" else "mkfs.ext4"
+    for tool in ("sgdisk", mkfs_tool, "blkid"):
+        if not shutil.which(tool, path=search):
+            raise Fatal(
+                f"{tool} is not installed, so the {OEM_LABEL} partition cannot "
+                f"be created and the installer would never read the kickstart.\n"
+                f"     fix: ./build_iso.py setup-host  (or: sudo apt install "
+                f"gdisk dosfstools)")
+
+
 def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
     """Add the QUBES_OEM partition carrying the install-time kickstart.
 
@@ -5615,16 +5900,9 @@ def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
     by the "Test media and install" boot entry will report a mismatch on a stick
     prepared this way. The install and OEM entries do not run that check.
     """
+    oem_tools_present(x)
     fstype = x.c["install"]["oem_fstype"]
-    if fstype not in ("vfat", "ext4"):
-        raise Fatal(f"install.oem_fstype must be vfat or ext4, not {fstype!r}")
     mkfs_tool = "mkfs.vfat" if fstype == "vfat" else "mkfs.ext4"
-    for tool in ("sgdisk", mkfs_tool, "blkid"):
-        if not shutil.which(tool):
-            raise Fatal(
-                f"{tool} is not installed, so the {OEM_LABEL} partition cannot "
-                f"be created and the installer would never read the kickstart.\n"
-                f"     fix: ./build_iso.py setup-host")
     if x.args.dry_run:
         x.info(f"[dry-run] sgdisk -e {dev_path}; append a {fstype} partition "
                f"labelled {OEM_LABEL}; copy {ks.name} onto it")
@@ -5661,7 +5939,7 @@ def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
     # GRUB finds this by label. If the label is not what the boot entry looks
     # for, the OEM entry never appears and the install is silently manual.
     seen = x.run(*_sudo(["blkid", "-s", "LABEL", "-o", "value", part]),
-                 check=False, capture=True).strip()
+                 check=False, capture="stdout").strip()
     if seen != OEM_LABEL:
         raise Fatal(f"{part} reports LABEL={seen!r}, not {OEM_LABEL!r} — the "
                     f"OEM boot entry would never fire.")
@@ -5680,7 +5958,7 @@ def write_oem_partition(x: Ctx, dev_path: str, ks: Path) -> None:
         try:
             written = Path(td) / "ks.cfg"
             got = x.run(*_sudo(["cat", str(written)]), check=False,
-                        capture=True)
+                        capture="stdout")
             if got != ks.read_text():
                 raise Fatal(f"the kickstart on {part} does not match "
                             f"{ks}. Do not distribute this stick.")
@@ -5742,16 +6020,315 @@ def authenticate_signature(status: str, returncode: int, expected: str) -> str:
                 "authenticated.")
 
 
-def want_digest(x: Ctx) -> str:
-    sha = x.out_dir / f"{x.c['iso_name']}.sha256"
-    if sha.is_file():
-        return sha.read_text().split()[0]
-    import hashlib
-    h = hashlib.sha256()
-    with (x.out_dir / x.c["iso_name"]).open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 22), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def write_image(x: Ctx, iso: Path, dev_path: str) -> None:
+    """Copy the image onto the device, showing how far along it is.
+
+    The bytes are fed to `dd` through a pipe rather than letting dd open the
+    image itself: dd's own status=progress is a carriage-return line that a
+    captured, line-buffered stream turns into thousands of lines. dd still
+    does the privileged, O_DIRECT write; iflag=fullblock keeps its 4 MiB
+    blocks whole when a pipe delivers them in pieces.
+    """
+    size = iso.stat().st_size
+    if os.geteuid() != 0:
+        # Ask for the password now, on a clean line: a sudo prompt that
+        # appears under a redrawing progress bar is unreadable.
+        if subprocess.run(["sudo", "-v"]).returncode != 0:
+            raise Fatal("sudo is needed to write to the device")
+    cmd = _sudo(["dd", f"of={dev_path}", "bs=4M", "iflag=fullblock",
+                 "oflag=direct", "status=none"])
+    x._log("EXEC  " + " ".join(cmd) + f" < {iso}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin
+    try:
+        with iso.open("rb") as f, Progress("writing", size) as bar:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                proc.stdin.write(chunk)
+                bar.update(len(chunk))
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+    if proc.wait() != 0:
+        raise Fatal(f"writing {iso.name} to {dev_path} failed (dd exit "
+                    f"{proc.returncode}) — see {x.log}")
+
+
+# ===========================================================================
+#  package-release — the image as downloadable release assets
+# ===========================================================================
+#  GitHub caps every release asset at 2 GiB and a release holds files, not
+#  folders. So the image is split into parts below that cap, and everything
+#  else a downloader needs travels as one small tarball: the checksum and
+#  signature of the whole image, both editions' signed kickstarts, the public
+#  key, the verification scripts, and this script to write the stick with the
+#  same checks write-usb runs here. SHA256SUMS covers every asset and is
+#  signed, so the download is authenticated before any of it is run.
+RELEASE_PART_LIMIT_MIB = 2048
+
+
+MAKE_USB_SH = r'''#!/usr/bin/env bash
+# make-usb.sh — write a downloaded InQubestigationOS release to a USB stick.
+#
+# Run it from the folder holding every downloaded release file, AFTER
+# verifying SHA256SUMS (see README.txt). It joins the image parts, then hands
+# over to `build_iso.py write-usb`, which re-checks the image's checksum and
+# signature, refuses a non-removable or mounted device, writes, reads the
+# stick back, and adds the QUBES_OEM partition with the edition's signed
+# kickstart.
+#
+#   ./make-usb.sh --fingerprint <40 hex> [--device /dev/sdX] [--edition wired|unwired]
+set -euo pipefail
+ISO=@ISO@
+FPR="" DEV="" EDITION=wired
+die() { echo "make-usb.sh: $*" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fingerprint|--device|--edition)
+            [ $# -ge 2 ] || die "$1 needs a value"
+            case "$1" in
+                --fingerprint) FPR=$2 ;;
+                --device)      DEV=$2 ;;
+                --edition)     EDITION=$2 ;;
+            esac
+            shift 2 ;;
+        -h|--help)     sed -n '2,11p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+cd "$(dirname "$(readlink -f "$0")")"
+# Debian's default PATH for a normal user lacks the sbin directories where
+# sgdisk, blkid and mkfs.vfat live; they run under sudo either way.
+PATH="$PATH:/usr/sbin:/sbin"
+# This folder's configuration, not one an inherited variable points at.
+export INQUBESTIGATION_CONFIG="$PWD/iso-build.json"
+FPR=$(printf '%s' "$FPR" | tr -d ' ' | tr 'a-f' 'A-F')
+[[ $FPR =~ ^[0-9A-F]{40}$ ]] || die "--fingerprint needs the 40-character key
+    fingerprint you received SEPARATELY from this download (phone, internal page).
+    The one in output/FINGERPRINT.txt came with the download and proves nothing."
+case "$EDITION" in wired|unwired) ;; *) die "--edition is wired or unwired" ;; esac
+for tool in python3 gpg sgdisk blkid; do
+    command -v "$tool" >/dev/null || die "$tool is missing (Debian/Kali: sudo apt install python3 gnupg gdisk dosfstools)"
+done
+command -v mkfs.vfat >/dev/null || die "mkfs.vfat is missing (sudo apt install dosfstools)"
+
+if [ ! -f "output/$ISO" ]; then
+    parts=( "$ISO".part* )
+    [ -e "${parts[0]}" ] || die "no output/$ISO and no $ISO.part* files here"
+    echo "joining ${#parts[@]} parts into output/$ISO ..."
+    if command -v pv >/dev/null; then
+        cat "${parts[@]}" | pv -s "$(stat -c %s "${parts[@]}" | awk '{t+=$1} END {print t}')" \
+            > "output/$ISO.partial"
+    else
+        cat "${parts[@]}" > "output/$ISO.partial"
+    fi
+    mv "output/$ISO.partial" "output/$ISO"
+fi
+
+gpg --batch --quiet --import output/unit-signing-key.asc
+python3 - "$FPR" "$ISO" <<'PY'
+import json, sys
+json.dump({"work_dir": ".", "iso_sign_key": sys.argv[1], "iso_name": sys.argv[2]},
+          open("iso-build.json", "w"), indent=2)
+PY
+args=(write-usb --edition "$EDITION")
+[ -n "$DEV" ] && args+=(--device "$DEV")
+exec python3 ./build_iso.py "${args[@]}"
+'''
+
+
+def release_readme(iso_name: str, parts: list[str], kit: str, fpr: str) -> str:
+    first = parts[0] if parts else f"{iso_name}.part01"
+    return f"""\
+{Path(iso_name).stem} — release files
+{'=' * (len(Path(iso_name).stem) + 16)}
+
+Files
+  {kit:<40} scripts, signatures, both editions' kickstarts
+  unit-signing-key.asc                     the public key everything is signed with
+  {first:<40} ...the image, split into {len(parts)} parts (GitHub caps a file at 2 GiB)
+  SHA256SUMS / SHA256SUMS.asc              checksums of every file, signed
+
+Editions (same image; the kickstart decides)
+  wired     the investigator templates AND the full design wired and tested:
+            inspection chain, SIEM, app qubes, policy, backups
+  unwired   the same templates only; you decide the topology. Every install
+            carries /usr/share/doc/inqubestigationos/WORKSTATION-GUIDE.md
+
+1. Authenticate the download (before running anything from it)
+   Get the signing key's fingerprint through a channel you already trust —
+   NOT from this download. It must be:
+       {fpr or '(unsigned build — do not distribute)'}
+
+     gpg --import unit-signing-key.asc
+     gpg --verify SHA256SUMS.asc SHA256SUMS  -> "Good signature", that fingerprint
+     sha256sum -c SHA256SUMS                  -> every line OK
+
+2. Write the stick (Linux; needs python3, gnupg, gdisk, dosfstools)
+     tar xzf {kit}
+     ./make-usb.sh --fingerprint <that fingerprint> --edition wired
+   It joins the parts, re-verifies the image and the kickstart, writes the
+   stick, reads it back, and adds the QUBES_OEM partition the installer
+   reads. Use --device /dev/sdX when more than one stick is plugged in.
+
+   Windows / Rufus / Etcher can write the joined image
+   (copy /b {iso_name}.part01+{iso_name}.part02+... {iso_name}),
+   but only as a PLAIN Qubes installer: without the QUBES_OEM partition
+   nothing is provisioned.
+
+3. Install
+   Boot the stick; the "OEM installation" entry is selected automatically.
+   You choose the disk encryption passphrase during the install; you set
+   the investigator login password at the console on first boot. Neither
+   is part of this download.
+"""
+
+
+def package_release(x: Ctx) -> int:
+    x.phase("release", "package the image as downloadable release files")
+    iso = x.out_dir / x.c["iso_name"]
+    fpr = (x.c.get("iso_sign_key") or "").strip()
+    need = [iso, x.out_dir / f"{iso.name}.sha256", x.out_dir / f"{iso.name}.asc",
+            x.out_dir / "unit-signing-key.asc", x.out_dir / "FINGERPRINT.txt",
+            x.out_dir / "verify-iso.sh", oem_kickstart_path(x),
+            oem_kickstart_signature_path(x)]
+    for ed in EDITIONS:
+        eks = edition_kickstart_path(x, ed)
+        need += [eks, eks.with_name("ks.cfg.asc")]
+    missing = [str(p.relative_to(x.out_dir)) for p in need if not p.is_file()]
+    if missing:
+        raise Fatal("cannot package a release without:\n       "
+                    + "\n       ".join(missing)
+                    + "\n     Build and sign first:  ./build_iso.py iso")
+    if not fpr:
+        raise Fatal("iso_sign_key is empty — a published image must be signed")
+    part_mib = int(getattr(x.args, "part_size", None) or 1900)
+    if not 16 <= part_mib < RELEASE_PART_LIMIT_MIB:
+        raise Fatal(f"--part-size must be 16..{RELEASE_PART_LIMIT_MIB - 1} MiB "
+                    "(GitHub rejects a release file of 2 GiB or more)")
+
+    stamp = f"{datetime.fromtimestamp(iso.stat().st_mtime):%Y%m%d}"
+    name = f"{iso.stem}-{stamp}"
+    dest = Path(getattr(x.args, "to", None) or (x.work / "release")) / name
+    if dest.exists() and any(dest.iterdir()):
+        raise Fatal(f"{dest} already has files in it — remove it or pass --to")
+    if x.args.dry_run:
+        x.info(f"[dry-run] verify, split {iso.name} into {part_mib} MiB parts, "
+               f"write the kit and SHA256SUMS(.asc) into {dest}")
+        return 0
+
+    # 1. Publish only what verifies here: the same checks write-usb makes.
+    want = (x.out_dir / f"{iso.name}.sha256").read_text().split()[0]
+    if sha256_file(iso, "checksum") != want:
+        raise Fatal(f"{iso.name} no longer matches its .sha256 — do not publish it")
+    x.ok("checksum matches the build record")
+    x.info("verifying the image signature (gpg hashes the whole image)")
+    verify_detached_signature(x.out_dir / f"{iso.name}.asc", iso, fpr)
+    x.ok(f"image signature verifies against {fpr}")
+    for p in [oem_kickstart_path(x)] + [edition_kickstart_path(x, e) for e in EDITIONS]:
+        verify_detached_signature(p.with_name("ks.cfg.asc"), p, fpr)
+    x.ok("every kickstart signature verifies")
+
+    # The public key downloaders import must be the key that signed: a stale
+    # or replaced export would leave them nothing to verify SHA256SUMS with.
+    listed = subprocess.run(
+        ["gpg", "--batch", "--with-colons", "--show-keys",
+         str(x.out_dir / "unit-signing-key.asc")],
+        capture_output=True, text=True).stdout
+    if fpr.upper() not in {ln.split(":")[9].upper() for ln in listed.splitlines()
+                           if ln.startswith("fpr:")}:
+        raise Fatal(f"output/unit-signing-key.asc does not contain {fpr}.\n"
+                    f"     Re-export it:  ./build_iso.py sign")
+    x.ok("unit-signing-key.asc is the release key")
+
+    # 2. The kit: an allowlist, so nothing else in output/ (let alone the
+    #    key backup beside it) can end up in a public release by accident.
+    dest.mkdir(parents=True, exist_ok=True)
+    kit_root = dest / ".kit"
+    out = kit_root / "output"
+    (out / "oem").mkdir(parents=True)
+    for f in (f"{iso.name}.sha256", f"{iso.name}.asc", "unit-signing-key.asc",
+              "FINGERPRINT.txt", "verify-iso.sh", "verify-iso.ps1",
+              "BUILD-RECORD.txt"):
+        if (x.out_dir / f).is_file():
+            shutil.copy2(x.out_dir / f, out / f)
+    for ks in [oem_kickstart_path(x)] + [edition_kickstart_path(x, e) for e in EDITIONS]:
+        for f in (ks, ks.with_name("ks.cfg.asc")):
+            rel = f.relative_to(x.out_dir)
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, out / rel)
+    shutil.copy2(Path(__file__).resolve(), kit_root / "build_iso.py")
+    mk = kit_root / "make-usb.sh"
+    mk.write_text(MAKE_USB_SH.replace("@ISO@", shlex.quote(iso.name)))
+    mk.chmod(0o755)
+    kit_name = f"{name}-kit.tar.gz"
+
+    # 3. The parts.
+    size, part_bytes = iso.stat().st_size, part_mib * 1024 * 1024
+    # Zero-padded to the part count, so a shell glob (make-usb.sh) and
+    # `cat *.part*` put part100 after part99, not after part10.
+    digits = max(2, len(str(-(-size // part_bytes))))
+    parts: list[str] = []
+    with iso.open("rb") as src, Progress("splitting", size) as bar:
+        n = 0
+        while True:
+            n += 1
+            pname = f"{iso.name}.part{n:0{digits}d}"
+            written = 0
+            with (dest / pname).open("wb") as dst:
+                while written < part_bytes:
+                    chunk = src.read(min(1 << 22, part_bytes - written))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+                    bar.update(len(chunk))
+            if written == 0:
+                (dest / pname).unlink()
+                break
+            parts.append(pname)
+    x.ok(f"{len(parts)} parts of at most {part_mib} MiB")
+
+    (kit_root / "README.txt").write_text(
+        release_readme(iso.name, parts, kit_name, fpr))
+    import tarfile
+    with tarfile.open(dest / kit_name, "w:gz") as tar:
+        for f in sorted(kit_root.rglob("*")):
+            tar.add(f, arcname=str(f.relative_to(kit_root)), recursive=False)
+    shutil.copy2(kit_root / "README.txt", dest / "README.txt")
+    shutil.copy2(x.out_dir / "unit-signing-key.asc", dest / "unit-signing-key.asc")
+    shutil.rmtree(kit_root)
+    x.ok(f"kit: {kit_name}")
+
+    # 4. SHA256SUMS over every asset, signed with the release key.
+    sums = dest / "SHA256SUMS"
+    lines = [f"{sha256_file(dest / f, f[-22:])}  {f}"
+             for f in [kit_name, "README.txt", "unit-signing-key.asc", *parts]]
+    sums.write_text("\n".join(lines) + "\n")
+    x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
+          "--detach-sign", "--armor", "--output", str(dest / "SHA256SUMS.asc"),
+          str(sums))
+    x.ok("SHA256SUMS signed")
+
+    total = sum((dest / f).stat().st_size for f in os.listdir(dest))
+    print(f"""
+{B}{G}══ Release ready{RST}  {dest}  ({human_bytes(total)})
+
+  Upload every file in that folder as the assets of one GitHub release
+  (Releases → Draft a new release → drag them in), or with the GitHub CLI:
+
+    gh release create {stamp} {shlex.quote(str(dest))}/* --title {shlex.quote(name)} \\
+        --notes-file {shlex.quote(str(dest / 'README.txt'))}
+
+  Never upload the key-backup folder or iso-build.json. The signing
+  passphrase stays with you; downloaders need only the fingerprint:
+    {fpr}
+  — given to them through a channel other than the release itself.
+""")
+    return 0
 
 
 # ===========================================================================
@@ -5837,6 +6414,15 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("manual installation must not persist a destructive target disk")
     if not install.get("username", "").strip():
         raise ValueError("install.username is required for target-local account enrollment")
+    # Pasted unquoted into the first-boot runner (qvm-check, log lines): a
+    # qube name, and nothing a shell could read as more than one.
+    template = install.get("required_template")
+    if template is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,30}",
+                                                 str(template)):
+        raise ValueError("install.required_template must be a qube name "
+                         "(a letter, then letters, digits, _ . or -)")
+    if cfg.get("edition", "wired") not in EDITIONS:
+        raise ValueError(f"edition must be one of {', '.join(EDITIONS)}")
 
 
 def main() -> int:
@@ -5845,7 +6431,9 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 lifecycle
-  bootstrap        all of the below, in order, stopping at the first failure
+  quickstart       one command: check, fix, build and sign (--usb: write the stick)
+  bootstrap        production path: gen-key, backup-key, doctor, check-upstream,
+                   plan and build, then an audited export (docs/BOOTSTRAP.md)
   bootstrap-status show the build-VM bootstrap status record (use --watch)
   setup-host       install and configure everything the build host needs
   gen-key          create (or adopt) the ISO signing key and record it
@@ -5854,25 +6442,28 @@ lifecycle
   check-upstream   compare pinned keys and versions against upstream
   templates        build the five investigator templates
   iso              build, checksum and sign the ISO
-  all              templates, then the ISO
+  all              the ISO (at tier 2: the templates first)
   sign             sign an image on the machine that holds the key
   backup-key       export the signing key, its revocation certificate and public key
   restore-key      import a signing-key backup on another machine
   write-usb        verify the image and write it to removable media
+  package-release  split and sign the image as downloadable release files
   list-kickstarts  show what the fetched Qubes sources offer
 """)
     p.add_argument("action", nargs="?", default="iso",
                    choices=["quickstart", "iso", "templates", "all",
                             "list-kickstarts",
                             "doctor", "setup-host", "gen-key", "check-upstream",
-                            "write-usb", "config", "sign",
+                            "write-usb", "package-release", "config", "sign",
                             "backup-key", "restore-key", "bootstrap",
                             "bootstrap-status"],
                    help="what to do (default: iso)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--watch", action="store_true",
                    help="bootstrap-status: refresh when the status file changes")
-    p.add_argument("--force", action="store_true", help="skip the warning prompt")
+    p.add_argument("--force", action="store_true",
+                   help="rebuild the templates even when their RPMs exist "
+                        "(--yes answers the prompts)")
     p.add_argument("--fix", action="store_true",
                    help="doctor: run the fixes it would otherwise only print")
     p.add_argument("--allow-unsigned", action="store_true",
@@ -5910,12 +6501,21 @@ lifecycle
     u.add_argument("--allow-local-key-backup", action="store_true",
                    help="keep the signing-key backup on this host instead of "
                         "requiring separately mounted media")
+    u.add_argument("--edition", choices=list(EDITIONS),
+                   help="which edition's signed kickstart goes on the stick "
+                        "(default: oem/ks.cfg, the configured edition)")
     u.add_argument("--no-oem", action="store_true",
                    help=f"do not write the {OEM_LABEL} partition; the installer "
                         f"will then find no kickstart and nothing provisions the "
                         f"machine")
-    b = p.add_argument_group("backup-key / restore-key")
-    b.add_argument("--to", metavar="DIR", help="where to write the key backup")
+    r = p.add_argument_group("package-release")
+    r.add_argument("--part-size", type=int, metavar="MIB",
+                   help="size of each image part in MiB (default 1900; "
+                        "GitHub rejects release files of 2 GiB or more)")
+    b = p.add_argument_group("backup-key / restore-key / package-release")
+    b.add_argument("--to", metavar="DIR",
+                   help="where to write the key backup (backup-key) or the "
+                        "release files (package-release)")
     b.add_argument("--from", dest="from_dir", metavar="DIR",
                    help="the key backup to restore from")
     b.add_argument("--passphrase-file", metavar="PATH",
@@ -5944,6 +6544,11 @@ lifecycle
     args.assume_yes = args.yes
     if (args.set_kv or args.get_key) and args.action == "iso":
         args.action = "config"
+    if args.set_kv and args.action not in ("config", "bootstrap", "quickstart"):
+        # Every other action used to ignore --set without a word.
+        p.error(f"--set is applied by config, bootstrap and quickstart, not by "
+                f"{args.action}. Run ./build_iso.py --set KEY=VALUE on its own "
+                f"first, then ./build_iso.py {args.action}.")
 
     try:
         # doctor and list-kickstarts report; they do not create anything, not
@@ -5952,10 +6557,11 @@ lifecycle
                           dry_run=args.dry_run
                           or args.action in ("doctor", "list-kickstarts"),
                           validate_semantics=not args.set_kv)
-        # Bootstrap consumes configuration while constructing paths and before
-        # spawning any dependent stage.  Apply and persist its overrides now;
-        # the old dispatch below happened too late and silently ignored them.
-        if args.action == "bootstrap" and args.set_kv:
+        # Bootstrap and quickstart consume configuration while constructing
+        # paths and before any dependent stage. Apply and persist their
+        # overrides now; the old dispatch below happened too late and silently
+        # ignored them.
+        if args.action in ("bootstrap", "quickstart") and args.set_kv:
             probe = Ctx(cfg, args)
             pairs = []
             for kv in args.set_kv:
@@ -6031,6 +6637,8 @@ lifecycle
             return restore_key(x)
         if args.action == "write-usb":
             return write_usb(x)
+        if args.action == "package-release":
+            return package_release(x)
 
         if args.action == "list-kickstarts":
             for k in list_kickstarts(x):

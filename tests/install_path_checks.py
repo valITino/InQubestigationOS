@@ -86,6 +86,28 @@ def main():
         assert "autopart" not in compose and "clearpart" not in compose
         assert f"%include {stock.name}" in compose
 
+        # One build yields a signed kickstart per edition, and oem/ks.cfg is
+        # the configured one. The edition reaches the provisioner through the
+        # embedded golden-image.json, and every install carries the guide.
+        import base64 as _b64
+        import re as _re
+
+        def embedded_config(path):
+            m = _re.search(r"<<'CONFIG_B64_EOF'\n(.*?)\nCONFIG_B64_EOF",
+                           path.read_text(), _re.S)
+            return json.loads(_b64.b64decode(m.group(1).replace("\n", "")))
+
+        for ed in bi.EDITIONS:
+            eks = bi.edition_kickstart_path(x, ed)
+            assert eks.is_file(), f"no kickstart for the {ed} edition"
+            assert embedded_config(eks)["edition"] == ed
+            assert "WORKSTATION-GUIDE.md" in eks.read_text()
+            assert f"({ed} edition)" in eks.read_text()
+        assert oem.read_text() == bi.edition_kickstart_path(x, "wired").read_text(), \
+            "oem/ks.cfg must be the configured (default: wired) edition"
+        # The custom provisioner_config is still carried, edition added.
+        assert embedded_config(oem)["wazuh"]["mode"] == "central"
+
         # Everything installer-side lives in the QUBES_OEM kickstart instead.
         text = oem.read_text()
         assert oem.name == "ks.cfg" and oem.parent.name == "oem"
@@ -243,7 +265,28 @@ def main():
         runner = SimpleNamespace(run=lambda *a, **k: "total_memory : 32768\n")
         assert gi.physical_memory_gb(runner) == 32
 
-    print("  44/44 installation-path checks pass")
+        # package-release publishes only a complete, signed set, and never a
+        # part GitHub would reject (2 GiB and up).
+        fatal(lambda: bi.package_release(x), "cannot package a release without")
+        fatal(lambda: bi.package_release(x), "InQubestigationOS.iso.asc")
+        for ed in bi.EDITIONS:
+            eks = bi.edition_kickstart_path(x, ed)
+            eks.parent.mkdir(parents=True, exist_ok=True)
+            eks.write_text("%post\n%end\n")
+            eks.with_name("ks.cfg.asc").write_text("sig")
+        for f in (f"{x.c['iso_name']}.asc", "unit-signing-key.asc",
+                  "FINGERPRINT.txt", "verify-iso.sh", "oem/ks.cfg.asc"):
+            (x.out_dir / f).write_text("fixture")
+        x.c["iso_sign_key"] = "A" * 40
+        x.args.part_size = 2048
+        fatal(lambda: bi.package_release(x), "--part-size")
+        x.args.part_size = None
+        # The download kit's writer must at least be valid bash.
+        mk = Path(td) / "make-usb.sh"
+        mk.write_text(bi.MAKE_USB_SH.replace("@ISO@", "x.iso"))
+        assert subprocess.run(["bash", "-n", str(mk)]).returncode == 0
+
+    print("  51/51 installation-path checks pass")
     return 0
 
 

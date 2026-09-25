@@ -8,6 +8,7 @@ SHELL := /bin/bash
 
 UID ?= Investigator Image Signing <cyber@example.invalid>
 DEVICE ?=
+EDITION ?=
 RC_ARGS ?=
 
 # Some shells export UID as the numeric user id. A key whose identity is "1000"
@@ -88,8 +89,12 @@ acceptance-collect:  ## authorized Qubes dom0 only: collect safe automated evide
 	sudo ./acceptance_runner.py --report "$(or $(REPORT),acceptance-report.json)" --collect
 
 .PHONY: usb
-usb:  ## verify the ISO and write it to a removable device (DEVICE=/dev/sdX)
-	./build_iso.py write-usb $(if $(DEVICE),--device $(DEVICE),)
+usb:  ## verify the ISO and write it to a removable device (DEVICE=/dev/sdX EDITION=wired|unwired)
+	./build_iso.py write-usb $(if $(DEVICE),--device $(DEVICE),) $(if $(EDITION),--edition $(EDITION),)
+
+.PHONY: release
+release:  ## split and sign the ISO as GitHub release files (TO=/path)
+	./build_iso.py package-release $(if $(TO),--to $(TO),)
 
 # --- checks ----------------------------------------------------------------
 .PHONY: check

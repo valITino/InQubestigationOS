@@ -135,7 +135,9 @@ def check_paths() -> None:
                        "golden-weekly-backup.sh", "Release.key", "GPG-KEY-WAZUH",
                        "config.yml", "node.cfg", "client.keys", "Packages",
                        "golden-image.json", "investigator.ks", "admin.py",
-                       "qvm-firewall.rst", "functions.sh"}:
+                       "qvm-firewall.rst", "functions.sh",
+                       # package-release outputs, inside the release kit
+                       "make-usb.sh", "README.txt"}:
                 continue
             # A bare name in docs/GUIDE.md means docs/GUIDE.md's own directory.
             exists = (ROOT / rel).exists() or (doc.parent / rel).exists()

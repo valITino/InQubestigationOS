@@ -36,15 +36,18 @@ happens there. The script checks this before starting a multi-hour build:
     gpg --list-secret-keys <fingerprint>
 
 If the key lives on a smartcard or a different machine, build unsigned, copy the
-image to the machine that holds the key, and sign it there:
+image, its `.sha256` and its `oem/` folder to the machine that holds the key,
+and sign it there:
 
     ./build_iso.py sign --iso /path/to/InQubestigationOS.iso --use-key <fingerprint>
 
 That re-checksums the image and refuses if it no longer matches its `.sha256` —
 an image that changed after it was built must not be signed — then signs it and
 regenerates everything that travels with the signature: the checksum file, the
-exported public key, `verify-iso.sh` and `FINGERPRINT.txt`. Doing it as three
-commands by hand left those four stale.
+exported public key, `verify-iso.sh`, `verify-iso.ps1` and `FINGERPRINT.txt`.
+It also signs the install-time kickstarts in the `oem/` folder beside the image
+— `oem/ks.cfg` and each edition's `oem/editions/*/ks.cfg` — which `write-usb`
+refuses to use unsigned. Doing it as three commands by hand left those stale.
 
 ## Creating the key, if you have not yet
 
@@ -85,6 +88,9 @@ expires within 90 days, before a multi-hour build rather than after it.
 | `unit-signing-key.asc` | Your public key, exported for colleagues |
 | `BUILD-RECORD.txt` | Build date, tier, templates, hashes, expiry warning |
 | `verify-iso.sh` | One-command verification, for colleagues |
+| `verify-iso.ps1` | The same, for Windows (Gpg4win) |
+| `oem/ks.cfg`, `oem/ks.cfg.asc` | The install-time kickstart of the configured edition, signed |
+| `oem/editions/{wired,unwired}/ks.cfg` (+ `.asc`) | One signed kickstart per edition, for `write-usb --edition` |
 | `FINGERPRINT.txt` | The fingerprint, laid out to be read aloud |
 
 Colleagues verify with one command — `verify-iso.sh` is generated beside the

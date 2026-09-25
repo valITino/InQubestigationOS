@@ -1,12 +1,14 @@
 # InQubestigationOS
 
-> **Primary build entry point:** use `./build_iso.py bootstrap`. It performs mandatory upfront destination/security review and verified host-accessible export. See [the bootstrap operator contract](docs/BOOTSTRAP.md); paths and hypervisor details are never guessed.
+> **Quick start:** `./build_iso.py quickstart --usb`. **Production release path:** `./build_iso.py bootstrap` — independent key-backup media and an audited export; see [the bootstrap operator contract](docs/BOOTSTRAP.md).
 
 A hardened Qubes OS build for cybercrime investigation workstations. Every
 clearnet connection is forced through a proxy, an inline IPS and a DPI recorder
 before it reaches the firewall; Tor traffic takes a separate, uninspected road;
-every compartment reports to a local SIEM. Ships as a bootable ISO that installs
-with no network and configures itself on first boot.
+every compartment reports to a local SIEM. Ships as a signed, bootable ISO; the
+installed machine configures itself on first boot. Two editions come from the
+same image: **wired** builds and wires the whole design below, **unwired**
+builds the same templates and leaves the wiring to you.
 
 ```
                                 Internet
@@ -51,9 +53,12 @@ templates, and Whonix.
 ## Quick start
 
 ```bash
-# On a Debian-family (Debian 13, Kali, Ubuntu) or Fedora host with ~100 GB
-# free (~250 GB for tier=2) — nothing pre-installed
+# On an x86-64 Debian-family (Debian 13, Kali, Ubuntu) or Fedora host.
+# Clone as your normal user into a directory you own: iso-build.json is
+# written beside build_iso.py. The build itself goes to work_dir (default
+# ~/investigator-iso), which needs ~100 GB free (~250 GB for tier=2).
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
+./build_iso.py --set work_dir=/big/disk/investigator-iso   # only if ~ is small
 ./build_iso.py quickstart --usb   # one passphrase, then walk away
 ```
 
@@ -61,8 +66,27 @@ git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
 the pinned supply chain — and fixes what it can, so a problem stops it in
 seconds rather than hours in. Then it creates or reuses the signing key, backs
 it up, builds and signs the ISO, and with `--usb` waits for a stick and writes
-it. It asks for exactly one passphrase. Every step is idempotent: fix the cause
-and re-run, and what already succeeded is skipped.
+it. It asks for exactly one passphrase. The steps before the build are skipped
+once they have succeeded; the ISO build itself runs again on every
+`quickstart`, so if only the USB step failed, run `./build_iso.py write-usb
+--wait` rather than starting over.
+
+**Two editions, one image.** `wired` (the default) builds the templates and
+wires, configures and tests the whole design. `unwired` builds the same
+templates and wires nothing — no qubes created, no networking changed, no
+credentials — and every install carries
+[docs/WORKSTATION-GUIDE.md](docs/WORKSTATION-GUIDE.md) in dom0 at
+`/usr/share/doc/inqubestigationos/` as the map of what to wire. The edition is
+chosen per stick: `./build_iso.py write-usb --edition unwired`.
+
+**Publishing a download.** `./build_iso.py package-release` re-verifies the
+build and writes files for a GitHub release: the image in parts under 2 GiB, a
+kit (`make-usb.sh`, `build_iso.py`, both editions' signed kickstarts),
+`unit-signing-key.asc`, `README.txt` and a signed `SHA256SUMS`. Downloaders
+verify `SHA256SUMS.asc` against the fingerprint you gave them separately, then
+write a stick with `./make-usb.sh` on Linux — see
+[GUIDE §7](docs/GUIDE.md#7-distribute-the-iso). The signing passphrase is never
+part of a release.
 
 For a throwaway test build, `--no-passphrase` asks nothing at all. For the
 production release path with independent key-backup media and an audited
@@ -84,10 +108,17 @@ Spare-machine acceptance and pending report: **[docs/ACCEPTANCE.md](docs/ACCEPTA
 InQubestigationOS/
 ├── golden_image.py            provisioner — runs in dom0 on each laptop
 ├── build_iso.py               ISO + template builder — runs on a build host
+├── bootstrap_workflow.py      the production `bootstrap` path's onboarding and export
+├── release_candidate.py       trusted release-candidate gate (docs/RELEASE.md)
+├── acceptance_runner.py       spare-machine acceptance evidence (docs/ACCEPTANCE.md)
 ├── Makefile                   one entry point for the whole lifecycle
 ├── supply-chain.lock.json     what upstream offered last time we looked
 ├── docs/
 │   ├── GUIDE.md               step-by-step, start to finish
+│   ├── WORKSTATION-GUIDE.md   the wired design and best practice — shipped in dom0
+│   ├── BOOTSTRAP.md           the production bootstrap operator contract
+│   ├── RELEASE.md             the trusted release-candidate runner
+│   ├── ACCEPTANCE.md          acceptance on a spare machine
 │   ├── DESIGN.html            the visual design specification
 │   ├── SIGNING.md             GPG signing — read before sending anyone a key
 │   ├── VERIFICATION.md        supply chain: every repository and key, with sources
@@ -103,15 +134,16 @@ InQubestigationOS/
 └── .gitignore                 keeps credentials and build artifacts out of git
 ```
 
-`golden_image.py` must stay beside `build_iso.py` — it is base64-embedded into
-the installer kickstart.
+`golden_image.py` must stay beside `build_iso.py`, and
+`docs/WORKSTATION-GUIDE.md` in `docs/` — both are base64-embedded into the
+installer kickstart.
 
 ## Two scripts, two machines
 
 | Script | Runs on | Does |
 |---|---|---|
 | `build_iso.py` | Build host (Debian-family — Debian 13, Kali, Ubuntu — or Fedora; Docker; ~100 GB, ~250 GB for tier=2) | Builds a signed bootable ISO, and with `tier=2` the five investigator templates too |
-| `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests |
+| `golden_image.py` | dom0, each laptop | Twelve phases: templates, chain, SIEM, segmentation, backups, tests (the unwired edition: the four template phases only) |
 
 `golden_image.py` is standard-library Python 3 — no `pip install`, which
 matters because dom0 has no network by design. `build_iso.py` runs on a
@@ -137,9 +169,10 @@ six months of known-vulnerable dom0 before its first update. Rebuild on every
 Qubes Security Bulletin affecting dom0 or Xen. `BUILD-RECORD.txt` stamps each
 build with that warning.
 
-**No credentials are baked in.** Four secrets are generated per machine at
-provisioning into `~/golden-image/credentials.json`, mode 600. Change them,
-escrow them, `shred -u` the file.
+**No credentials are baked in.** The wired edition generates four secrets per
+machine at provisioning into `~/golden-image/credentials.json`, mode 600.
+Change them, escrow them, `shred -u` the file. The unwired edition generates
+none. The build refuses a `provisioner_config` that would embed shared ones.
 
 **Test on a spare machine first.** Not one you intend to issue.
 
@@ -159,6 +192,7 @@ Most of those steps are now commands or timers.
 | Read the Qubes bulletin list and decide whether to rebuild | the same command classifies new bulletins by whether they touch dom0/Xen |
 | `dd` to a device you hope is the right one | `./build_iso.py write-usb` — verifies the signature, refuses fixed disks, reads the stick back (elevating if it must) |
 | "Build unsigned and sign afterwards on the machine that holds the key" | `./build_iso.py sign` — re-checksums, signs, and regenerates everything that travels with the signature |
+| Split a multi-gigabyte image for a download site and explain how to flash it | `./build_iso.py package-release` — parts under GitHub's 2 GiB cap, a signed `SHA256SUMS`, and `make-usb.sh` with the same checks as `write-usb` |
 | Compare the printed fingerprint against the one you were given, by eye | `./verify-iso.sh <fingerprint>` compares them and exits non-zero |
 | Pick a `work_dir` "somewhere with enough free space" | `--set work_dir=auto` |
 | "Verify the builder itself — nothing verifies the builder for you" | `verify_builder` checks the signed tag against the Qubes master signing key's web of trust; one pinned fingerprint, developer keys derived from it |
@@ -199,12 +233,20 @@ published keyring checksum, the Zeek OBS repository and its key expiry, the
 Wazuh release the repository actually offers and its signing key, the Qubes
 4.3 template names and firewall chains, and the `qvm-backup` profile schema in
 qubes-core-admin. `supply-chain.lock.json` records what was seen;
-`./build_iso.py check-upstream` re-checks it and fails on drift.
+`./build_iso.py check-upstream` re-checks it and fails on drift. Its run on
+2026-09-25 found nothing blocking and two warnings, both left for a
+reviewer: Wazuh 4.14.8 is out (the pin is 4.14.7), and upstream's
+`wazuh-passwords-tool.sh` changed.
 
-Neither script has been run end-to-end against a live Qubes 4.3.1 system. Both
+`build_iso.py` has built and signed an image end to end on one real host:
+`./build_iso.py quickstart --usb` on Kali Linux rolling, in a VirtualBox VM with
+the Docker executor at tier 1, produced a signed 7.8 GB `InQubestigationOS.iso`
+([docs/REVIEW.md](docs/REVIEW.md), pass 5). Nobody has installed it on a laptop
+yet, so `golden_image.py` has still never run on a live Qubes 4.3.1 system. Both
 are exercised on every push by `tests/run_tests.py`, a fake-dom0 harness that
-runs all twelve phases against stub `qvm-*` binaries and then asserts on every
-configuration file they generated. Run it yourself: `make check`.
+runs all twelve phases — and the unwired edition — against stub `qvm-*` binaries
+and then asserts on every configuration file they generated. Run it yourself:
+`make check`.
 
 Defects found during verification are documented in
 [docs/REVIEW.md](docs/REVIEW.md) rather than quietly patched, so nobody

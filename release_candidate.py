@@ -23,7 +23,12 @@ ALLOWLIST = (
     # and its signature. A candidate without them cannot produce the
     # provisioning media; without the signature write-usb refuses to.
     "oem/ks.cfg", "oem/ks.cfg.asc",
+    # One per edition: write-usb --edition and package-release pick from these.
+    "oem/editions/wired/ks.cfg", "oem/editions/wired/ks.cfg.asc",
+    "oem/editions/unwired/ks.cfg", "oem/editions/unwired/ks.cfg.asc",
 )
+KICKSTARTS = ("oem/ks.cfg", "oem/editions/wired/ks.cfg",
+              "oem/editions/unwired/ks.cfg")
 
 
 class Gate(Exception):
@@ -200,9 +205,10 @@ def main() -> int:
 
     output = a.work_dir / "output"
     missing = [name for name in ALLOWLIST if not (output / name).is_file()]
-    present = [p.name for p in output.iterdir() if p.is_file()]
-    if (output / "oem").is_dir():
-        present += [f"oem/{p.name}" for p in (output / "oem").iterdir() if p.is_file()]
+    # Every file under output/, at any depth: a stray file in a subfolder
+    # is exactly as unexpected as one at the top.
+    present = [p.relative_to(output).as_posix() for p in output.rglob("*")
+               if p.is_file()]
     extras = [name for name in present if name not in ALLOWLIST]
     if missing or extras:
         raise Gate(f"release allowlist mismatch; missing={missing}, unexpected={extras}")
@@ -211,7 +217,8 @@ def main() -> int:
     if (output / ALLOWLIST[1]).read_text().split()[0].lower() != digest:
         raise Gate("ISO checksum does not match")
     verify_signature(iso, output / ALLOWLIST[2], fingerprint)
-    verify_signature(output / "oem/ks.cfg", output / "oem/ks.cfg.asc", fingerprint)
+    for ks in KICKSTARTS:
+        verify_signature(output / ks, output / f"{ks}.asc", fingerprint)
     size = sum((output / name).stat().st_size for name in ALLOWLIST)
     if size > a.max_artifact_gb * 1024**3:
         raise Gate(f"candidate is {size / 1024**3:.1f} GiB; owner limit is "
