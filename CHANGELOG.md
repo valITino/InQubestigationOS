@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.9 — 2026-09-25
+
+**Fixed**
+
+- **`quickstart --usb` never found a stick that was plugged in early.** Its
+  wait accepted only a device that appeared *after* the wait began. A stick
+  inserted during the hours-long build was therefore ignored, and the wait
+  timed out after five minutes. With exactly one eligible device present, it
+  is now used straight away. The confirmation before writing still names it,
+  with its size and model.
+- **USB sticks that report themselves as fixed disks were invisible.** Media
+  detection trusted only the kernel's `removable` flag, which many sticks clear
+  in firmware. A disk attached over USB now counts too; internal SATA/NVMe
+  disks still do not. This also applies to the `--oem-device` check.
+- The device choice is now its own function, `select_device()`, tested with a
+  fake `/sys/block` tree: a USB disk with the bit cleared, a card reader, an
+  internal disk and an empty slot. Also tested: one stick already present,
+  several present (a timeout that names them), and a stick arriving during the
+  wait.
+
 ## 2.8 — 2026-09-25
 
 **Added**

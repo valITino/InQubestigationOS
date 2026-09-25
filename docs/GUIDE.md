@@ -152,6 +152,11 @@ If it stops, fix the cause and run it again: the steps that already succeeded
 are skipped. The image build itself runs again every time, so if **only the USB
 step** failed, run `./build_iso.py write-usb --wait` instead.
 
+`--usb` is optional. Without it, `quickstart` builds and signs the image and
+stops, and you write the stick later with `write-usb` (Part 3). With it, you
+can plug the stick in at any time, even before the build starts. A stick that
+is already there is used, as long as it is the only one.
+
 | Add | Effect |
 |---|---|
 | `--yes` | Also skips the "write to /dev/sdX?" confirmation |
@@ -262,13 +267,13 @@ guided first run that needs none of the above typed by hand, is in
 `quickstart --usb` already did this. To write another stick:
 
 ```bash
-./build_iso.py write-usb --wait                      # waits for a stick, then writes it
+./build_iso.py write-usb --wait                      # uses the stick plugged in, or waits for one
 ./build_iso.py write-usb --device /dev/sdX --edition unwired
 ```
 
 Before touching the stick, it checks the image's checksum and signature, and
-the signature of the chosen edition's kickstart. It refuses fixed disks and
-mounted devices. After writing, it **reads the stick back** and compares it.
+the signature of the chosen edition's kickstart. It only writes to USB or
+removable media (never an internal disk), and never to a mounted device. After writing, it **reads the stick back** and compares it.
 It adds the `QUBES_OEM` partition with the kickstart. With one stick plugged
 in, `--device` can be left out.
 
@@ -631,7 +636,8 @@ quickstart`, `make check`, `make verify`, …).
 | `doctor`: "disk at … needed for tier 1" | `./build_iso.py --set work_dir=/mnt/build/investigator-iso` on a bigger disk, then run `quickstart` again. |
 | The build disk is gone after a reboot | A disk mounted by hand does not come back. Add it to `/etc/fstab` by UUID (`sudo blkid`), with `nofail`, then `sudo mount -a`. |
 | Docker needs `sudo` | `./build_iso.py setup-host`. It adds you to the group and tells you how to carry on without logging out. |
-| `write-usb --wait` never sees the stick (VirtualBox) | Power the VM off, set Settings → USB → **USB 3.0 (xHCI)**, attach the stick, then `./build_iso.py write-usb --wait`. Do not re-run `quickstart`, which would rebuild. |
+| `write-usb --wait` never sees the stick (VirtualBox) | Check that `lsblk` in the VM lists it. If not: power the VM off, set Settings → USB → **USB 3.0 (xHCI)**, attach the stick, then `./build_iso.py write-usb --wait`. Do not re-run `quickstart`, which would rebuild. |
+| "more than one was already plugged in" | Several USB disks are attached. Name the one to write: `./build_iso.py write-usb --device /dev/sdX`. |
 | "Running in dom0" | `build_iso.py` belongs on a separate build host. Only the provisioner runs in dom0. |
 | Kali fingerprint mismatch stops the build | Either Kali rotated its key (confirm at kali.org, then `--set kali.key_fpr=…`) or the download was tampered with. Never bypass it. |
 | A template fails to build (tier 2) | Fix the cause and run `./build_iso.py templates` again. Finished templates are skipped. |

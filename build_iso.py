@@ -5513,11 +5513,20 @@ Write-Host ''
 # ---------------------------------------------------------------------------
 #  write-usb — GUIDE section 7, with the safety rails dd does not have
 # ---------------------------------------------------------------------------
+SYS_BLOCK = Path("/sys/block")
+
+
 def removable_devices() -> list[dict]:
+    """Disks this script may write an image to: flagged removable, or attached
+    over USB. Many USB sticks clear the removable bit (their firmware presents
+    them as fixed disks), so the flag alone missed exactly the media this is
+    for. The USB bus in the device's sysfs path is what lsblk calls TRAN=usb."""
     out = []
-    for blk in sorted(Path("/sys/block").glob("*")):
+    for blk in sorted(SYS_BLOCK.glob("*")):
         try:
-            if (blk / "removable").read_text().strip() != "1":
+            flagged = (blk / "removable").read_text().strip() == "1"
+            usb = "/usb" in os.path.realpath(blk / "device")
+            if not (flagged or usb):
                 continue
             size = int((blk / "size").read_text().strip()) * 512
             if size == 0:
@@ -5527,7 +5536,8 @@ def removable_devices() -> list[dict]:
                 if cand.is_file():
                     model = cand.read_text().strip()
                     break
-            out.append({"dev": f"/dev/{blk.name}", "size": size, "model": model})
+            out.append({"dev": f"/dev/{blk.name}", "size": size, "model": model,
+                        "usb": usb})
         except (OSError, ValueError):
             continue
     return out
@@ -5541,6 +5551,63 @@ def _mounted_partitions(dev: str) -> list[str]:
         return []
     return [line.split()[0] for line in mounts.splitlines()
             if line.split()[0].startswith(f"/dev/{base}")]
+
+
+def select_device(x: Ctx) -> tuple[str, list[dict]]:
+    """The device write-usb will write: --device, the one removable device
+    present, or (--wait) one that appears. Returns its kernel path and the
+    removable list it was chosen from."""
+    devs = removable_devices()
+    if (getattr(x.args, "wait", False) and not getattr(x.args, "device", None)
+            and len(devs) == 1):
+        # Plugged in before this step started — typically during a build that
+        # takes hours. Waiting for a NEW device would never see it and timed
+        # out. The destructive confirmation below still names it.
+        x.args.device = devs[0]["dev"]
+        x.ok(f"using {devs[0]['dev']}, already plugged in "
+             f"({devs[0]['size'] / 1e9:.1f} GB {devs[0]['model']})")
+    elif getattr(x.args, "wait", False) and not getattr(x.args, "device", None):
+        # Plugging the stick in cannot be automated. Waiting for it can.
+        before = {d["dev"] for d in devs}
+        x.info("waiting for a removable device to appear — plug the stick in "
+               "(Ctrl-C to give up)")
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            time.sleep(2)
+            devs = removable_devices()
+            fresh = [d for d in devs if d["dev"] not in before]
+            if len(fresh) == 1:
+                x.args.device = fresh[0]["dev"]
+                x.ok(f"{fresh[0]['dev']} appeared "
+                     f"({fresh[0]['size'] / 1e9:.1f} GB {fresh[0]['model']})")
+                break
+            if len(fresh) > 1:
+                raise Fatal("more than one device appeared at once — name the one "
+                            "you mean with --device")
+        else:
+            if before:
+                raise Fatal("no new removable device appeared within five minutes, "
+                            "and more than one was already plugged in ("
+                            + ", ".join(sorted(before)) + ").\n"
+                            "     Name the one you mean:  --device /dev/sdX")
+            raise Fatal("no new removable device appeared within five minutes")
+    dev_path = getattr(x.args, "device", None)
+    if not dev_path:
+        if not devs:
+            raise Fatal("no removable device found. Plug the USB stick in, or pass "
+                        "--device /dev/sdX explicitly.")
+        print("\n  Removable devices:")
+        for d in devs:
+            print(f"      {d['dev']:12s} {d['size'] / 1e9:6.1f} GB  {d['model']}")
+        if len(devs) > 1:
+            raise Fatal("more than one removable device — name the one you mean "
+                        "with --device")
+        dev_path = devs[0]["dev"]
+        x.info(f"selected the only removable device: {dev_path}")
+    # /dev/disk/by-id/usb-... names the same stick as /dev/sdb; the removable
+    # list, the mount check and the size check all speak kernel names.
+    dev_path = os.path.realpath(dev_path)
+    return dev_path, devs
 
 
 def write_usb(x: Ctx) -> int:
@@ -5614,43 +5681,7 @@ def write_usb(x: Ctx) -> int:
         x.ok(f"install-time kickstart signature verifies, signed by {signer}")
 
     # 2. Pick a device, and refuse anything that is not removable.
-    devs = removable_devices()
-    if getattr(x.args, "wait", False) and not getattr(x.args, "device", None):
-        # Plugging the stick in cannot be automated. Waiting for it can.
-        before = {d["dev"] for d in devs}
-        x.info("waiting for a removable device to appear — plug the stick in "
-               "(Ctrl-C to give up)")
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            time.sleep(2)
-            devs = removable_devices()
-            fresh = [d for d in devs if d["dev"] not in before]
-            if len(fresh) == 1:
-                x.args.device = fresh[0]["dev"]
-                x.ok(f"{fresh[0]['dev']} appeared "
-                     f"({fresh[0]['size'] / 1e9:.1f} GB {fresh[0]['model']})")
-                break
-            if len(fresh) > 1:
-                raise Fatal("more than one device appeared at once — name the one "
-                            "you mean with --device")
-        else:
-            raise Fatal("no new removable device appeared within five minutes")
-    dev_path = getattr(x.args, "device", None)
-    if not dev_path:
-        if not devs:
-            raise Fatal("no removable device found. Plug the USB stick in, or pass "
-                        "--device /dev/sdX explicitly.")
-        print("\n  Removable devices:")
-        for d in devs:
-            print(f"      {d['dev']:12s} {d['size'] / 1e9:6.1f} GB  {d['model']}")
-        if len(devs) > 1:
-            raise Fatal("more than one removable device — name the one you mean "
-                        "with --device")
-        dev_path = devs[0]["dev"]
-        x.info(f"selected the only removable device: {dev_path}")
-    # /dev/disk/by-id/usb-... names the same stick as /dev/sdb; the removable
-    # list, the mount check and the size check all speak kernel names.
-    dev_path = os.path.realpath(dev_path)
+    dev_path, devs = select_device(x)
 
     match = next((d for d in devs if d["dev"] == dev_path), None)
     if match is None:

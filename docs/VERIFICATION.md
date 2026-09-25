@@ -213,6 +213,7 @@ What is left for a person is genuinely a matter of judgement, not verification:
 | Date | Image version | What was re-verified | By |
 |---|---|---|---|
 | 2026-09-01 | 2.1 | Kali key + checksum, Zeek Debian_13 repo, Wazuh 4.14.7 and pinning requirement | initial research |
+| 2026-09-25 | 2.9 | Pins unchanged (`check-upstream`: 13 ok, 0 warnings). USB media detection only | `check-upstream` |
 | 2026-09-25 | 2.8 | Pins unchanged (`check-upstream`: 13 ok, 0 warnings). Adds the published image-signing fingerprint, `SIGNING-KEY.md`, which is not an upstream pin | `check-upstream` |
 | 2026-09-25 | 2.7 | Pins unchanged: `check-upstream` 13 ok, 0 warnings, 0 blocking. Documentation restructured; every command, phase, timer and template name in the guide was re-checked against the code | `check-upstream`; the code read directly |
 | 2026-09-25 | 2.6 | The two 2.5 warnings resolved: Wazuh moved to 4.14.8 (the stable apt repository offers 4.14.8-1 for manager, agent, indexer and dashboard). `wazuh-passwords-tool.sh` re-pinned to `ef4f8900…1b92` after diffing wazuh-installation-assistant v4.14.7→v4.14.8: the only changes are retry loops around the API user lookup and polling for the service to be active after restart — no new network endpoints — and the published script matches the v4.14.8 source. `wazuh-certs-tool.sh` unchanged. `check-upstream --update` recorded the new baseline | `check-upstream`; upstream diff read directly |
