@@ -72,7 +72,7 @@ Three places are involved, and each command belongs to exactly one of them:
 | **Template, qube** | A template is a base system. A qube is a VM that uses one. This design's templates are called `tpl-*` (`tpl-kali`, `tpl-ids` …), and its qubes `sys-proxy`, `kali-tor` and so on. |
 | **Provisioner** | `golden_image.py`, installed on the laptop as `golden-image-provision`. It runs twelve **phases** that build and wire everything. |
 | **`work_dir`** | Where the build puts its files (default `~/investigator-iso`). Needs ~100 GB free. |
-| **Config files** | `iso-build.json` (build host, beside `build_iso.py`), and `golden-image.json` (laptop, `/usr/local/sbin/`). Both are written with defaults on first run. Change them with `--set`, never by hand. |
+| **Config files** | `iso-build.json` on the build host, beside `build_iso.py`: change it with `./build_iso.py --set`. `golden-image.json` on the laptop, in `/usr/local/sbin/`: edit it as root, since the provisioner has no `--set`. Both are written with defaults on first run. |
 
 ---
 
@@ -234,9 +234,13 @@ sudo -v
   --to /mnt/image-key-backup/inqubestigation
 ```
 
-For a repeat build, run the **same command** with the same medium mounted. It
+The key **backup** is encrypted with a second, separate passphrase. On a
+terminal, bootstrap asks for it. Unattended, supply it the same way as the first
+one, in its own protected file, with `--backup-passphrase-file`.
+
+For a repeat build, run the same command with the same medium mounted. It
 reuses the key already pinned in `iso-build.json` and never creates a second
-one. Delete the passphrase file afterwards. The full contract, including the
+one. Delete the passphrase files afterwards. The full contract, including the
 guided first run that needs none of the above typed by hand, is in
 [BOOTSTRAP.md](BOOTSTRAP.md).
 
@@ -320,9 +324,16 @@ configures the machine. Only `write-usb` and `make-usb.sh`, both on Linux, add t
 `QUBES_OEM` partition. So use a Linux VM and pass the stick through to it. In
 VirtualBox that means Settings → USB → **USB 3.0 (xHCI)**.
 
-If you still want a plain stick from Windows, verify it first with
-`.\verify-iso.ps1 <fingerprint>` (needs Gpg4win), then write it with Rufus in
-**DD Image mode**. ISO mode breaks the boot. Choose "Install Qubes OS" at boot.
+If you still want a plain stick from Windows:
+
+1. **From a downloaded release only:** extract the kit archive (it contains
+   `verify-iso.ps1`), then join the parts in order into one file, for example
+   `cmd /c copy /b InQubestigationOS.iso.part01+InQubestigationOS.iso.part02 InQubestigationOS.iso`
+   with every part listed. A build's own `output/` folder already has the
+   whole image and the script.
+2. Verify with `.\verify-iso.ps1 <fingerprint>` (needs Gpg4win).
+3. Write it with Rufus in **DD Image mode**, because ISO mode breaks the boot.
+   Choose "Install Qubes OS" at boot.
 
 ---
 
@@ -344,8 +355,12 @@ Find the laptop's disk identity **on the laptop**, then set both values in
 **one** command:
 
 ```bash
-ls -l /dev/disk/by-id/ | grep -v part          # on the laptop: pick the internal disk
+# 1. On the laptop (from any live system): pick the internal disk
+ls -l /dev/disk/by-id/ | grep -v part
+```
 
+```bash
+# 2. On the build host, then build (Part 2) and write the stick (Part 3)
 ./build_iso.py --set install.unattended=true \
   --set install.disk=/dev/disk/by-id/nvme-SAMSUNG_MZVL2512HCJQ_S64ANS0T123456
 ```

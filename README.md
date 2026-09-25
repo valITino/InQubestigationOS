@@ -112,7 +112,7 @@ InQubestigationOS/
 │   ├── VERIFICATION.md        every repository and key, with its source
 │   └── REVIEW.md              defects found during review, and the test results
 ├── tests/                     run them all with `make check`
-│   ├── run_tests.py           fake-dom0 harness: runs all 12 phases off Qubes, then every suite
+│   ├── run_tests.py           fake-dom0 harness: all 12 phases off Qubes, plus static/host/config/doc checks
 │   ├── qubes_stub.py          one stand-in for every dom0 command
 │   ├── static_checks.py       assertions over every generated config file
 │   ├── doc_checks.py          the docs must not drift from the code
