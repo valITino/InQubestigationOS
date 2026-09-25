@@ -1,5 +1,11 @@
 # Hardware acceptance of a release candidate
 
+> **In short.** How to prove a release candidate on a spare laptop and keep the
+> evidence. Install it, then run `acceptance_runner.py` in that laptop's dom0 to
+> collect the results into a report. A build that has not passed this is not a
+> verified release. For a single laptop, `golden-image-provision --verify`
+> ([GUIDE.md §6](GUIDE.md#6-verify-and-hand-over)) is enough.
+
 ISO build/export do not imply installation, provisioning, online acceptance, or issuance. Those remain separate installed-laptop facts; see [BOOTSTRAP.md](BOOTSTRAP.md).
 
 `acceptance_runner.py` knows where it is. `--collect` refuses to run unless

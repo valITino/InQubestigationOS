@@ -1,368 +1,231 @@
-# InQubestigationOS — the complete guide
+# InQubestigationOS — the guide
 
-The quick start is one command, `./build_iso.py quickstart --usb`. `./build_iso.py bootstrap` is the production release path with independent key-backup media and an audited export; its contract is in [BOOTSTRAP.md](BOOTSTRAP.md).
-
-From an empty build host to an issued investigator laptop. Follow it in order.
+From an empty Linux machine to an investigator laptop that is ready to issue.
+Read [section 0](#0-the-big-picture) first. It shows the whole journey on
+one screen. Then follow the parts in order.
 
 **Contents**
 
-1. [What you need before starting](#1-what-you-need-before-starting)
-2. [Prepare the build host](#2-prepare-the-build-host)
-3. [Create the signing key](#3-create-the-signing-key)
-4. [Configure the build](#4-configure-the-build)
-5. [Build the templates](#5-build-the-templates)
-6. [Build the ISO](#6-build-the-iso)
-7. [Distribute the ISO](#7-distribute-the-iso)
-8. [Install on a laptop](#8-install-on-a-laptop)
-9. [First boot](#9-first-boot)
-10. [Verify before issuing](#10-verify-before-issuing)
-11. [Hand over to the investigator](#11-hand-over-to-the-investigator)
-12. [Ongoing maintenance](#12-ongoing-maintenance)
-13. [Troubleshooting](#13-troubleshooting)
+0. [The big picture](#0-the-big-picture): what happens where, which path is
+   yours, and the words this guide uses
+1. [Prepare the build host](#1-prepare-the-build-host)
+2. [Build and sign the image](#2-build-and-sign-the-image)
+3. [Put it on a USB stick](#3-put-it-on-a-usb-stick)
+4. [Install on the laptop](#4-install-on-the-laptop)
+5. [First boot](#5-first-boot)
+6. [Verify and hand over](#6-verify-and-hand-over)
+7. [Living with it: maintenance](#7-living-with-it-maintenance)
+8. [Command cheat sheet](#8-command-cheat-sheet)
+9. [Troubleshooting](#9-troubleshooting)
+- [Appendix A — Build host details](#appendix-a--build-host-details): Linux
+  distributions, VMs, Windows
+- [Appendix B — What the build does inside](#appendix-b--what-the-build-does-inside)
 
 ---
 
-## 1. What you need before starting
+## 0. The big picture
 
-**A build host.** Any Debian-family or Fedora-family Linux. This is *not* dom0
-and not the laptop you are building — it is a separate machine or VM.
-
-| Requirement | Why | Who satisfies it |
-|---|---|---|
-| A Debian-family or Fedora-family Linux | qubes-builderv2 ships dependency lists for both families. Debian, Kali and Ubuntu all qualify — see the next table | you |
-| Docker, usable without `sudo` | Build cages. Podman cannot currently build DEB packages | `setup-host` |
-| ~100 GB free disk | Tier 1, the default. Tier 2 builds five templates locally and needs ~250 GB | you |
-| 8 GB RAM minimum | Builds are slow and can OOM below this | you |
-| 4 CPU cores recommended | Nothing enforces it, but two cores roughly doubles an already long build | you |
-| Several hours | The Kali *template* dominates — and see the warning below about the two different things called "Kali" here | you |
-
-Everything in that table that a script can do, a script does. Ask first:
-
-```bash
-./build_iso.py doctor
-```
-
-It checks each requirement, changes nothing, and prints the command that fixes
-whatever is missing. Every later step in this guide is also available as a
-`make` target — run `make` on its own for the list.
-
-### Which Linux, specifically
-
-`doctor` reads `/etc/os-release` and prints the distribution by name, so you
-never have to work out which of these you are on:
+Three places are involved, and each command belongs to exactly one of them:
 
 ```
-✓ supported build host  Kali GNU/Linux Rolling (debian-family) — detected via /etc/os-release
+ ┌─────────────────────────┐      ┌──────────────┐      ┌──────────────────────────────┐
+ │ BUILD HOST              │      │ USB STICK    │      │ LAPTOP  (Qubes OS, dom0)     │
+ │ any x86-64 Linux        │ ───▶ │ image +      │ ───▶ │ installs, then configures    │
+ │ runs  ./build_iso.py    │      │ answer file  │      │ itself on first boot         │
+ │                         │      │              │      │ runs  golden-image-provision │
+ │ Parts 1–3               │      │ Part 3       │      │ Parts 4–7                    │
+ └─────────────────────────┘      └──────────────┘      └──────────────────────────────┘
 ```
 
-| Build host | Handled by the scripts | What is different about it |
-|---|---|---|
-| **Debian 13 (trixie)** | Preferred | Nothing. This is the reference host the rest of the guide assumes. |
-| **Kali Linux (rolling)** | Yes | Debian testing underneath, and it declares `ID_LIKE=debian`, so every Debian instruction applies unchanged. Two packages Debian proper also lacks are missing here — see below. |
-| **Ubuntu 22.04 / 24.04** | Yes | Same Debian-family path. Older Ubuntu may not carry the `sq`/`sqv` packages the builder wants; `setup-builder` — the step that installs upstream's own dependency list, not `setup-host` — names any it cannot find and carries on. |
-| **Fedora 43 / 44** | Yes | Upstream's own build host, and the only family whose dependency list installs `mock`, so the build cage is seeded from a Mock chroot here and from the pinned Fedora container everywhere else. |
+| Part | Where | You do | Takes |
+|---|---|---|---|
+| 1 Prepare | build host | `./build_iso.py doctor`, then `setup-host` if something is missing | 10 min |
+| 2 Build | build host | `./build_iso.py quickstart --usb`, which asks for one passphrase | a few hours, unattended |
+| 3 USB stick | build host | plug in a stick, and `quickstart --usb` writes it | 10–20 min |
+| 4 Install | laptop | boot the stick and enter the disk-encryption passphrase | 20–40 min |
+| 5 First boot | laptop | nothing: it configures itself | 1–3 h (tier 1) |
+| 6 Verify and hand over | laptop | `--verify`, `--handover`, `--issue` | 15 min |
+| 7 Maintenance | laptop | nothing routine: timers do it | — |
 
-> **What "handled" means, and what has actually run.** Every row above is what
-> the code detects and adapts to, checked against each distribution's package
-> archives. One of them has built an image end to end: on **Kali Linux
-> rolling**, in a VirtualBox VM with the Docker executor at tier 1,
-> `./build_iso.py quickstart --usb` built and signed a 7.8 GB
-> `InQubestigationOS.iso` (the four defects that run found are fixed, see
-> [REVIEW.md](REVIEW.md) pass 5). Debian, Ubuntu and Fedora hosts have not
-> built one yet: for them the regression suite covers host detection and
-> package resolution only. No image has been installed on a laptop yet.
+### Which path is yours?
 
-**Two packages are missing on every Debian-family host, Kali included, and
-neither is fatal:**
-
-- **`mock`** was dropped from Debian in 2019 and is in no current Debian or
-  Kali suite. Upstream's `tools/generate-container-image.sh` takes the Mock
-  chroot as an *optional* argument; without it the build cage image is built
-  from `dockerfiles/fedora.Dockerfile`, which pulls the pinned Fedora
-  container and installs `mock`, `rpm-build` and `createrepo_c` *inside* it.
-  The two images are not identical — one is seeded from a digest-pinned Fedora
-  image, the other from a chroot built on your host — but both carry the
-  `qubes-builder-fedora` tag, and that name is the only thing the builder ever
-  looks for. `build_iso.py` picks the path automatically, based on whether
-  `mock` is actually installed rather than on which distribution you are on.
-- **`pykickstart`** was removed from Debian in August 2019 and has never been
-  in Kali. It is only used to parse the generated kickstart *before* the
-  build. `setup-host` offers to install it into a virtualenv under `work_dir`
-  instead — the plan shows that step, and the PyPI download it involves,
-  before you agree to it, and it pulls in `python3-venv` if that is missing;
-  if that is not possible — no network, say — the build still runs and the
-  same question is answered afterwards, by confirming the template RPMs are
-  present in the finished ISO. `doctor` says which of the two is in effect.
-
-> **"Kali" means two unrelated things in this repository.** Everywhere else in
-> this guide, Kali is a **template inside the image you are building** — the
-> `investigator-kali` qube, its apt repository and its signing key. Here, and
-> only in this section, Kali is a **distribution you might be running the
-> build on**. They are independent: you can build on Debian and get the Kali
-> template, or build on Kali and produce an image with no Kali template at
-> all. Which distribution you build on contributes nothing to the image's
-> contents — every package is built inside a container, from the pinned
-> sources in the configuration. What the build host does contribute is what
-> you would expect it to: your signing key, and the hostname and timestamps
-> the build record carries.
-
-### Running the build host in a VM
-
-A VM is a first-class build host — the ISO does not care what built it. Size
-it as follows:
-
-| | |
+| You want to… | Do this |
 |---|---|
-| **Virtual disk** | 100 GB for Tier 1 (the default), 250 GB for Tier 2. Prefer a dynamically-allocated disk so it only consumes what it uses, but **check the host has the space to grow into** — running the physical disk out mid-build is the most common way this fails. |
-| **RAM** | 8 GB minimum, 12–16 GB if the physical machine allows. |
-| **CPUs** | 4 cores recommended, 2 workable. |
-| **Guest additions** | Not needed. Nothing here uses a GUI. |
-| **Shared folder** | Optional, and the easiest way to get the finished ISO back to the host. A `vboxsf`/`hgfs` mount is fine as a *destination*; do not put `work_dir` on one. |
+| Build a stick for a test machine | [Part 1](#1-prepare-the-build-host), then `./build_iso.py quickstart --usb` |
+| Publish the image on GitHub for others to download | Build as above, then [3.2 Publish a download](#32-publish-a-download-github-releases) |
+| Install from a release you downloaded | Skip Parts 1–2 and go to [3.3 From a downloaded release](#33-from-a-downloaded-release) |
+| Make a production release for your unit | `./build_iso.py bootstrap`, see [2.5](#25-production-path-bootstrap) |
+| Wire an **unwired** machine yourself | [WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md), which is also on every installed machine |
 
-**You do not need nested virtualisation, and you should not turn it on for
-this.** Docker containers are not virtual machines — they are processes
-isolated by namespaces and cgroups on the VM's *own* kernel — so the build
-cages need no VT-x inside the guest. Nested virtualisation only matters if you
-intend to *boot* the finished ISO inside that same VM, which is a separate
-activity from building it and is not what this guide asks for.
+### Words used in this guide
 
-The one hardware requirement that is real: **the build host must be x86-64**,
-because every package and the installer itself are built for that
-architecture. An Apple Silicon Mac running an ARM Linux VM cannot build this
-image — `./build_iso.py doctor` checks the architecture and fails on anything
-that is not x86-64, so you find out in a second rather than in an hour.
-
-**A target laptop** with VT-x and VT-d/IOMMU, 32 GB RAM comfortable (16 GB
-workable), 512 GB SSD minimum. Check it against the Qubes Hardware
-Compatibility List before committing.
-
-### If your workstation is Windows
-
-**The build host must be Linux.** This is not a limitation of these scripts —
-`qubes-builderv2` builds every package inside a Linux container, using Mock
-chroots for the RPMs and pbuilder for the DEBs, and its dependency lists are
-Debian and Fedora packages. There is no Windows-native path, and the two
-scripts here are POSIX throughout.
-
-You have two options on a Windows machine, and they are not equally proven:
-
-| | |
+| Word | Means |
 |---|---|
-| **A Linux VM** — Hyper-V, VirtualBox or VMware; Debian 13, **Kali**, Ubuntu or Fedora; ~250 GB virtual disk, 8 GB RAM, 4 vCPU | **The path to use.** Inside the VM it is an ordinary Linux build host, so everything in this guide applies unchanged. |
-| **WSL2** — Debian from the Microsoft Store, `systemd=true` in `/etc/wsl.conf`, Docker | **Not verified.** WSL2 is a real Linux kernel and the scripts run, but nobody — upstream or here — has confirmed that the Mock chroots and loop-device work that the ISO build depends on behave under it. `./build_iso.py doctor` detects WSL and checks the parts it can (kernel type, `/dev/loop-control`, systemd as PID 1). If it fails, use a VM rather than fighting it. |
-
-Two things the first real build (Kali in VirtualBox) ran into, both settings of
-the VM rather than of these scripts:
-
-- **A second virtual disk for the build.** `work_dir` defaults to
-  `~/investigator-iso` on the system disk. Mount the second disk from
-  `/etc/fstab` by UUID (a disk mounted by hand is gone after a reboot) and
-  point the build at it: `./build_iso.py --set work_dir=/mnt/build/investigator-iso`.
-- **USB passthrough.** VirtualBox's default USB 1.1 controller never hands a
-  modern stick to the guest: `lsblk` inside the VM does not show it even while
-  it is ticked under Devices → USB. Power the VM off, choose Settings → USB →
-  **USB 3.0 (xHCI)**, then attach the stick.
-
-**If you already have a Kali VM, use it.** A Kali VM installed for any other
-reason is a perfectly good build host: it is Debian testing underneath, it
-declares `ID_LIKE=debian`, and `setup-host` treats it exactly as it treats
-Debian. See [Which Linux, specifically](#which-linux-specifically) above for
-the two packages Kali does not carry and what the scripts do about them — and
-for the warning that "Kali the build host" has nothing to do with "the Kali
-template inside the image".
-
-Two questions that come up at this point, both answered above but worth
-repeating here because they decide whether you bother:
-
-- **Does the VM need nested virtualisation enabled?** No. Docker containers
-  are namespaced processes on the VM's own kernel, not virtual machines, so
-  the build cages need no VT-x inside the guest. Leave it off.
-- **Does it need to be a fresh VM?** No. The build touches `work_dir`,
-  `/var/lib/docker`, and packages. `./build_iso.py --dry-run setup-host`
-  prints exactly what that step would run, including the virtualenv and the
-  PyPI download it uses for `pykickstart`, before you agree to any of it. Note
-  that this is the *host* setup only: `setup-builder`, later in the run, also
-  installs `qubes-builderv2`'s own dependency list, which is upstream's and
-  not shown by that dry run.
-
-Either way, remember that a WSL distro or a discarded VM takes your **signing
-key** with it. Back it up the moment you create it:
-
-```bash
-./build_iso.py backup-key --to /mnt/c/Users/you/keys/investigator
-```
-
-**Writing the USB from Windows.** You can build in the VM, copy the ISO out to
-Windows, and flash it with Rufus onto your 128 GB stick — but:
-
-> **Rufus must be set to "Write in DD Image mode".** Select the ISO, press
-> START, and choose DD Image mode when Rufus asks. This is the Qubes project's
-> own instruction; ISO mode rewrites the boot structure and the installer will
-> not work. One consequence they also note: a Rufus-written stick does not offer
-> "Test this media and install Qubes OS" — choose "Install Qubes OS".
-
-Rufus does not verify the image, so verify it on Windows first. The build writes
-a PowerShell script beside the ISO for exactly this:
-
-```powershell
-.\verify-iso.ps1 <the fingerprint you were given out of band>
-```
-
-It checks the SHA-256 with Windows' own tooling and the GPG signature via
-Gpg4win, and exits non-zero on any mismatch. Without a fingerprint argument it
-prints the signer for you to compare by eye. If Gpg4win is not installed it says
-so and exits 2 rather than implying the image is trustworthy.
-
-**A Rufus stick is a plain Qubes installer: nothing on it provisions the
-machine.** The provisioning — the installer answers and the first-boot payload
-— lives in the signed kickstart that `./build_iso.py write-usb` (or
-`make-usb.sh` from a downloaded release) puts on a separate `QUBES_OEM`
-partition, and reads the stick back afterwards. So write the stick from Linux;
-in a VirtualBox VM, pass the stick through (USB 3.0 xHCI, see above) and run
-`write-usb` there.
-
-**A GPG key** for signing. Section 3 covers creating one — and backing it up,
-which matters more than it sounds: lose the build host and every image you ever
-signed becomes unverifiable.
-
-**A spare machine to test on.** Do not let the first install be on hardware you
-intend to issue.
+| **Build host** | The Linux machine or VM that builds the image. It is *not* the laptop, and not dom0. |
+| **Image / ISO** | `InQubestigationOS.iso`: a Qubes OS 4.3 installer carrying this project's additions. |
+| **Signing key, fingerprint** | Your GPG key signs the image. Its **fingerprint** (40 hex characters) is how others check the signature. The fingerprint is public; the key and its passphrase are never shared. |
+| **Kickstart** | The installer's answer file (`ks.cfg`). It carries the setup code that runs on the laptop. It is signed separately from the image. |
+| **`QUBES_OEM` partition** | A small partition that `write-usb` adds to the stick. The installer finds the kickstart there. A stick without it is a plain Qubes installer. |
+| **Edition** | Chosen per stick. **wired** (the default) builds the templates and the whole network design, then tests it. **unwired** builds the templates only and leaves the wiring to you. One build serves both. |
+| **Tier** | **1** (the default): the image carries stock templates, and the investigator templates are built on the laptop at first boot, which needs network. **2**: the templates are built into the image. Implemented, but not yet built end to end. |
+| **dom0** | Qubes' administrative VM on the laptop. The provisioner runs there. |
+| **Template, qube** | A template is a base system. A qube is a VM that uses one. This design's templates are called `tpl-*` (`tpl-kali`, `tpl-ids` …), and its qubes `sys-proxy`, `kali-tor` and so on. |
+| **Provisioner** | `golden_image.py`, installed on the laptop as `golden-image-provision`. It runs twelve **phases** that build and wire everything. |
+| **`work_dir`** | Where the build puts its files (default `~/investigator-iso`). Needs ~100 GB free. |
+| **Config files** | `iso-build.json` (build host, beside `build_iso.py`), and `golden-image.json` (laptop, `/usr/local/sbin/`). Both are written with defaults on first run. Change them with `--set`, never by hand. |
 
 ---
 
-## 2. Prepare the build host
+## 1. Prepare the build host
 
-**The short version.** Sections 2 to 7 are one command:
+> **Where:** build host · **Time:** about 10 minutes
+
+### 1.1 What you need
+
+| | Minimum | Notes |
+|---|---|---|
+| Linux, x86-64 | Debian 13, Kali, Ubuntu 22.04+ or Fedora 43+ | A VM is fine. ARM (Apple Silicon) cannot build. Windows: use a Linux VM, see [Appendix A](#appendix-a--build-host-details). |
+| Free disk | ~100 GB (tier 2: ~250 GB) | Put `work_dir` on a big disk if your home is small. |
+| RAM / CPU | 8 GB / 2 cores | 16 GB and 4 cores make it noticeably faster. |
+| Time | a few hours | It runs unattended after one passphrase. |
+| A USB stick | 16 GB or more | Its contents will be erased. |
+| A spare laptop to test on | VT-x, VT-d/IOMMU, 16 GB RAM (32 comfortable), 512 GB SSD | Check it against the Qubes Hardware Compatibility List. Never make the first install on a machine you intend to issue. |
+
+### 1.2 Get the code
 
 ```bash
 git clone <your-internal-url>/InQubestigationOS.git
 cd InQubestigationOS
+```
+
+Clone **as your normal user**, into a directory you own, and never run the
+scripts with `sudo`. The build writes `iso-build.json` next to `build_iso.py`,
+and a clone made with `sudo` belongs to root.
+
+### 1.3 Check the host, and let it fix itself
+
+```bash
+./build_iso.py doctor         # checks everything, changes nothing
+./build_iso.py setup-host     # installs what is missing (shows the plan, asks once)
+```
+
+`doctor` prints one line per requirement and, for anything missing, the command
+that fixes it. `setup-host` installs the packages, enables Docker, and adds you
+to its group. It shows every command before running any.
+
+If `work_dir` is on a disk that is too small, point it elsewhere:
+
+```bash
+./build_iso.py --set work_dir=/mnt/build/investigator-iso
+```
+
+Docker group membership does not reach a shell that is already open.
+`setup-host` tells you how to continue without logging out
+(`sg docker -c './build_iso.py all'`). `quickstart` handles this for you.
+
+---
+
+## 2. Build and sign the image
+
+> **Where:** build host · **Time:** a few hours, unattended after one passphrase
+
+### 2.1 The one command
+
+```bash
 ./build_iso.py quickstart --usb
 ```
 
-Clone as your normal user, into a directory you own: `iso-build.json` is
-written beside `build_iso.py`, and a clone made with `sudo` (into `/mnt`, say)
-belongs to root. Run the scripts as yourself, never with `sudo`.
+What it does, in order:
 
-It checks the host first and fixes what it can (`doctor`, then `setup-host` if
-anything was missing), creates or reuses the signing key, backs it up, checks
-the pinned supply chain, builds and signs the ISO, and then waits for a USB
-stick and writes it — installer answer file included. It asks for one
-passphrase, once. Everything that can fail fast does, before the multi-hour
-build starts. The steps before the build are skipped once they have
-succeeded, so after fixing a cause you run it again; the ISO build itself
-runs again on every `quickstart`, so if only the USB step failed, run
-`./build_iso.py write-usb --wait` instead. Add `--yes` to also skip the
-"write to /dev/sdX?" confirmation, and `--no-passphrase` for a throwaway lab
-build that asks nothing at all.
+1. **Checks** the host and fixes what it can (`doctor`, then `setup-host`).
+   Anything that can fail fast fails here, in seconds rather than hours in.
+2. **Creates or reuses your signing key**, and asks for its passphrase. This is
+   the only question it asks.
+3. **Backs up the key** beside the build. Copy that backup to removable media
+   before you ship anything signed with the key.
+4. **Checks the supply chain** (`check-upstream`): the pinned Kali, Zeek and
+   Wazuh keys and versions against upstream.
+5. **Builds and signs the image.** This is the long part.
+6. **Waits for a USB stick and writes it** (because of `--usb`). See Part 3.
 
-Two things it deliberately leaves to you: the key backup lands beside the
-build (it says so, loudly — copy it to removable media before you ship an
-image signed with that key), and the fingerprint still has to travel to
-recipients by a channel independent of the stick.
+If it stops, fix the cause and run it again: the steps that already succeeded
+are skipped. The image build itself runs again every time, so if **only the USB
+step** failed, run `./build_iso.py write-usb --wait` instead.
 
-`bootstrap` is the production release path: it insists on independent
-key-backup media and an audited export destination before it builds. Use it
-for a release you will hand to others.
+| Add | Effect |
+|---|---|
+| `--yes` | Also skips the "write to /dev/sdX?" confirmation |
+| `--no-passphrase` | A throwaway lab build that asks nothing, with an unprotected key |
+| `--edition unwired` | The stick installs the unwired edition |
 
-The rest of this section, and sections 3 to 6, explain what each of those steps
-does and how to run them individually.
+### 2.2 Choose before you build (optional)
 
----
-
-Clone the repository, then let it prepare the host:
+Nothing has to be edited: the defaults build a working image. Settings are
+changed by name. A typo is rejected, not ignored.
 
 ```bash
-git clone <your-internal-url>/InQubestigationOS.git
-cd InQubestigationOS
-./build_iso.py setup-host
+./build_iso.py --set work_dir=/srv/build   # change one
+./build_iso.py --get tier                  # read one
+./build_iso.py config                      # print them all
 ```
 
-It prints every command it intends to run and asks once before running any of
-them. Rather than a fixed list of package names — which is how it used to
-break, by naming one that a distribution had removed years earlier — it lists
-what it needs by *capability* (a container engine, git, curl, gpg, rsync, YAML
-for `builder.yml`, something that can read an ISO), asks your package manager
-which name provides each, and installs those. Anything your distribution has
-no package for at all is named and skipped rather than failing the rest. On
-Debian and Kali the install runs non-interactively and keeps your existing
-configuration files, so a package's setup question (Kali's "restart services
-during package upgrades?") cannot stall it behind a dialog.
+| Setting | Default | Change it when |
+|---|---|---|
+| `work_dir` | `~/investigator-iso` | your home disk has less than ~100 GB free |
+| `edition` | `wired` | you want `unwired` sticks by default (you can also pick per stick) |
+| `tier` | `1` | you want the templates inside the image (`2`, not yet built end to end) |
+| `install.unattended` + `install.disk` | off | you want an install with no clicking, see [Part 4](#4-install-on-the-laptop) |
+| `auto_provision` | `true` | you do not want first boot to configure the machine |
+| `provisioner_config` | empty | you want to ship a reviewed, non-secret `golden-image.json` with the image |
+| `iso_sign_key` | set by `gen-key` | never by hand |
 
-It then enables the Docker service, adds you to its group, and — if the build
-host is a Qubes app qube rather than a normal machine — writes the bind-dirs
-entry that keeps `/var/lib/docker` across reboots, seeding the directory so the
-first copy does not fail silently.
+### 2.3 What you get
 
-One step is listed conditionally: on Debian and Kali, which have not packaged
-`pykickstart` since 2019, the plan offers to create a virtualenv under
-`work_dir` and `pip install pykickstart` into it from PyPI. It is shown before
-you agree, and it is optional — declining costs you the kickstart check that
-runs *before* the build, and the same thing is confirmed afterwards from the
-finished ISO instead.
+In `<work_dir>/output/` (by default `~/investigator-iso/output/`):
 
-Group membership does not apply to a shell that was already open. Rather than
-telling you to log out and back in, `setup-host` verifies through `sg` and tells
-you how to run this session's build without one:
+| File | What it is |
+|---|---|
+| `InQubestigationOS.iso` | the image |
+| `InQubestigationOS.iso.sha256`, `InQubestigationOS.iso.asc` | its checksum and signature |
+| `oem/editions/wired/ks.cfg`, `oem/editions/unwired/ks.cfg` (each with `.asc`) | the signed installer answer file for each edition |
+| `oem/ks.cfg` (+ `.asc`) | a copy of the configured default edition |
+| `unit-signing-key.asc` | your public key, for colleagues |
+| `verify-iso.sh`, `verify-iso.ps1` | one command for colleagues to verify the image (Linux, Windows) |
+| `FINGERPRINT.txt` | your fingerprint, laid out to be read aloud |
+| `BUILD-RECORD.txt` | date, tier, templates, hashes, and a staleness warning |
+
+### 2.4 The same steps one at a time
+
+`quickstart` chains these. Run them yourself when you want to see or repeat
+one step:
 
 ```bash
-sg docker -c './build_iso.py all'
+./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"  # new key (rsa4096, 3 years)
+./build_iso.py gen-key --use-key auto          # or adopt the one key already in your keyring
+./build_iso.py backup-key --to /media/usb/keys # back the key up to removable media
+./build_iso.py check-upstream                  # upstream keys and versions still match?
+./build_iso.py --dry-run all                   # print the whole plan, change nothing
+./build_iso.py templates                       # tier 2 only: build the templates
+./build_iso.py iso                             # build, checksum and sign the image
 ```
 
-Then confirm the whole host in one command:
+> **Never put private key material in a config file or in this repository.**
+> Only the fingerprint goes into `iso-build.json`. The build refuses to start if
+> it finds a key block. Details: [SIGNING.md](SIGNING.md).
+
+What `templates` and `iso` do internally is in
+[Appendix B](#appendix-b--what-the-build-does-inside).
+
+### 2.5 Production path: `bootstrap`
+
+`quickstart` keeps the key backup on the build host, which is fine for testing.
+For an image you will issue, use `bootstrap`. It **requires** a separate
+backup medium and an export destination before it builds anything, and it
+verifies the export by reading it back:
 
 ```bash
-./build_iso.py doctor
-```
-
-For an unattended run, `--yes` answers every prompt.
-
----
-
-## 3. Create the signing key
-
-```bash
-./build_iso.py gen-key --uid "Kapo Cyber Image Signing <cyber@example.ch>"
-```
-
-That generates an rsa4096 signing key with a three-year expiry — deliberate: an
-image-signing key should outlive a build cycle but not outlive the team — and
-then does the parts that used to be manual and easy to fumble:
-
-- writes the fingerprint into `iso-build.json`, so nothing is retyped
-- exports the public key beside the ISO
-- writes `FINGERPRINT.txt`, laid out in the two rows of five groups that
-  `gpg --fingerprint` prints, ready to be read out over the phone
-
-gpg will ask for a passphrase. `--no-passphrase` skips it and says loudly why
-that is a lab-only choice.
-
-If your unit already has an image-signing key in this keyring, adopt it instead:
-
-```bash
-./build_iso.py gen-key --use-key auto          # exactly one secret key present
-./build_iso.py gen-key --use-key <fingerprint> # otherwise
-```
-
-> **Never put private key material in a config file or this repository.** Only
-> the fingerprint goes in `iso-build.json`. The private key stays in the build
-> host's keyring. The build script refuses to start if it finds a key block, and
-> validates the fingerprint format before anything else runs.
-> Details in [SIGNING.md](SIGNING.md).
-
-### Production path: `bootstrap`
-
-`quickstart` keeps the key backup on the build host. For an image you intend to
-issue, `bootstrap` insists on independent backup media and an audited export;
-it is what `make bootstrap` and the release workflow run. Full detail in
-[BOOTSTRAP.md](BOOTSTRAP.md); a first run looks like this:
-
-```bash
-# The administrator mounts the removable backup filesystem first. Merely
-# creating /mnt/image-key-backup is deliberately not sufficient.
-sudo mount LABEL=IMAGE-KEY-BACKUP /mnt/image-key-backup
+sudo mount LABEL=IMAGE-KEY-BACKUP /mnt/image-key-backup   # the backup medium, mounted
 install -m 600 /dev/null /run/user/$UID/inqubestigation-gpg.pass
-# Write the passphrase into that runtime file without putting it in shell history.
 read -rsp 'Signing/backup passphrase: ' P; printf '%s' "$P" > /run/user/$UID/inqubestigation-gpg.pass; unset P; echo
 sudo -v
 ./build_iso.py bootstrap --yes \
@@ -371,493 +234,228 @@ sudo -v
   --to /mnt/image-key-backup/inqubestigation
 ```
 
-The backup-encryption passphrase is a second secret: on a terminal it is asked
-for, and `--backup-passphrase-file` supplies it where nobody is at the keyboard.
-
-For every repeat build, mount the same backup medium and use the same runtime
-secret file, then run the **same command**. The fingerprint already pinned in
-`iso-build.json` wins: bootstrap verifies and reuses that key even though
-`--uid` remains present, safely refreshes the encrypted backup, checks signing
-with an empty agent cache, and resumes only marks whose configuration and Git
-revision still match. `--yes` never creates a second identity. If the configured
-key is missing or selection is ambiguous, the command stops and tells you to
-restore it or pass its full fingerprint.
-
-The runtime passphrase file must be owned by the build user and mode `0600` (a
-protected FIFO or inherited `/proc/self/fd/N` is also accepted). Delete it after
-the run. It is never copied into JSON, logs, artifacts, or the ISO. Run bootstrap
-as the ordinary build user, not via `sudo`; after `setup-host`, orchestration
-enters the new Docker group with `sg` while retaining that user's HOME and GPG
-keyring. For `--yes`, authenticate with `sudo -v` first; the script verifies
-non-interactive sudo readiness and does not edit sudo policy.
+For a repeat build, run the **same command** with the same medium mounted. It
+reuses the key already pinned in `iso-build.json` and never creates a second
+one. Delete the passphrase file afterwards. The full contract, including the
+guided first run that needs none of the above typed by hand, is in
+[BOOTSTRAP.md](BOOTSTRAP.md).
 
 ---
 
-## 4. Configure the build
+## 3. Put it on a USB stick
 
-There is nothing you have to edit. Step 3 already set the only key that has no
-sensible default. To change anything else, name it — no editor, and a typo is
-rejected rather than silently ignored:
+> **Where:** a Linux machine: the build host, or any Linux for a downloaded release · **Time:** 10–20 minutes
 
-```bash
-./build_iso.py --set work_dir=/srv/build
-./build_iso.py --get tier
-./build_iso.py config                    # print every effective setting
-```
+> **The fingerprint travels separately. Always.** A public key on the same stick
+> or download as the image proves nothing: whoever can swap the image can swap
+> the key. Read the fingerprint out over the phone, or publish it somewhere
+> people already trust. `FINGERPRINT.txt` is laid out for that. This is the one
+> step that must stay manual. **The signing passphrase is never shared with
+> anyone.**
 
-The settings that matter:
+### 3.1 From your own build
 
-| Key | Set it to |
-|---|---|
-| `iso_sign_key` | set for you by `gen-key` |
-| `tier` | `1` (default) — stock templates in the ISO; the investigator templates are built on the target at first boot, which needs network and 1-3 hours |
-| `qubes_release` | `r4.3` |
-| `mock_config` | `auto` (default) — derived from the fetched builder for your release |
-| `work_dir` | Somewhere with 100 GB free, or 250 GB for tier 2 |
-| `auto_provision` | `true` — first boot configures itself |
-| `edition` | `wired` (default) — templates plus the whole design, wired and tested. `unwired` — the same templates only; the operator wires them using [WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md). Both editions' kickstarts are always built and signed, so this only picks the default for `oem/ks.cfg` |
-| `provisioner_config` | Optional path to a reviewed, non-secret `golden-image.json` to embed beside the provisioner |
-
-To transport provisioner settings, create a reviewed JSON file containing only
-non-secret overrides and set `provisioner_config=/path/to/golden-image.json`.
-The build rejects secret-looking populated fields and version mismatches, embeds
-the validated JSON beside `golden_image.py`, and the target loads that exact
-neighbor. Per-machine credentials are still generated only after installation.
-
-Before a first build, check that what the image trusts is still what upstream
-publishes:
+`quickstart --usb` already did this. To write another stick:
 
 ```bash
-./build_iso.py check-upstream
-```
-
-It compares the pinned Kali, Zeek and Wazuh signing keys against the live
-sources, reports how long each has before it expires, checks the Wazuh version
-the repository actually offers, and lists any Qubes Security Bulletin published
-since the recorded baseline — flagging the ones that touch dom0, Xen or the
-kernel, which are the ones that mean rebuild. It exits non-zero if anything
-moved. CI runs it every Monday.
-
-Now read the plan without changing anything:
-
-```bash
-./build_iso.py --dry-run all
-```
-
-This prints every action it would take. Read it. It takes two minutes and will
-save you hours.
-
----
-
-## 5. Build the templates
-
-Tier 2 only. At tier 1, the default, skip this section: `all` builds the ISO
-alone and the investigator templates are built on the target at first boot.
-
-```bash
-./build_iso.py templates
-```
-
-What happens:
-
-1. **Preflight** — refuses to run in dom0, checks disk, Docker and the signing
-   key, then shows three warnings you must acknowledge by typing `UNDERSTOOD`.
-   (`--yes` acknowledges them non-interactively and records that in the build
-   log; without a terminal the build stops rather than hanging on a prompt.)
-2. **Fetches qubes-builderv2** and builds the container image. Slow, one-off.
-3. **Fetches and verifies the Kali archive keyring** against fingerprint
-   `827C8569F2518CC677FECA1AED65462EC8D5E4C5`. A mismatch **aborts the build** —
-   this key is about to be baked into an image you hand to colleagues, so it does
-   not proceed on a guess.
-4. **Generates the template component** at
-   `~/investigator-iso/qubes-template-investigator`, structured like the upstream
-   `qubes-template-kali` component.
-5. **Installs the flavor content where qubes-builderv2 looks** — it fetches
-   `builder-debian`, copies each hook to
-   `template_debian/<flavor>/04_install_qubes_post.sh` with the keyring beside
-   it, and refuses to build unless the hook is there. Nothing else puts it on
-   the builder's search path, and a flavor it cannot find builds as stock
-   Debian under the investigator name.
-6. **Builds five templates**, each a full debootstrap:
-
-| Template | Contents |
-|---|---|
-| `investigator-kali` | Kali rolling, `kali-linux-default`, Maltego |
-| `investigator-office` | LibreOffice, de-CH language, Thunderbird, KeePassXC |
-| `investigator-ids` | Suricata, Zeek 8.0 LTS (`zeek-lts`) |
-| `investigator-proxy` | Squid with peek/splice, unbound |
-| `investigator-wazuh` | Wazuh indexer + server + dashboard |
-
-Every one also gets the Wazuh agent, installed **disabled** and **version-held**.
-
-> **Why disabled?** A template is a shared filesystem. An enabled agent would
-> beacon during template updates, and every qube cloned from it would inherit the
-> *same* agent identity and collide in the manager instead of appearing as
-> separate hosts. The provisioner enables it per qube automatically in phase 11.
-> This is correct ordering, not a manual step.
-
-Expect several hours. If a template fails, fix the cause and resume — templates
-build independently, and a completed set is skipped rather than rebuilt:
-
-```bash
-./build_iso.py templates          # skipped if every RPM is already present
-./build_iso.py --force templates  # rebuild them anyway
-```
-
----
-
-## 6. Build the ISO
-
-```bash
-./build_iso.py iso
-```
-
-1. Reads the real kickstart and comps files from the fetched Qubes sources and
-   **derives the stock template names from `comps-dom0.xml`** rather than
-   assuming them.
-2. Detects whether the comps file has the `@QUBES_TEMPLATES@` marker. On
-   `release4.3` it does not, so the custom templates are added to a `%packages`
-   section in the generated kickstart instead. The script tells you which path it
-   took.
-3. Writes the compose kickstart `investigator.ks` into `qubes-release/conf/` —
-   beside the kickstart it `%include`s, because `%include` resolves relative to
-   the including file. It only decides what goes into the ISO. The installer
-   answers and the `%post` go into one install-time kickstart per edition,
-   `oem/editions/wired/ks.cfg` and `oem/editions/unwired/ks.cfg`: the `%post`
-   plants the provisioner, [WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md) and the
-   first-boot service into dom0. `oem/ks.cfg` is a copy of the configured
-   `edition`.
-4. **Merges** the `iso:`, `cache:` and `sign-key:` settings into `builder.yml`,
-   rather than appending a second copy of those keys. YAML keeps only the last
-   occurrence of a duplicate key, so appending silently replaced the upstream
-   component list and dropped the rpm and deb signing fingerprints. The merge is
-   then verified with `qb config get-var templates`. It also sets
-   `use-qubes-repo` to the Qubes release, because the installer's build chroot
-   needs `lorax-templates-qubes` from the signed Qubes repository, and
-   `use-kernel-latest: false`, because lorax (the libdnf5 versions Fedora 41
-   ships) crashes on the `--excludepkgs kernel` that setting adds. The
-   installer boots the default kernel; the installed system still gets
-   `kernel-latest` from the kickstart.
-5. Runs `qb installer init-cache all`.
-6. Picks the **newest** image under `artifacts/`, refuses it if it predates this
-   run, then checksums it, signs the image and every `ks.cfg` under `oem/`, and
-   writes `BUILD-RECORD.txt`.
-
-Output in `<work_dir>/output/` (by default `~/investigator-iso/output/`):
-
-```
-InQubestigationOS.iso
-InQubestigationOS.iso.sha256
-InQubestigationOS.iso.asc         detached signature
-oem/ks.cfg (+ .asc)               install-time kickstart, the configured edition
-oem/editions/wired/ks.cfg (+ .asc)
-oem/editions/unwired/ks.cfg (+ .asc)
-unit-signing-key.asc              your public key, for colleagues
-verify-iso.sh                     one command for colleagues to run
-verify-iso.ps1                    the same, for Windows
-FINGERPRINT.txt                   the fingerprint, laid out to be read aloud
-BUILD-RECORD.txt                  date, tier, templates, hashes, expiry warning
-```
-
----
-
-## 7. Distribute the ISO
-
-Write to USB:
-
-```bash
-./build_iso.py write-usb --device /dev/sdX
-```
-
-Rather than a `dd` line you have to get right at four in the afternoon, this:
-
-- re-checks the image against its own `.sha256` and verifies the GPG signature
-  **before** writing anything — an image that no longer matches the build record
-  never reaches the media
-- lists removable devices and refuses a fixed disk unless you pass
-  `--allow-fixed-disk`, because this command destroys its target
-- refuses a device with mounted partitions
-- writes, syncs, then **reads the stick back** and compares it byte for byte. A
-  stick that writes without error and reads back wrong is a failure you would
-  otherwise discover at the install, on someone else's desk
-- verifies the signature on `oem/ks.cfg` — the install-time kickstart it then
-  puts on the stick's `QUBES_OEM` partition — against the same key, **before**
-  any of the above. That file runs as root inside the installer and the
-  image's signature does not cover it; the build signs it beside the image,
-  and an unsigned or altered one is refused. `verify-iso.sh` checks it too
-  when the bundle carries one. Nothing verifies the stick at boot, for the
-  image or for the kickstart: Qubes' installer has no such mechanism, so a
-  written stick is protected by custody, exactly as an image-only stick
-  always was
-
-With one removable device plugged in, `--device` can be omitted.
-
-**Pick the edition at write time.** One build signs a kickstart for each
-edition under `oem/editions/`, and the ISO is the same for both:
-
-```bash
+./build_iso.py write-usb --wait                      # waits for a stick, then writes it
 ./build_iso.py write-usb --device /dev/sdX --edition unwired
 ```
 
-Without `--edition` the stick gets `oem/ks.cfg`, the configured `edition`;
-`quickstart --usb --edition unwired` passes it through the same way.
-Every install, of either edition, carries
-[WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md) in dom0 at
-`/usr/share/doc/inqubestigationos/`.
+Before touching the stick, it checks the image's checksum and signature, and
+the signature of the chosen edition's kickstart. It refuses fixed disks and
+mounted devices. After writing, it **reads the stick back** and compares it.
+It adds the `QUBES_OEM` partition with the kickstart. With one stick plugged
+in, `--device` can be left out.
 
-Colleagues verify before installing — one command, shipped beside the image:
+Colleagues verify an image with one command: `./verify-iso.sh <fingerprint>`.
 
-```bash
-./verify-iso.sh
-```
+### 3.2 Publish a download (GitHub Releases)
 
-It checks the checksum, imports the key, verifies the signature, and then prints
-the fingerprint it verified against so they can compare it with the one you gave
-them. By hand it is still:
+GitHub rejects files of 2 GiB or more. `package-release` re-verifies the build
+and turns it into files GitHub accepts:
 
 ```bash
-sha256sum -c InQubestigationOS.iso.sha256
-gpg --import unit-signing-key.asc
-gpg --verify InQubestigationOS.iso.asc InQubestigationOS.iso
+./build_iso.py package-release                  # into <work_dir>/release/InQubestigationOS-<YYYYMMDD>/
+./build_iso.py package-release --to /mnt/big    # somewhere else
 ```
 
-> **The fingerprint must travel separately from the ISO.** A public key shipped
-> on the same USB stick as the image it signs proves nothing — anyone who can
-> replace the image can replace the key beside it. Read the fingerprint out over
-> the phone, or publish it somewhere colleagues already trust. `FINGERPRINT.txt`
-> is formatted for exactly that, and `write-usb` reminds you to carry it
-> separately. **This is the one step in the whole guide that must stay manual**:
-> its entire value is that it does not travel with the image.
+It writes:
 
-### Publishing a download (GitHub Releases)
+| File | What it is |
+|---|---|
+| `InQubestigationOS.iso.part01`, `.part02`, … | the image, split into parts under 2 GiB |
+| `InQubestigationOS-<YYYYMMDD>-kit.tar.gz` | `make-usb.sh`, the checksum and signature, both editions' signed kickstarts, the verification scripts |
+| `unit-signing-key.asc` | your public key |
+| `SHA256SUMS`, `SHA256SUMS.asc` | checksums of every file, signed |
+| `README.txt` | the downloader's instructions: paste it as the release notes |
 
-GitHub rejects release files of 2 GiB or more and stores files, not folders.
-`package-release` turns a signed build into files it accepts:
+Create **one** release and upload every file in that folder as its assets.
+Nothing secret is in it: the kit is built from an allowlist, so the key backup
+and `iso-build.json` never go in. Signing `SHA256SUMS` asks for your passphrase
+on *your* machine. Downloaders never need it.
 
-```bash
-./build_iso.py package-release       # into <work_dir>/release/InQubestigationOS-<YYYYMMDD>/
-./build_iso.py package-release --to /mnt/big --part-size 1900   # into /mnt/big/InQubestigationOS-<YYYYMMDD>/
-```
-
-A folder that already holds files is refused rather than mixed into. It first
-re-verifies the checksum, every signature and that `unit-signing-key.asc` is
-the release key, then writes:
-
-- the image split into parts (`InQubestigationOS.iso.part01`, ...), each
-  under 2 GiB;
-- `...-kit.tar.gz`: the whole-image checksum and signature, both editions'
-  signed kickstarts, the verification scripts, and `make-usb.sh`, which joins
-  the parts and runs this script's own `write-usb` checks on the downloader's
-  machine;
-- `unit-signing-key.asc`, `README.txt` (the downloader's instructions; use it as
-  the release notes), and `SHA256SUMS` with its signature `SHA256SUMS.asc`.
-
-Upload every file in that folder as the assets of one release. The kit is built
-from an allowlist: the key backup, `iso-build.json` and anything else in
-`output/` never go into it. **The signing passphrase is never published**:
-downloaders need only the fingerprint, which you give them separately, exactly
-as above. Compression is not used, because an ISO is mostly compressed packages
-already and would barely shrink. `SHA256SUMS` is signed with the release key,
-so gpg asks for the passphrase (or pass `--passphrase-file`). Downloaders on
-Windows can join the parts and write a plain Qubes installer, but only
-`make-usb.sh` on Linux adds the `QUBES_OEM` partition that makes the install
-provision itself.
-
-### Writing a stick from a downloaded release
+### 3.3 From a downloaded release
 
 On Linux, with `python3`, `gnupg`, `gdisk` and `dosfstools` installed, and the
-signing key's fingerprint obtained **separately** from the download:
+fingerprint obtained **separately**:
 
 ```bash
-# every release file in one folder, then:
+# all release files in one folder, then:
 gpg --import unit-signing-key.asc
-gpg --verify SHA256SUMS.asc SHA256SUMS     # "Good signature", and that fingerprint
-sha256sum -c SHA256SUMS                     # every line OK
+gpg --verify SHA256SUMS.asc SHA256SUMS      # "Good signature", with the fingerprint you were given
+sha256sum -c SHA256SUMS                     # every line: OK
 tar xzf InQubestigationOS-<YYYYMMDD>-kit.tar.gz
-./make-usb.sh --fingerprint <that fingerprint> --edition wired
+./make-usb.sh --fingerprint <that fingerprint> --edition wired    # or unwired
 ```
 
-`make-usb.sh` joins the parts, then runs `write-usb` with the fingerprint you
-gave it: the checksum, the image signature and the edition's kickstart
-signature are all checked against that key before the stick is touched, the
-stick is read back after the write, and the `QUBES_OEM` partition is added.
-Add `--device /dev/sdX` when more than one stick is plugged in.
+`make-usb.sh` joins the parts and then runs the same checks as `write-usb`
+(3.1) against the fingerprint you gave it. Add `--device /dev/sdX` if more than
+one stick is plugged in.
+
+### 3.4 From Windows
+
+Windows tools write a **plain Qubes installer**: the image boots, but nothing
+configures the machine. Only `write-usb` and `make-usb.sh`, both on Linux, add the
+`QUBES_OEM` partition. So use a Linux VM and pass the stick through to it. In
+VirtualBox that means Settings → USB → **USB 3.0 (xHCI)**.
+
+If you still want a plain stick from Windows, verify it first with
+`.\verify-iso.ps1 <fingerprint>` (needs Gpg4win), then write it with Rufus in
+**DD Image mode**. ISO mode breaks the boot. Choose "Install Qubes OS" at boot.
 
 ---
 
-## 8. Install on a laptop
+## 4. Install on the laptop
 
-**Build the ISO so there is nothing to click.** Set this before section 6 and
-the generated kickstart carries the language, keyboard, timezone and
-partitioning answers, so Anaconda stops asking them:
+> **Where:** the laptop · **Time:** 20–40 minutes
+
+**Normal install (the default):**
+
+1. Boot the stick.
+2. Install Qubes as usual and accept the defaults. **Enable disk encryption**
+   with your unit's passphrase policy.
+3. Reboot and complete Qubes' initial setup, which creates `sys-net`,
+   `sys-firewall` and the rest. First boot (Part 5) waits for these to exist.
+
+**Unattended install (optional, set before building):** the installer then
+asks only for the disk-encryption passphrase, which stays human on purpose.
+Find the laptop's disk identity **on the laptop**, then set both values in
+**one** command:
 
 ```bash
-# Find the target's stable identity ON THE LAPTOP, not on the build host:
-ls -l /dev/disk/by-id/ | grep -v part
+ls -l /dev/disk/by-id/ | grep -v part          # on the laptop: pick the internal disk
 
 ./build_iso.py --set install.unattended=true \
   --set install.disk=/dev/disk/by-id/nvme-SAMSUNG_MZVL2512HCJQ_S64ANS0T123456
 ```
 
-`install.disk` must be a `/dev/disk/by-id/...` path.
-A kernel name like `/dev/nvme0n1` is refused: those are assigned in discovery
-order and the disk that answers to it on the build host is not the one that
-answers to it on the laptop — which, for a directive that erases the disk, is
-not a mistake worth being able to make. Both `--set`s go in **one command**:
-`unattended` without a target disk is not a configuration a build can use, so
-setting them separately is refused and nothing is written. The value shown is
-an example: record the actual identifier from the laptop being installed. At
-install time, before any `clearpart` is emitted, the kickstart's `%pre` requires
-that identity to resolve to exactly one whole disk on that machine and stops on
-a missing, ambiguous, partition or installation-media match. Blank can never
-mean `clearpart --all`, and there is deliberately no "pick the only fixed disk"
-fallback: a fleet whose disks have different identities needs a per-machine
-configuration.
-
-It is **off by default** on purpose: it names a disk and erases it, which is not
-a thing to turn on by accident. Turn it on once you have decided which disk, and
-every laptop after that installs the same way.
-
-The one answer it deliberately does **not** supply is the disk encryption
-passphrase. `autopart --encrypted` makes Anaconda *require* one, so the decision
-that has to stay human cannot be clicked past by someone in a hurry.
-
-Then the install is:
-
-1. Boot the verified USB. The installer starts by itself; `%pre` checks the
-   disk identity and stops before partitioning if it does not match.
-2. Enroll the machine's unique disk-encryption passphrase when Anaconda asks.
-   No shared passphrase is embedded and encryption cannot be disabled in
-   unattended mode. That is the only prompt.
-3. The installer completes and reboots. `install.auto_initial_setup` (on by
-   default) means the first-boot runner completes Qubes' own initial setup
-   non-interactively — the templates the ISO carries are installed, the
-   default kernel and template set, and the same salt states the wizard would
-   apply are applied — and retries every thirty minutes until the machine is
-   provisioned, so a laptop left alone overnight finishes by itself.
-
-**Without `install.unattended`** it is the ordinary Qubes install:
-
-1. Boot the USB.
-2. Install Qubes normally. Accept the defaults. **Enable full-disk encryption**
-   with your unit's passphrase policy.
-3. Reboot and complete Qubes initial setup — the step that creates `sys-net`,
-   `sys-firewall`, `personal`, `work` and so on. The provisioner rewires these,
-   so it waits for them to exist. (`sudo golden-image-provision --initial-setup`
-   does the same thing without the wizard.)
+- Only `/dev/disk/by-id/...` is accepted. `/dev/nvme0n1`-style names change
+  between machines, and this setting erases the disk.
+- At install time the stick checks that this identity matches exactly one whole
+  disk, and stops before partitioning if it does not. There is no "pick any
+  disk" fallback. Machines with different disks need different builds.
+- Qubes' initial setup then runs by itself (`install.auto_initial_setup`, on by
+  default).
 
 ---
 
-## 9. First boot
+## 5. First boot
 
-Provisioning starts automatically and needs nobody at the keyboard. The
-**unwired** edition runs only the template phases (1, 3, 4 and 5): it creates
-no qube, generates no credentials and installs no timers, and its handover
-points at [WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md). On a
-Tier 1 image — the default — the investigator templates are built here, from
-the network: expect 1-3 hours and make sure the machine has connectivity. On a
-Tier 2 image the templates are already on disk, so this wires the topology
-only, in minutes. Either way the templates are shut down after each phase that
-installs into them, so every qube created afterwards boots with what was
-installed rather than the template's previous root.
+> **Where:** the laptop · **Time:** tier 1: 1–3 hours, needs network (both editions)
 
-Local provisioning does not need a repository download, but that is **not** a
-claim that online acceptance has passed: first boot runs the offline checks and
-records DNS resolution and Tor exit confirmation as `PENDING ONLINE`, never
-PASS. Run the full `--verify` once the machine is on its network; issuance
-stays blocked by real failures.
-
-The console will ask, once per run, for the `investigator` login password —
-the one thing only a person can supply. It waits 90 seconds and then carries
-on without it; provisioning never depends on that answer. If you were not
-there, the question comes back at the next boot and every 30 minutes, and
-`sudo golden-image-firstboot` asks it right now. The machine counts as fully
-provisioned only once both halves are done.
-
-Watch it:
+Nothing to do: the machine configures itself, with nobody at the keyboard.
+Watch it if you like:
 
 ```bash
 journalctl -t golden-image -f
 ```
 
-Twelve phases run: preflight, credentials, template clones, payloads, agents,
-chain qubes, chain configuration, the SIEM, app qubes, policy and backups,
-enrollment, acceptance tests. Each phase logs where the run is, for example
-`phase 4 (4/12, 25% done): install template payloads`, and the run ends with
+Each phase logs its progress, for example
+`phase 4 (4/12, 25% done): install template payloads`. The run ends with
 `provisioning run finished in … (wired edition)`.
 
-If it was deferred or failed, it is safe to run or resume by hand — completed
-phases are skipped:
+| # | Phase | Unwired runs it |
+|---|---|---|
+| 1 | preflight checks | yes |
+| 2 | credentials (four per-machine secrets) | — |
+| 3 | clone templates | yes |
+| 4 | install template payloads | yes |
+| 5 | Wazuh agent in every template | yes |
+| 6 | build inspection chain qubes | — |
+| 7 | configure inspection chain (and its two in-qube timers) | — |
+| 8 | Wazuh manager (the SIEM) | — |
+| 9 | app qubes and netvm assignment | — |
+| 10 | dom0 policy, segmentation, backup (and the dom0 timers) | — |
+| 11 | agent enrollment | — |
+| 12 | acceptance tests | — |
+
+**One question comes up at the console:** the `investigator` login password.
+It waits 90 seconds and then carries on without it, because provisioning never
+depends on it. Unanswered, it is asked again at the next boot and every 30
+minutes. `sudo golden-image-firstboot` asks it right away.
+
+**If it stopped or was deferred**, resume by hand. Completed phases are
+skipped:
 
 ```bash
 sudo golden-image-provision              # run or resume
-sudo golden-image-provision --dry-run    # see what it would do
+sudo golden-image-provision --dry-run    # show what it would do
 sudo golden-image-provision --from-phase 7
 ```
 
-An unwired machine can be given the whole design at any time;
-`--edition wired` is recorded in its configuration, so `--status`, `--verify`
-and the weekly self-check follow it from then on:
+**An unwired machine can be wired later**, at any time. From then on it counts
+as wired. There is no way back short of reinstalling:
 
 ```bash
 sudo golden-image-provision --edition wired
 ```
 
+First boot runs the offline checks only. Checks that need the internet (DNS,
+Tor exit) are recorded as `PENDING ONLINE`, never as passed. Run `--verify`
+(Part 6) once the machine is on its network.
+
 ---
 
-## 10. Verify before issuing
+## 6. Verify and hand over
+
+> **Where:** the laptop, in dom0 · **Time:** about 15 minutes
+
+### 6.1 Verify
 
 ```bash
 sudo golden-image-provision --verify
 ```
 
-On the unwired edition, `--verify` checks the templates only: that each
-exists, carries its payload and a disabled Wazuh agent, and that the Kali
-keyring and Zeek are in place. On the wired edition it runs
-thirteen groups of acceptance tests. **All must pass** before the laptop leaves
-your desk — and the command exits non-zero if any fail, so it can gate a script
-rather than relying on someone reading the output. Notably:
+**Everything must pass before the laptop leaves your desk.** The command exits
+non-zero on any failure, so a script can gate on it.
 
-- Every hop in the chain points where it should
-- **No clearnet qube attaches directly to `sys-firewall` or `sys-net`** — this
-  walks every qube on the system and fails if anything bypasses the chain
-- `vault` and `dvm-offline` have no netvm
-- All nine templates carry `/var/ossec`
-- Every custom template is Debian-based
-- The Kali keyring carries the expected 2025 signing key
-- `wazuh-agent` is version-held in every Debian template
-- `8.8.8.8` is unreachable from `personal`, but name resolution works
-- Suricata, Zeek and Squid are running; the NFQUEUE hook is present
-- The backup timer is enabled
+- **Wired:** fourteen groups of acceptance tests (0–13). Among them:
+  - every hop of the chain points where it should;
+  - no clearnet qube bypasses it;
+  - `vault` and `dvm-offline` have no network;
+  - every template carries the disabled Wazuh agent;
+  - `8.8.8.8` is unreachable from `personal`, but DNS works;
+  - Suricata, Zeek and Squid run;
+  - the SIEM answers, and Tor really exits through Tor;
+  - Wi-Fi firmware loaded.
+- **Unwired:** the templates only. Each exists, carries its payload and the
+  disabled agent, and the Kali keyring and Zeek are in place.
 
-**There is no longer a "confirm by hand" list.** Group 13 is exactly that list,
-turned into tests that run on the real hardware:
+### 6.2 Hand over the credentials (wired only)
 
-| Was a manual check | Group 13 does |
-|---|---|
-| `nft list chain ip qubes dnat-dns` and read it | reads the chain and fails if the golden rule is not in it |
-| — | reads the `custom-dnat-squid` counters and fails if nothing has been redirected |
-| — | runs `squid -k parse` in `sys-proxy` against the peek/splice config |
-| `systemctl is-active wazuh-{manager,indexer,dashboard}` | asserts all three |
-| — | asserts `qvm-prefs wazuh-srv ip` took the pinned address |
-| — | opens the dashboard from `work` over qrexec and fetches from it, proving the `qubes.ConnectTCP` policy and argument order |
-| `sudo qvm-backup --profile golden-image` | generates a reference profile with `--save-profile` and compares the key names — no backup is taken |
-| Open Tor Browser and look at check.torproject.org | asks `check.torproject.org/api/ip` from `kali-tor` and fails if `IsTor` is false |
-| "Also confirm Wi-Fi works" | looks for a wireless interface in `sys-net` and for firmware load failures in its kernel log |
+The wired edition generated four per-machine secrets into
+`~/golden-image/credentials.json`: the dashboard, API and enrollment passwords,
+and the backup passphrase. One command rotates them, copies them into the
+offline `vault` qube (verified), and then destroys the dom0 copy and the build
+log:
 
-Drivers come from the dom0 kernel but firmware comes from the Debian template,
-and that last row is the one place the Debian switch could bite.
+```bash
+sudo golden-image-provision --handover
+```
 
----
-
-## 11. Hand over to the investigator
-
-The unwired edition generates no credentials, so there is nothing to hand over
-and these commands say so.
-
-Three commands, in this order — or `sudo golden-image-provision --handover`,
-which runs all three behind a single confirmation and stops the chain if any of
-them fails:
+Or run the three steps separately, if your policy needs the values in the
+unit's password process *before* the dom0 copy is destroyed:
 
 ```bash
 sudo golden-image-provision --rotate-credentials
@@ -865,238 +463,269 @@ sudo golden-image-provision --escrow-credentials
 sudo golden-image-provision --shred-credentials
 ```
 
-Run them separately if your policy requires the values to reach the unit's
-password process before the dom0 copy is destroyed — that is the gap between
-steps 2 and 3.
+**Copy the backup passphrase into your unit's password process as well.
+Without it, no restore.** The unwired edition has no credentials, and these
+commands say so.
 
-**`--rotate-credentials`** generates four new secrets and applies them: the
-manager's enrollment password and every enrolled agent's copy of it, the
-dashboard admin password through the Wazuh passwords tool, and the backup
-passphrase. If it cannot set the dashboard password it stops before writing
-anything, so the old values stay valid rather than the file and the machine
-disagreeing. The previous backup passphrase is kept in the file, because the
-existing backup sets still need it.
+### 6.3 Prepare the backup disk
 
-**`--escrow-credentials`** copies the file into `vault` — verifying the copy by
-SHA-256, and refusing outright if the target qube has a netvm — and records
-where it went.
-
-**`--shred-credentials`** refuses to run without that record, re-verifies the
-escrowed copy is still there and still matches, and only then destroys the dom0
-copy. It shreds the **build log** too: that log records every command run
-against every qube, and leaving it behind was the quiet half of this step.
-
-Copy the escrowed values into your unit's password process as well — a vault
-qube is offline, but it is on the same disk as everything else. **Escrow the
-backup passphrase especially:** no passphrase, no restore.
-
-Then the dashboard. There is no `qvm-connect-tcp` line to remember: `work` has a
-**SIEM dashboard** launcher that opens the qrexec tunnel and the browser.
-
-Finally, prepare the backup disk. Attach it to `sys-usb`, then:
+Attach the disk to `sys-usb`, then:
 
 ```bash
 sudo golden-image-provision --prepare-backup-media
 ```
 
-It lists what is attached, refuses anything that is not removable, makes you
-type `ERASE`, then partitions, formats and labels it — and confirms
-`/dev/disk/by-label/GOLDEN-BACKUP` actually appeared, because that is the path
-the automount rule keys off.
+It refuses non-removable disks, asks you to type `ERASE`, then formats and
+labels it `GOLDEN-BACKUP`. From then on it mounts itself by that label, never
+by device name.
 
-A udev rule and a mount unit in `sys-usb` mount it at `/mnt/backup` whenever it
-appears — by label, never by device node, because `/dev/sdb` is whatever was
-plugged in last and a backup written to the wrong disk is worse than none.
-
-When every check passes and the handover is done, record the release:
+### 6.4 Record the release
 
 ```bash
 sudo golden-image-provision --issue --operator "Your Name"
 ```
 
-It re-runs the acceptance tests, refuses if any fail *or* if `credentials.json`
-is still on the machine, and only then writes `/var/lib/golden-image/issuance`
-with the image version, the host, the counts and who released it. "All must pass
-before the laptop leaves your desk" then survives the conversation it was said
-in.
+It re-runs the tests, refuses if anything fails *or* if the credentials file is
+still there, and writes a release record (`/var/lib/golden-image/issuance`):
+version, host, results, and who released it.
 
-**Brief the investigator on three rules:**
+### 6.5 Brief the investigator: three rules
 
 - **Window colours mean trust.** Never move files from a redder window into a
-  blacker one without a reason. `docs/DESIGN.html` has the legend.
-- **Evidence opens in a disposable.** Right-click → open in `dvm-offline`. No
-  network, destroyed on close, full office suite so anything renders.
-- **Two Kali qubes, two exits.** `kali-clear` for scans and active work,
-  inspected. `kali-tor` for OSINT where your IP must not appear — but Tor carries
-  TCP only, so SYN scans, UDP scans and ICMP will not work there.
+  blacker one without a reason. [DESIGN.html](DESIGN.html) has the legend.
+- **Evidence opens in a disposable.** Right-click, then open in `dvm-offline`:
+  no network, destroyed on close.
+- **Two Kali qubes, two exits.** `kali-clear` for scans and active work, which
+  is inspected. `kali-tor` for OSINT where your IP must not appear. Tor carries
+  TCP only, so SYN scans, UDP and ICMP do not work there.
 
-**For a case that demands zero linkage.** Tor-branch telemetry reaches the same
-SIEM index as attributed telemetry. The correlation stays on this laptop, but if
-a case cannot tolerate it at all:
-
-```bash
-sudo golden-image-provision --case-mode anonymous --case 2026-0417
-# ...and when the case closes:
-sudo golden-image-provision --case-mode normal --case 2026-0417
-```
-
-It stops and *masks* the agent in `kali-tor`, `sys-whonix` and `anon-whonix`, so
-the per-boot start does not quietly undo it, and appends both actions to
-`~/golden-image/case-mode.log` for the case file.
+The SIEM dashboard opens from the **SIEM dashboard** launcher in `work`.
 
 ---
 
-## 12. Ongoing maintenance
+## 7. Living with it: maintenance
 
-This used to be a table of things to remember. Phase 10 installs it as timers
-instead (wired edition; the unwired edition installs none). Nothing below needs a calendar entry or a named owner.
+> **Where:** the laptop runs itself · the build host decides when to rebuild
 
-| Cadence | What runs | Where | Unit |
+On the wired edition, routine upkeep is installed as timers. Nothing needs a
+calendar entry. The unwired edition installs none.
+
+| Timer | When | Does | Runs in |
 |---|---|---|---|
-| Weekly | Template updates; dom0 updates *reported*, never applied unattended | dom0 | `golden-template-update.timer` |
-| Weekly | The full acceptance suite, again | dom0 | `golden-selfcheck.timer` |
-| Weekly | Encrypted backup, then prune to `backup.keep_sets` | dom0 | `golden-backup.timer` |
-| Weekly | `suricata-update` + in-place `reload-rules` | `sys-ids` | `golden-suricata-update.timer` |
-| Monthly | **Restore verification** of the newest set | dom0 | `golden-restore-test.timer` |
-| Monthly | Zeek OBS, Kali and Wazuh key expiry watch | `sys-dpi` | `golden-key-expiry.timer` |
-| Weekly | Renew a repository key inside its expiry window — verified against the pinned fingerprint, rolled back otherwise | dom0 | `golden-key-refresh.timer` |
-| Daily | "Is this image too old to install safely?" | dom0 | `golden-staleness.timer` |
-| Weekly, in CI | Signing keys, versions and Qubes bulletins vs upstream | build host | `check-upstream` |
+| `golden-template-update` | weekly | updates templates; dom0 updates are *reported*, never applied unattended | dom0 |
+| `golden-backup` | weekly | encrypted backup, then prunes old sets | dom0 |
+| `golden-selfcheck` | weekly | the full acceptance suite again | dom0 |
+| `golden-key-refresh` | weekly | renews a repository key near expiry, only if it matches the pinned fingerprint | dom0 |
+| `golden-restore-test` | monthly | checks the newest backup archive's integrity (not a full restore) | dom0 |
+| `golden-staleness` | daily | warns when the installed image is too old | dom0 |
+| `golden-suricata-update` | weekly | refreshes IPS rules, reloads in place | `sys-ids` |
+| `golden-key-expiry` | weekly | watches the Zeek, Kali and Wazuh key expiry | `sys-dpi` |
 
-**Failures are not silent.** Each of these writes to the journal under
-`golden-image` and raises a banner in `/etc/motd.d/`, so the next person to log
-in sees it. One command answers "where is this machine":
+**Failures are not silent.** Every failure goes to the journal and shows as a
+banner at the next login. One command answers "how is this machine?":
 
 ```bash
 sudo golden-image-provision --status
 ```
 
-It prints which phases completed, whether the credentials are still on the
-machine and whether they were escrowed, whether each timer is enabled and when it
-next runs, and the last line of the self-check, restore-test and first-boot
-records. The underlying detail is still there if you want it:
+**Occasional tasks, each one command:**
 
-```bash
-systemctl list-timers 'golden-*'
-journalctl -t golden-image --since '1 week ago'
-```
+| When | Run |
+|---|---|
+| A case must not be linkable to other work at all | `sudo golden-image-provision --case-mode anonymous --case 2026-0417`, and `--case-mode normal` when it closes. It stops the Wazuh agent in the Tor qubes and logs both actions for the case file. |
+| Upgrading Wazuh | `sudo golden-image-provision --upgrade-wazuh`. It upgrades the manager first, then the agents, and records the version. Commit that change to this repository too. |
+| The expiry watch says a key is expiring | `sudo golden-image-provision --refresh-repo-keys` |
+| Kali rotated its signing key | Confirm the new fingerprint at kali.org, set `"kali": {"key_fpr": "<new>"}` in `/usr/local/sbin/golden-image.json` on each laptop and run `--refresh-repo-keys`. On the build host, `./build_iso.py --set kali.key_fpr=<new fingerprint>`. |
 
-**Rebuilding is still yours to decide, but not yours to notice.**
-`./build_iso.py check-upstream` on the build host lists every Qubes Security
-Bulletin published since the recorded baseline and tells you which of them touch
-dom0, Xen or the kernel. Those are the ones that mean rebuild and re-cut the ISO.
-CI runs it every Monday and fails when they appear.
-
-**Upgrade order for Wazuh** — manager first, then release the holds and upgrade
-the agents; an agent newer than the manager is unsupported and stops reporting.
-You no longer have to remember which way round that is:
-
-```bash
-sudo golden-image-provision --upgrade-wazuh
-```
-
-It upgrades `wazuh-srv`, reads back the version it actually reached, refuses to
-touch a single agent if it cannot, then upgrades and re-pins every template — and
-writes that version into `golden-image.json`, so the next provisioning run
-installs the same thing rather than re-pinning to the old one. Commit that
-change: the golden image is the git tag, not any one laptop.
-
-**Signing keys expire, and Zeek's documentation says you must re-add theirs by
-hand when it does.** The expiry watch tells you when; this is what it tells you
-to run:
-
-```bash
-sudo golden-image-provision --refresh-repo-keys
-```
-
-It re-fetches the Zeek, Kali and Wazuh keys into the templates that use them and
-re-verifies each against its pinned fingerprint, keeping the old key in place if
-the new one does not match — a failed refresh must not leave a template unable to
-update at all.
-
-**Kali key rolls happen.** April 2025 broke `apt update` for every Kali system
-worldwide. `check-upstream` catches the next one the Monday after it happens, and
-cross-checks the key against an independent keyserver rather than trusting the
-announcement alone. Confirm the new fingerprint at kali.org. Each laptop checks
-against its own configuration, so on each one set `"kali": {"key_fpr":
-"<new fingerprint>"}` in `/usr/local/sbin/golden-image.json` (as root), then
-refresh; and on the build host, record it for the next image:
-
-```bash
-sudo golden-image-provision --refresh-repo-keys          # on each laptop
-./build_iso.py --set kali.key_fpr=<new fingerprint>      # on the build host
-```
-
-**The verification stamp maintains itself.** `supply-chain.lock.json` records
-what upstream offered at the last check; `check-upstream --update` moves the
-baseline forward and `tests/doc_checks.py` fails CI if the fingerprints in the
-docs and the two scripts ever disagree.
+**When to rebuild the image.** An image freezes dom0, Xen and the kernel at
+build time. `./build_iso.py check-upstream` on the build host lists every
+Qubes Security Bulletin since the last build and marks those that touch dom0,
+Xen or the kernel. Those mean rebuild. CI runs it every Monday.
 
 ---
 
-## 13. Troubleshooting
+## 8. Command cheat sheet
 
-**`build_iso.py` says it is running in dom0.** It is not meant to. Use a separate
-build host. Only `golden_image.py` runs in dom0.
+**Build host: `./build_iso.py <command>`**
 
-**`Permission denied` writing `iso-build.json`.** It is written beside
-`build_iso.py`, so a clone made with `sudo` (into `/mnt`, say) belongs to root.
-`sudo chown -R "$USER": <the clone>`, or clone under your home, and run the
-scripts as yourself — never with `sudo`.
+| Command | Does |
+|---|---|
+| `quickstart --usb` | everything: check, fix, key, build, sign, write the stick |
+| `bootstrap` | the production path, with a separate key-backup medium and a verified export |
+| `doctor` / `doctor --fix` | check the host; `--fix` also runs the fixes |
+| `setup-host` | install what the host needs |
+| `gen-key` / `backup-key` / `restore-key` | create, back up and restore the signing key |
+| `config`, `--set K=V`, `--get K` | read and change settings |
+| `check-upstream` | pinned keys and versions against upstream (`--update` accepts the changes) |
+| `--dry-run all` | print the whole build plan, change nothing |
+| `templates` / `iso` / `all` | build templates (tier 2) / the image / both |
+| `sign` | sign an image on the machine that holds the key |
+| `write-usb` | verify, then write, then read back a stick (`--wait`, `--device`, `--edition`) |
+| `package-release` | turn a build into GitHub release files |
+| `bootstrap-status` | show the state of a bootstrap run |
+| `list-kickstarts` | show what the fetched Qubes sources offer |
 
-**`doctor`: "disk at … needed for tier 1".** `work_dir` defaults to
-`~/investigator-iso` on the system disk. Point it at a bigger disk you own:
-`./build_iso.py --set work_dir=/mnt/build/investigator-iso`, then run
-`quickstart` again.
+**Laptop, in dom0: `sudo golden-image-provision <flag>`**
 
-**The build disk is gone after a reboot.** A disk mounted by hand does not come
-back. Add it to `/etc/fstab` by UUID (from `sudo blkid`), with `nofail` so the
-machine still boots without it, then `sudo mount -a`.
+| Flag | Does |
+|---|---|
+| *(none)* | run or resume provisioning |
+| `--dry-run`, `--from-phase N`, `--phase N`, `--list-phases` | preview, resume from, or run one phase; list them |
+| `--status` | edition, phases, timers, last results |
+| `--verify` | the acceptance tests |
+| `--edition wired` | wire an unwired machine |
+| `--handover` | rotate, escrow and shred the credentials |
+| `--prepare-backup-media` | format the backup disk |
+| `--issue --operator NAME` | record the release |
+| `--case-mode anonymous\|normal --case ID` | cut or restore SIEM linkage for one case |
+| `--upgrade-wazuh`, `--refresh-repo-keys` | maintenance |
 
-**`write-usb --wait` never sees the stick (VirtualBox).** The VM's USB 1.1
-controller does not pass it through, even while it is ticked under Devices →
-USB; `lsblk` in the VM does not list it. Power the VM off, choose Settings →
-USB → USB 3.0 (xHCI), attach the stick, and run `./build_iso.py write-usb
---wait` — not `quickstart` again, which would rebuild the image.
+`make` on its own lists shortcuts for the most common of these (`make
+quickstart`, `make check`, `make verify`, …).
 
-**Docker needs sudo.** `./build_iso.py setup-host` — it adds you to the group and
-tells you how to run this session's build through `sg` rather than logging out.
+---
 
-**Kali fingerprint mismatch aborts the build.** Either Kali rolled the key —
-check kali.org/blog, confirm the new fingerprint, update `kali.key_fpr` — or the
-download was tampered with. Do not bypass this check.
+## 9. Troubleshooting
 
-**A template fails to build.** Templates build independently. Fix the cause and
-re-run `./build_iso.py templates`; completed ones are skipped.
+| Symptom | Fix |
+|---|---|
+| `Permission denied` writing `iso-build.json` | The clone belongs to root. `sudo chown -R "$USER": <the clone>`, or clone under your home. Never run the scripts with `sudo`. |
+| `doctor`: "disk at … needed for tier 1" | `./build_iso.py --set work_dir=/mnt/build/investigator-iso` on a bigger disk, then run `quickstart` again. |
+| The build disk is gone after a reboot | A disk mounted by hand does not come back. Add it to `/etc/fstab` by UUID (`sudo blkid`), with `nofail`, then `sudo mount -a`. |
+| Docker needs `sudo` | `./build_iso.py setup-host`. It adds you to the group and tells you how to carry on without logging out. |
+| `write-usb --wait` never sees the stick (VirtualBox) | Power the VM off, set Settings → USB → **USB 3.0 (xHCI)**, attach the stick, then `./build_iso.py write-usb --wait`. Do not re-run `quickstart`, which would rebuild. |
+| "Running in dom0" | `build_iso.py` belongs on a separate build host. Only the provisioner runs in dom0. |
+| Kali fingerprint mismatch stops the build | Either Kali rotated its key (confirm at kali.org, then `--set kali.key_fpr=…`) or the download was tampered with. Never bypass it. |
+| A template fails to build (tier 2) | Fix the cause and run `./build_iso.py templates` again. Finished templates are skipped. |
+| Provisioning was deferred at first boot | It waited 30 minutes for `sys-net` and `sys-firewall`. Complete Qubes' initial setup, then run `sudo golden-image-provision`. |
+| An acceptance test fails | Do not issue. The log is `~/golden-image/build.log`. Fix, then `--verify` again. |
+| The weekly self-check failed after issue | The login banner and `journalctl -t golden-image` name the group. The usual cause is a netvm changed by hand. |
+| No network in a qube | Its netvm should be `sys-proxy`. The IPS is **fail-closed**, so check `systemctl status suricata-nfqueue` in `sys-ids`. |
+| DNS goes to the wrong resolver | The `dnat-dns` rule did not survive. `--verify` group 13 names it. Background in [REVIEW.md](REVIEW.md), defect 3. |
 
-**`templates:` or `components:` appear twice in builder.yml.** They should not:
-the script now loads the YAML, merges its entries into the existing lists and
-mappings, writes a timestamped backup, and verifies the result with
-`qb config get-var templates`. If you see a duplicate, it came from somewhere
-else. (This needs `python3-yaml`, which `setup-host` installs; without it the
-script refuses to edit builder.yml rather than appending a block that would
-silently drop the upstream component list and the rpm/deb signing keys.)
+---
 
-**Provisioning was deferred at first boot.** The runner waits up to 30 minutes
-for `sys-net` and `sys-firewall`, then writes a notice to the MOTD rather than
-provisioning a half-built system. Complete Qubes initial setup, then
-`sudo golden-image-provision`.
+## Appendix A — Build host details
 
-**An acceptance test fails.** Do not issue the laptop. The build log is at
-`~/golden-image/build.log` (mode 600 — it records every command run against
-every qube, with generated secrets redacted). Fix, then re-run `--verify`, which
-exits non-zero while anything is still failing.
+### Which Linux
 
-**A weekly self-check failed after the laptop was issued.** The login banner and
-`journalctl -t golden-image` say which group. `sudo golden-image-provision
---verify` reproduces it. Something drifted — most often a netvm reassigned by
-hand — and the machine is out of compliance with its own design until it passes.
+`doctor` names your distribution and what it does about it:
 
-**No network in a qube after provisioning.** Check its netvm is `sys-proxy`, and
-that Suricata is running in `sys-ids` — the IPS is **fail-closed** by design, so
-a dead Suricata stops the inspected chain rather than passing traffic
-uninspected. `systemctl status suricata-nfqueue` in `sys-ids`.
+| Build host | Supported | What is different |
+|---|---|---|
+| **Debian 13** | reference host | nothing |
+| **Kali rolling** | yes, and **the only host that has actually built an image** (VirtualBox, Docker, tier 1) | Debian underneath. The same two packages are missing as on Debian (below). |
+| **Ubuntu 22.04 / 24.04** | yes | Older releases may lack `sq`/`sqv`. `setup-builder` names them and carries on. |
+| **Fedora 43 / 44** | yes | upstream's own host, and the only one with `mock` |
 
-**DNS resolves but goes to the wrong resolver.** Confirm the `dnat-dns` chain
-survived the reboot (section 10, check 1). This is the failure mode that used to
-be silent; see `docs/REVIEW.md` defect 3.
+Debian, Ubuntu and Fedora are covered by tests of host detection and package
+resolution, but have not built an image yet.
+
+**Two packages that every Debian-family host lacks, neither fatal:**
+
+- **`mock`**: without it, the build container is created from the pinned
+  Fedora image instead of a local chroot. This is chosen automatically.
+- **`pykickstart`**: `setup-host` offers to install it into a virtualenv under
+  `work_dir`. If you decline, the kickstart is checked from the finished image
+  instead of before the build.
+
+> **"Kali" means two different things here.** In this appendix it is a
+> distribution you might build *on*. Everywhere else it is a template *inside*
+> the image (`tpl-kali`). They are unrelated: the build host contributes only
+> your signing key and the build record's hostname and timestamps. Every
+> package is built inside containers from pinned sources.
+
+### Running the build host in a VM
+
+| | |
+|---|---|
+| Disk | 100 GB (tier 2: 250 GB), dynamically allocated. Make sure the physical disk has room to grow into. |
+| RAM / CPU | 8 GB and 2 cores minimum, 16 GB and 4 cores better |
+| A second virtual disk | the easiest way to give `work_dir` space. Mount it from `/etc/fstab` by UUID and `--set work_dir=` onto it. |
+| USB passthrough | VirtualBox needs the **USB 3.0 (xHCI)** controller, or the stick never appears |
+| Nested virtualisation | **not needed**. Docker containers are not VMs. |
+| Guest additions | not needed |
+| Architecture | must be x86-64. `doctor` refuses anything else. |
+
+An existing Kali or Debian VM is fine. It does not need to be fresh:
+`./build_iso.py --dry-run setup-host` shows everything it would change.
+
+### Windows
+
+The build needs Linux, so run a **Linux VM** (Hyper-V, VirtualBox or VMware)
+and follow this guide inside it. **WSL2** may work, but it is unverified: the
+image build's loop devices and chroots have not been confirmed under it.
+`doctor` checks what it can. If it fails, use a VM.
+
+Whatever you use, a discarded VM takes your signing key with it. Back it up
+the moment you create it (`./build_iso.py backup-key --to <removable media>`).
+
+---
+
+## Appendix B — What the build does inside
+
+### Templates: `investigator-*` and `tpl-*`
+
+Two sets of names exist, and they are not a contradiction:
+
+- **`tpl-*`**: the templates every installed machine uses (`tpl-sys`,
+  `tpl-proxy`, `tpl-ids`, `tpl-kali`, `tpl-personal`, `tpl-wazuh`). First boot
+  (phase 3) clones them from Debian 13 and installs their contents (phase 4).
+- **`investigator-*`**: tier 2 only. The build host builds them into the image
+  (`investigator-kali`, `investigator-office`, `investigator-ids`,
+  `investigator-proxy`, `investigator-wazuh`). When they are present, phase 3
+  clones `tpl-kali`, `tpl-personal`, `tpl-ids` and `tpl-proxy` from them
+  instead, and phase 4 skips what they already contain. That is what saves
+  hours at first boot.
+
+Every template carries the Wazuh agent **installed but disabled**. A template
+is shared: an enabled agent would report during updates, and every qube cloned
+from it would share one identity. Phase 11 enables it per qube.
+
+### `./build_iso.py templates` (tier 2)
+
+1. **Preflight.** It refuses to run in dom0, checks disk, Docker and the key,
+   and asks you to type `UNDERSTOOD` for three warnings (`--yes` records the
+   acknowledgement).
+2. **Fetches `qubes-builderv2`** and verifies its signed tag against the Qubes
+   master key. Then it builds the container image.
+3. **Fetches the Kali keyring** and checks it against the pinned fingerprint
+   `827C8569F2518CC677FECA1AED65462EC8D5E4C5`. A mismatch **aborts**.
+4. **Generates the template component** in
+   `<work_dir>/qubes-template-investigator` and puts each flavor where the
+   builder looks for it. Without that, a flavor would silently build as plain
+   Debian.
+5. **Builds the templates.** Each is a full debootstrap and takes hours.
+   Finished ones are skipped. `--force templates` rebuilds them.
+
+### `./build_iso.py iso`
+
+1. Reads Qubes' own kickstart and `comps-dom0.xml`, and takes the stock template
+   names from there rather than assuming them.
+2. Writes `investigator.ks`, which decides what goes into the image. It also
+   writes one install-time kickstart per edition, whose `%post` installs the
+   provisioner, [WORKSTATION-GUIDE.md](WORKSTATION-GUIDE.md) and the
+   first-boot service into dom0.
+3. **Merges** its settings into `builder.yml`, rather than appending a
+   duplicate block that would silently drop upstream's settings. The merge is
+   then verified with `qb config get-var templates`. It sets
+   `use-qubes-repo`, which the installer needs for `lorax-templates-qubes`, and
+   `use-kernel-latest: false`, because Fedora 41's lorax crashes on the
+   `--excludepkgs` that setting adds. The *installed* system still gets
+   `kernel-latest`.
+4. Runs `qb installer init-cache all`, then builds the installer.
+5. Takes the **newest** image, refuses one older than this run, then checksums
+   and signs it and every kickstart, and writes `BUILD-RECORD.txt`.
+
+### What `write-usb` protects against
+
+- **An image that changed since the build:** the checksum and signature are
+  checked before writing.
+- **An altered answer file:** the kickstart runs as root in the installer and
+  the image signature does not cover it, so it is verified separately.
+- **The wrong disk:** fixed and mounted disks are refused.
+- **A stick that writes without error but reads back wrong:** it is read back
+  and compared.
+
+What nothing can check: the stick at boot time. Qubes' installer has no such
+mechanism, so a written stick is protected by keeping it in your custody.

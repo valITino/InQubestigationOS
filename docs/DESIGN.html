@@ -174,7 +174,7 @@ hr.rule{border:none;border-top:1px solid var(--line);margin:52px 0}
 <div class="wrap">
 
 <header class="masthead">
-  <div class="doc-id">Kapo Cyber · Build specification · v2.6 · 2026-09-25</div>
+  <div class="doc-id">Kapo Cyber · Build specification · v2.7 · 2026-09-25</div>
   <h1>InQubestigationOS<br><span style='font-size:.62em;font-weight:500;color:var(--ink-2)'>Cybercrime investigator workstation</span></h1>
   <p class="lede" style="margin-top:16px">Reference design and verified build for the team-standard laptop. One inspected road for every clearnet connection, one anonymous road for Tor, endpoint telemetry in every compartment, reproducible from a stock installer or a custom ISO.</p>
   <div class="chips">
@@ -764,7 +764,7 @@ include:
   <li><strong>Included:</strong> everything carrying state or effort — vault, work qubes, case qubes, <code>kali-clear</code> (tool configs and Maltego graphs live in <code>/home</code>), <code>wazuh-srv</code> (standalone, so full root), all custom templates, and dom0.</li>
   <li><strong>Excluded:</strong> stock templates (re-downloadable), <code>untrusted</code>, and <strong>the entire Tor branch</strong> — it intentionally holds nothing, and backing it up would copy anonymous-context artifacts into attributed storage.</li>
   <li><strong>Retention:</strong> the last four weekly sets.</li>
-  <li><strong>Monthly:</strong> restore verification, calendared, owned by a named person. An unverified backup is a hope, not a control.</li>
+  <li><strong>Monthly:</strong> a timer checks the newest archive's integrity (<code>qvm-backup-restore --verify-only</code>). A full test restore is still a person's job, calendared and owned. An unverified backup is a hope, not a control.</li>
   <li><strong>Escrow the passphrase</strong> before shredding <code>credentials.json</code>. No passphrase, no restore.</li>
 </ul>
 

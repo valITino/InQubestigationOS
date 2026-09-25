@@ -1,7 +1,5 @@
 # InQubestigationOS
 
-> **Quick start:** `./build_iso.py quickstart --usb`. **Production release path:** `./build_iso.py bootstrap` — independent key-backup media and an audited export; see [the bootstrap operator contract](docs/BOOTSTRAP.md).
-
 A hardened Qubes OS build for cybercrime investigation workstations. Every
 clearnet connection is forced through a proxy, an inline IPS and a DPI recorder
 before it reaches the firewall; Tor traffic takes a separate, uninspected road;
@@ -42,8 +40,8 @@ builds the same templates and leaves the wiring to you.
 | **Forced DNS** | All clearnet DNS captured and sent to Quad9 over TLS; Whonix exempt by design |
 | **SIEM in every compartment** | Wazuh agent in all nine templates in service, version-held, per-qube identity |
 | **Investigator tooling** | Kali + Maltego, LibreOffice, Suricata, Zeek, Squid — built on the target at first boot (`tier=1`, the default), or baked into the ISO with `tier=2` |
-| **Weekly encrypted backups** | Profile-mode `qvm-backup` on a timer, with monthly restore verification |
-| **Acceptance tests** | Thirteen groups, re-runnable, that prove the design is actually in force |
+| **Weekly encrypted backups** | Profile-mode `qvm-backup` on a timer, with a monthly archive integrity check |
+| **Acceptance tests** | Fourteen groups, re-runnable, that prove the design is actually in force |
 | **Runs itself afterwards** | Updates, rule refreshes, key-expiry watch, self-checks and staleness warnings are all timers, not a checklist |
 
 Base is Qubes OS 4.3.1. dom0 is Fedora because Qubes builds it that way and
@@ -53,85 +51,84 @@ templates, and Whonix.
 ## Quick start
 
 ```bash
-# On an x86-64 Debian-family (Debian 13, Kali, Ubuntu) or Fedora host.
-# Clone as your normal user into a directory you own: iso-build.json is
-# written beside build_iso.py. The build itself goes to work_dir (default
-# ~/investigator-iso), which needs ~100 GB free (~250 GB for tier=2).
+# On an x86-64 Linux: Debian 13, Kali, Ubuntu or Fedora. A VM is fine.
+# Clone as your normal user; never run the scripts with sudo.
 git clone <your-internal-url>/InQubestigationOS.git && cd InQubestigationOS
-./build_iso.py --set work_dir=/big/disk/investigator-iso   # only if ~ is small
+./build_iso.py --set work_dir=/big/disk/investigator-iso   # only if ~ has < 100 GB free
 ./build_iso.py quickstart --usb   # one passphrase, then walk away
 ```
 
-`quickstart` checks everything it can **first** — host, tools, disk, Docker,
-the pinned supply chain — and fixes what it can, so a problem stops it in
-seconds rather than hours in. Then it creates or reuses the signing key, backs
-it up, builds and signs the ISO, and with `--usb` waits for a stick and writes
-it. It asks for exactly one passphrase. The steps before the build are skipped
-once they have succeeded; the ISO build itself runs again on every
-`quickstart`, so if only the USB step failed, run `./build_iso.py write-usb
---wait` rather than starting over.
+That checks and fixes the host, creates or reuses your signing key, builds
+and signs the image, and writes a USB stick. Boot the stick on the laptop and
+install. On first boot the laptop configures itself. The step-by-step version,
+with what each step does and what to do when one fails, is
+**[docs/GUIDE.md](docs/GUIDE.md)**.
 
-**Two editions, one image.** `wired` (the default) builds the templates and
-wires, configures and tests the whole design. `unwired` builds the same
-templates and wires nothing — no qubes created, no networking changed, no
-credentials — and every install carries
-[docs/WORKSTATION-GUIDE.md](docs/WORKSTATION-GUIDE.md) in dom0 at
-`/usr/share/doc/inqubestigationos/` as the map of what to wire. The edition is
-chosen per stick: `./build_iso.py write-usb --edition unwired`.
+- **Two editions, one image.** `wired` (the default) builds and tests the whole
+  design. `unwired` installs the templates only and leaves the wiring to you.
+  Pick one per stick: `./build_iso.py write-usb --edition unwired`.
+- **Publishing a download.** `./build_iso.py package-release` turns a build into
+  GitHub release files, see [GUIDE §3.2](docs/GUIDE.md#32-publish-a-download-github-releases).
+  Downloaders need only your fingerprint, never your passphrase.
+- **Production release.** `./build_iso.py bootstrap` adds a separate key-backup
+  medium and a verified export, see [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md).
 
-**Publishing a download.** `./build_iso.py package-release` re-verifies the
-build and writes files for a GitHub release: the image in parts under 2 GiB, a
-kit (`make-usb.sh`, `build_iso.py`, both editions' signed kickstarts),
-`unit-signing-key.asc`, `README.txt` and a signed `SHA256SUMS`. Downloaders
-verify `SHA256SUMS.asc` against the fingerprint you gave them separately, then
-write a stick with `./make-usb.sh` on Linux — see
-[GUIDE §7](docs/GUIDE.md#7-distribute-the-iso). The signing passphrase is never
-part of a release.
+## Which document do I read?
 
-For a throwaway test build, `--no-passphrase` asks nothing at all. For the
-production release path with independent key-backup media and an audited
-export, use `bootstrap` instead — `make` lists every step on its own.
-
-Boot the USB and install. First boot provisions itself with nobody at the
-keyboard. The one thing only a person can supply — the login password — is
-asked for at the console and never holds provisioning up: unanswered, it is
-asked again at every boot and every 30 minutes until someone sets it. The
-recurring maintenance installs itself as timers.
-
-Full walkthrough: **[docs/GUIDE.md](docs/GUIDE.md)**.
-Trusted release-candidate runner setup: **[docs/RELEASE.md](docs/RELEASE.md)**.
-Spare-machine acceptance and pending report: **[docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)**.
+| I want to… | Read |
+|---|---|
+| Build, install and issue a laptop, start to finish | [docs/GUIDE.md](docs/GUIDE.md) |
+| Wire an unwired machine, or understand the wired layout | [docs/WORKSTATION-GUIDE.md](docs/WORKSTATION-GUIDE.md), also shipped on every laptop |
+| Know what to share about the signing key, and what never to | [docs/SIGNING.md](docs/SIGNING.md) |
+| Run the production `bootstrap` path | [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md) |
+| Set up the trusted CI runner for release candidates | [docs/RELEASE.md](docs/RELEASE.md) |
+| Record hardware acceptance on a spare machine | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) |
+| See the design: chain, colours, trust levels | [docs/DESIGN.html](docs/DESIGN.html) |
+| Check where every key and repository comes from | [docs/VERIFICATION.md](docs/VERIFICATION.md) |
+| Read what was found and fixed during review | [docs/REVIEW.md](docs/REVIEW.md), [CHANGELOG.md](CHANGELOG.md) |
 
 ## Repository layout
 
 ```
 InQubestigationOS/
-├── golden_image.py            provisioner — runs in dom0 on each laptop
-├── build_iso.py               ISO + template builder — runs on a build host
-├── bootstrap_workflow.py      the production `bootstrap` path's onboarding and export
+├── build_iso.py               ISO builder: runs on the build host (start here)
+├── golden_image.py            the provisioner: runs in dom0 on each laptop
+├── bootstrap_workflow.py      helper for `build_iso.py bootstrap` (onboarding, export)
 ├── release_candidate.py       trusted release-candidate gate (docs/RELEASE.md)
 ├── acceptance_runner.py       spare-machine acceptance evidence (docs/ACCEPTANCE.md)
-├── Makefile                   one entry point for the whole lifecycle
-├── supply-chain.lock.json     what upstream offered last time we looked
+├── Makefile                   short aliases for common commands (`make` lists them)
+├── supply-chain.lock.json     what upstream offered at the last check-upstream
+├── requirements-dev.txt       lint and test tools for contributors and CI only
+├── CHANGELOG.md               what changed in each version
 ├── docs/
-│   ├── GUIDE.md               step-by-step, start to finish
-│   ├── WORKSTATION-GUIDE.md   the wired design and best practice — shipped in dom0
-│   ├── BOOTSTRAP.md           the production bootstrap operator contract
+│   ├── GUIDE.md               the guide: build host to issued laptop
+│   ├── WORKSTATION-GUIDE.md   the wired design and best practice (shipped in dom0)
+│   ├── SIGNING.md             the signing key: what to share, what never to
+│   ├── BOOTSTRAP.md           the production bootstrap path
 │   ├── RELEASE.md             the trusted release-candidate runner
 │   ├── ACCEPTANCE.md          acceptance on a spare machine
+│   ├── acceptance-pending.json  the current acceptance report (all pending)
 │   ├── DESIGN.html            the visual design specification
-│   ├── SIGNING.md             GPG signing — read before sending anyone a key
-│   ├── VERIFICATION.md        supply chain: every repository and key, with sources
-│   └── REVIEW.md              defects found during verification, and the test results
-├── tests/
-│   ├── run_tests.py           fake-dom0 harness: runs all 12 phases off Qubes
+│   ├── VERIFICATION.md        every repository and key, with its source
+│   └── REVIEW.md              defects found during review, and the test results
+├── tests/                     run them all with `make check`
+│   ├── run_tests.py           fake-dom0 harness: runs all 12 phases off Qubes, then every suite
+│   ├── qubes_stub.py          one stand-in for every dom0 command
 │   ├── static_checks.py       assertions over every generated config file
-│   ├── host_checks.py         the build-host support must hold up per distro
 │   ├── doc_checks.py          the docs must not drift from the code
 │   ├── config_checks.py       the code and its configuration must agree
-│   └── qubes_stub.py          one stand-in for every dom0 command
-├── .github/workflows/ci.yml   harness on every push, supply chain every Monday
-└── .gitignore                 keeps credentials and build artifacts out of git
+│   ├── host_checks.py         build-host support per distribution
+│   ├── quickstart_checks.py   ordering and safety of `quickstart`
+│   ├── orchestration_checks.py  unattended build-host orchestration
+│   ├── bootstrap_workflow_checks.py  the bootstrap onboarding and export
+│   ├── install_path_checks.py the generated installer and first-boot scripts
+│   ├── oem_media_checks.py    the QUBES_OEM partition on real media images
+│   ├── signature_checks.py    signature checks against real GnuPG keys
+│   ├── release_checks.py      the release-candidate gate
+│   └── acceptance_checks.py   acceptance evidence and maintenance gates
+└── .github/workflows/
+    ├── ci.yml                 every push: the tests; every Monday: check-upstream
+    └── release-candidate.yml  manual, trusted-runner release candidate
 ```
 
 `golden_image.py` must stay beside `build_iso.py`, and
@@ -178,49 +175,23 @@ none. The build refuses a `provisioner_config` that would embed shared ones.
 
 ## What runs by itself
 
-The lifecycle used to be a procedure with a person in the loop at every step.
-Most of those steps are now commands or timers.
+Almost every step that used to be a manual checklist is now a command or a timer:
 
-| Was | Now |
+| Stage | Automated by |
 |---|---|
-| Seven commands in the right order to get from a clone to a signed image | `./build_iso.py bootstrap` |
-| Install Docker, join its group, log out and back in | `./build_iso.py setup-host` |
-| `gpg --quick-generate-key`, copy the fingerprint into JSON | `./build_iso.py gen-key --uid "..."` |
-| `$EDITOR iso-build.json`, match `mock_config` to the release by hand | `./build_iso.py --set key=value`; the chroot derives itself |
-| Merge duplicate `templates:`/`components:` blocks in builder.yml by hand | merged properly, then verified with `qb config get-var` |
-| Re-verify three signing keys and a version, monthly, from the docs | `./build_iso.py check-upstream`, weekly in CI, with a committed baseline |
-| Read the Qubes bulletin list and decide whether to rebuild | the same command classifies new bulletins by whether they touch dom0/Xen |
-| `dd` to a device you hope is the right one | `./build_iso.py write-usb` — verifies the signature, refuses fixed disks, reads the stick back (elevating if it must) |
-| "Build unsigned and sign afterwards on the machine that holds the key" | `./build_iso.py sign` — re-checksums, signs, and regenerates everything that travels with the signature |
-| Split a multi-gigabyte image for a download site and explain how to flash it | `./build_iso.py package-release` — parts under GitHub's 2 GiB cap, a signed `SHA256SUMS`, and `make-usb.sh` with the same checks as `write-usb` |
-| Compare the printed fingerprint against the one you were given, by eye | `./verify-iso.sh <fingerprint>` compares them and exits non-zero |
-| Pick a `work_dir` "somewhere with enough free space" | `--set work_dir=auto` |
-| "Verify the builder itself — nothing verifies the builder for you" | `verify_builder` checks the signed tag against the Qubes master signing key's web of trust; one pinned fingerprint, developer keys derived from it |
-| Keep the signing key safe by remembering to | `backup-key` / `restore-key` — encrypted key, revocation certificate, public key |
-| `mkfs.ext4 -L GOLDEN-BACKUP /dev/sdX1` against a device you identified by eye | `--prepare-backup-media` |
-| Click through Anaconda, then through Qubes' initial-setup wizard | `install.unattended` + `install.auto_initial_setup` — everything except the disk passphrase, which stays human on purpose |
-| "Confirm on your hardware that the first-boot service fires" | the runner records what it did; group 13 reads the record, and a timer retries until the machine is provisioned |
-| "Confirm pykickstart merges two %packages sections" | the generated kickstart is parsed and its package list read back; the finished ISO is opened and the template RPMs confirmed present |
-| Move the component to your git server and sign its tags "before production" | `component_remote` + `component_sign_key` — the build pushes a signed tag and turns `verification-mode` back on |
-| Read each `doctor` row and run the fix it printed | `doctor --fix` runs the ones this script owns |
-| Remember to run `check-upstream` before a first build | `templates`, `iso` and `all` run it themselves and refuse to start on a blocking finding |
-| Notice `iso_sign_key` is empty before shipping an unsigned image | a real build refuses; `--allow-unsigned` is an explicit, testing-only choice |
-| "Disable the agent in kali-tor for the duration and note it in the case log" | `--case-mode anonymous --case <id>`, which masks the agent and writes the log entry |
-| `journalctl -f`, `systemctl list-timers`, and knowing which files to read | `--status` |
-| "All must pass before the laptop leaves your desk" | `--issue --operator "<name>"` re-runs the tests, refuses if the credentials are still on the machine, and writes the release record |
-| Re-add an expiring repository key when the watch tells you to | a timer runs `--refresh-repo-keys`, which renews against the pinned fingerprint and rolls back on mismatch — a genuinely *rotated* key still stops for a person |
-| Click through Anaconda | `install.unattended` — everything but the disk passphrase |
-| Give the template a netvm when apt fails through the update proxy, then clear it | done automatically for that one install, and the netvm is always restored |
-| Install the SIEM stack by hand on a Tier 1 build | phase 8 installs it from the already-configured, already-verified repository |
-| Decide whether this machine has the RAM for a local SIEM | `wazuh.mode: auto` |
-| Three verification commands emailed to colleagues | `verify-iso.sh` and `FINGERPRINT.txt`, generated beside the image |
-| "Confirm by hand the four things the tests cannot check" | acceptance-test group 13 |
-| Read credentials.json, rotate four secrets in a web UI, escrow, `shred -u` | `--rotate-credentials`, `--escrow-credentials`, `--shred-credentials` — or `--handover` for all three |
-| Re-add an expired repository key by hand in the template | `--refresh-repo-keys`, re-verified against the pinned fingerprint, rolled back if it does not match |
-| "Do this cross-check on first build rather than trusting the blog post alone" | `check-upstream` asks an independent keyserver about the Kali key, every run |
-| `qvm-connect-tcp 8443:wazuh-srv:443` from memory | a "SIEM dashboard" launcher in `work` |
-| Weekly template updates, weekly `suricata-update`, monthly key-expiry check, monthly restore test | eight timers, installed by phases 7 and 10, that raise a login banner when they fail |
-| Upgrade Wazuh in the right order and remember which order that is | `--upgrade-wazuh` |
+| Preparing the build host | `setup-host`, `doctor --fix` |
+| Creating, backing up and restoring the signing key | `gen-key`, `backup-key`, `restore-key` |
+| Checking upstream keys, versions and Qubes security bulletins | `check-upstream`, and CI every Monday. Builds refuse to start on a blocking finding. |
+| Verifying the Qubes builder itself | the signed tag is checked against the pinned Qubes master key |
+| Writing and checking USB sticks | `write-usb`, `make-usb.sh`, `verify-iso.sh` |
+| Publishing a download | `package-release` |
+| Installing without clicking | `install.unattended`, `install.auto_initial_setup`. Only the disk passphrase stays human. |
+| Building, wiring and testing the laptop | first boot, the twelve provisioner phases |
+| Credentials after provisioning | `--handover` (rotate, escrow into `vault`, shred) |
+| Releasing a laptop | `--issue`, which re-tests and refuses while credentials remain |
+| Updates, IPS rules, backups, key expiry, self-checks, staleness | eight timers, which show a login banner when they fail |
+| Wazuh upgrades in the right order | `--upgrade-wazuh` |
+| Seeing where a machine stands | `--status` |
 
 What is deliberately still yours: reading the fingerprint out over an
 independent channel, plugging in the backup disk the first time, and deciding

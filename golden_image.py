@@ -42,7 +42,7 @@ from typing import Callable
 # ===========================================================================
 DEFAULT_CONFIG: dict = {
     "image_name": "InQubestigationOS",
-    "image_version": "2.6",
+    "image_version": "2.7",
     "expect_qubes_release": "4.3",
 
     # Which edition this machine is.
@@ -4451,7 +4451,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
     golden-template-update.timer   weekly template updates      (dom0)
     golden-key-refresh.timer       renew expiring repo keys     (dom0)
     golden-selfcheck.timer         weekly acceptance tests      (dom0)
-    golden-restore-test.timer      monthly restore verification (dom0)
+    golden-restore-test.timer      monthly backup integrity     (dom0)
     golden-staleness.timer         daily "is this image too old" (dom0)
     golden-suricata-update.timer   weekly IPS rules             ({self.q['ids']})
     golden-key-expiry.timer        weekly signing-key expiry    ({self.q['dpi']})
