@@ -372,9 +372,50 @@ class Out:
         self._log(f"VERIFY {m}")
         self.verify_notes.append(m)
 
-    def phase(self, n, name):
-        print(f"\n{self.B}{self.C}\u2550\u2550 Phase {n} \u2014 {name}{self.RST}")
+    @staticmethod
+    def _tty() -> bool:
+        try:
+            return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+        except (AttributeError, ValueError):
+            return False
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        s = int(max(seconds, 0))
+        return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+    def journal(self, message: str) -> None:
+        """One line into the journal under the golden-image tag.
+
+        First boot runs with no terminal: `journalctl -t golden-image -f` is
+        how anyone watches it, and it used to show only "starting
+        provisioning" for one to three hours.
+        """
+        if not self.enabled or not shutil.which("logger"):
+            return
+        try:
+            subprocess.run(["logger", "-t", "golden-image", message],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def phase(self, n, name, pos: int | None = None, total: int | None = None):
+        now = time.monotonic()
+        prev = getattr(self, "_phase_started", None)
+        if prev is not None:
+            took = self._duration(now - prev)
+            if self._tty():
+                print(f"  {self.D}\u2514 took {took}{self.RST}")
+            self._log(f"PHASE done in {took}")
+        self._phase_started = now
+        meter = ""
+        if pos and total:
+            cells = "\u25b0" * pos + "\u25b1" * (total - pos)
+            meter = f"   {self.D}{cells} {pos}/{total}{self.RST}"
+        print(f"\n{self.B}{self.C}\u2550\u2550 Phase {n} \u2014 {name}{self.RST}{meter}")
         self._log(f"PHASE {n} {name}")
+        if pos and total:
+            self.journal(f"phase {n} ({pos}/{total}, {100 * (pos - 1) // total}% done): {name}")
 
     def phase_skipped(self, n, name):
         print(f"\n{self.D}\u2550\u2550 Phase {n} \u2014 {name} (done, skipping "
@@ -4369,14 +4410,21 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             self.p01, self.p02, self.p03, self.p04, self.p05, self.p06,
             self.p07, self.p08, self.p09, self.p10, self.p11, self.p12,
         ]
+        wanted = [i for i in range(1, len(phases) + 1)
+                  if self.edition == "wired" or i in self.UNWIRED_PHASES]
+        started = time.monotonic()
         for i, fn in enumerate(phases, start=1):
             if self._should_run(i):
-                o.phase(i, self.PHASES[i - 1])
+                pos = wanted.index(i) + 1 if i in wanted else None
+                o.phase(i, self.PHASES[i - 1], pos, len(wanted))
                 fn()
+        took = Out._duration(time.monotonic() - started)
+        if not self.args.dry_run:
+            o.journal(f"provisioning run finished in {took} ({self.edition} edition)")
         if self.edition == "unwired":
             self.handover_unwired()
             o.say("")
-            o.ok("finished: templates ready, nothing wired")
+            o.ok(f"finished: templates ready, nothing wired  {Out.D}({took}){Out.RST}")
             return 0
         self.handover()
         o.say("")
@@ -4384,7 +4432,7 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             o.warn(f"{self.tests['fail']} acceptance test(s) failed — this machine "
                    f"is NOT ready to issue")
         else:
-            o.ok("finished")
+            o.ok(f"finished  {Out.D}({took}){Out.RST}")
         return self.tests["fail"]
 
 

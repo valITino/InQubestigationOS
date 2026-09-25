@@ -529,6 +529,13 @@ def main() -> int:
     utpls = ("tpl-sys", "tpl-proxy", "tpl-ids", "tpl-kali", "tpl-personal", "tpl-wazuh")
     stage("unwired: every template is built", all(t in uworld for t in utpls),
           f"missing: {[t for t in utpls if t not in uworld]}")
+    journal = [" ".join(a["argv"]) for a in uacts
+               if a["kind"] == "exec" and a["prog"] == "logger"]
+    stage("unwired: every phase reports its progress to the journal",
+          any("phase 1 (1/4, 0% done)" in j for j in journal)
+          and any("phase 5 (4/4, 75% done)" in j for j in journal)
+          and any("provisioning run finished" in j for j in journal),
+          "; ".join(journal[:6]))
     stage("unwired: the handover points at the workstation guide",
           "WORKSTATION-GUIDE.md" in pu.stdout, pu.stdout[-400:])
     pv = run(ugi, ["--verify"], uenv, usand)
