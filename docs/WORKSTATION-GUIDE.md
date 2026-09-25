@@ -43,8 +43,9 @@ stay as Qubes installed them.
 
 ## 2. The templates you have
 
-Every custom template is a clone of `debian-13-xfce` (one distribution, one
-package manager, one update cadence).
+Every custom template is Debian 13: a clone of `debian-13-xfce`, or, on a tier 2
+image, of the matching prebuilt `investigator-*` template, which is Debian too.
+One distribution, one package manager, one update cadence.
 
 | Template | What is in it | Meant for |
 |---|---|---|

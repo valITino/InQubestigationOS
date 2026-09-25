@@ -1,5 +1,14 @@
 # Bootstrap operator contract
 
+> **In short.** `./build_iso.py bootstrap` is `quickstart` for an image you
+> will issue. It does the same build, but it **requires** two things first: a
+> separate medium for the key backup, and a destination for the finished
+> release. After the build it copies the release there and reads it back to
+> verify it. The first run guides you through choosing both. Repeat runs are
+> the same command. The everyday path is in [GUIDE.md §2.5](GUIDE.md#25-production-path-bootstrap).
+> This page is the detailed contract: what it asks, what it stores, and what it
+> refuses.
+
 `./build_iso.py bootstrap` is the build-VM entry point. It first requests narrow
 authorization and prepares discovery/transport helpers, then performs mandatory
 upfront onboarding, validates both destinations, creates or
@@ -16,23 +25,6 @@ encrypted storage. A repeat run can use `--non-interactive` with a complete,
 previously authorized profile and a protected external secret provider. Generic
 `--yes` never authorizes disk erasure or turns guest block storage into a
 physical-host export.
-
-## Implemented regression repairs
-
-| Defect | Implemented behavior | Automated evidence |
-|---|---|---|
-| `lsblk` returned `mountpoints: [null]` | Discovery validates the JSON object/list shapes, removes null entries, and prints `unmounted`; malformed facts are rejected. | `python tests/bootstrap_workflow_checks.py` exercises the production discovery function. |
-| `/mnt` mountpoint was created as the build user | An absolute, non-symlink, empty destination is created with the narrowly scoped privileged `install -d -m 0700 -- PATH` argv before mounting; the mounted filesystem is then checked for build-user write/search access. | The bootstrap workflow check records the real privileged boundary and ordering. |
-| Device aliases were compared as spelling | Block sources must resolve to the same nonzero kernel device identity; unresolved or replaced sources fail. Network transports retain protocol/source identity checks and are not treated as block devices. | Bootstrap identity tests use distinct spellings with a measured device identity and reject unavailable identity. |
-| Enrollment marked success after `chpasswd` failed | First boot locks before prompting, checks account/password state, verifies the resulting non-secret password state, and atomically publishes the marker only on success. Enrollment never gates provisioning: a failure or an unanswered prompt is logged, no marker is published, provisioning proceeds, and the prompt returns on the next run. | `python tests/install_path_checks.py` executes the generated script with a failing `chpasswd` stub, with an unanswered prompt, and with a successful enrollment: no marker in the first two, a mode-0600 marker in the third, and the run continues in all three. |
-| Inventory appeared only after export | A mode-0600 planned inventory is atomically initialized immediately after lock acquisition. Export remains unverified until destination readback and signature authentication complete. | Bootstrap workflow and orchestration checks cover early state and publication ordering. |
-| Secrets survived pre-export child failures | Workflow cleanup now encloses every child stage as well as export; only run-owned secret files and mounts are cleaned. Lock contention writes neither status nor inventory. | Orchestration and bootstrap workflow checks cover failure and ownership boundaries. |
-
-The portable suite validates code and generated-script behavior. It does **not**
-claim a full ISO build, Qubes boot, real removable-media separation, host-share
-durability, or physical-laptop acceptance. Those environment-specific gates
-remain recorded separately in `docs/ACCEPTANCE.md`; a guest-visible capacity or
-removable bit is never reported as proof of an independent physical backup.
 
 ## Guided first run and supported storage
 
@@ -130,6 +122,23 @@ bootstrap. Input-bound markers avoid unnecessary template/ISO builds, while
 destination identities are revalidated at use. Mock tests cover these contracts.
 Live mounts, hypervisor setup, real GPG, full ISO build, USB writing, physical
 installation/boot, and enterprise enrollment remain environment-specific tests.
+
+## Implemented regression repairs
+
+| Defect | Implemented behavior | Automated evidence |
+|---|---|---|
+| `lsblk` returned `mountpoints: [null]` | Discovery validates the JSON object/list shapes, removes null entries, and prints `unmounted`; malformed facts are rejected. | `python tests/bootstrap_workflow_checks.py` exercises the production discovery function. |
+| `/mnt` mountpoint was created as the build user | An absolute, non-symlink, empty destination is created with the narrowly scoped privileged `install -d -m 0700 -- PATH` argv before mounting; the mounted filesystem is then checked for build-user write/search access. | The bootstrap workflow check records the real privileged boundary and ordering. |
+| Device aliases were compared as spelling | Block sources must resolve to the same nonzero kernel device identity; unresolved or replaced sources fail. Network transports retain protocol/source identity checks and are not treated as block devices. | Bootstrap identity tests use distinct spellings with a measured device identity and reject unavailable identity. |
+| Enrollment marked success after `chpasswd` failed | First boot locks before prompting, checks account/password state, verifies the resulting non-secret password state, and atomically publishes the marker only on success. Enrollment never gates provisioning: a failure or an unanswered prompt is logged, no marker is published, provisioning proceeds, and the prompt returns on the next run. | `python tests/install_path_checks.py` executes the generated script with a failing `chpasswd` stub, with an unanswered prompt, and with a successful enrollment: no marker in the first two, a mode-0600 marker in the third, and the run continues in all three. |
+| Inventory appeared only after export | A mode-0600 planned inventory is atomically initialized immediately after lock acquisition. Export remains unverified until destination readback and signature authentication complete. | Bootstrap workflow and orchestration checks cover early state and publication ordering. |
+| Secrets survived pre-export child failures | Workflow cleanup now encloses every child stage as well as export; only run-owned secret files and mounts are cleaned. Lock contention writes neither status nor inventory. | Orchestration and bootstrap workflow checks cover failure and ownership boundaries. |
+
+The portable suite validates code and generated-script behavior. It does **not**
+claim a full ISO build, Qubes boot, real removable-media separation, host-share
+durability, or physical-laptop acceptance. Those environment-specific gates
+remain recorded separately in `docs/ACCEPTANCE.md`; a guest-visible capacity or
+removable bit is never reported as proof of an independent physical backup.
 
 ## Implementation and test matrix
 

@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.7 — 2026-09-25
+
+Documentation restructured for readability. No behaviour change.
+
+**Changed**
+
+- **docs/GUIDE.md rewritten.** It opens with the whole journey on one screen:
+  what runs where, a "which path is yours?" table and a glossary. It follows
+  with seven parts in the order you do them, each stating where it runs and how
+  long it takes. After those come a command cheat sheet, a troubleshooting
+  table (symptom and fix), and two appendices that hold the background
+  (distributions, VMs, Windows, build internals) that used to interrupt the
+  steps.
+- **README.md** gains a "Which document do I read?" table. Its repository
+  layout lists every file, and the old 38-row automation table becomes 13 rows
+  without duplicates.
+- **BOOTSTRAP, RELEASE, ACCEPTANCE and SIGNING** each open with a
+  plain-language "In short". BOOTSTRAP puts its defect-history table after the
+  operating instructions.
+
+**Fixed — the guide said something the code does not do**
+
+- Acceptance tests are **fourteen** groups (0–13), not thirteen.
+- `golden-key-expiry` runs **weekly**, not monthly. It and
+  `golden-suricata-update` are installed by phase 7; phase 10 installs the six
+  dom0 timers.
+- `golden-restore-test` checks the newest backup archive's **integrity**
+  (`--verify-only`). It does not restore, and the guide, README, DESIGN and the
+  `--status` summary now say so.
+- `--rotate-credentials` rotates four secrets. The guide named three and
+  missed the API password.
+- "Every step is also a `make` target" was not true. `make` offers shortcuts
+  for the common ones.
+- The two template name sets are explained: `investigator-*` (built into a
+  tier 2 image) and `tpl-*` (used on every laptop, cloned from the former when
+  present). The guide no longer calls `investigator-kali` "the qube".
+- A comment in `build_iso.py` still said tier 2 "refuses". It no longer does:
+  the flavor content is put in place, and tier 2 is simply not yet built end to
+  end.
+
 ## 2.6 — 2026-09-25
 
 **Changed**

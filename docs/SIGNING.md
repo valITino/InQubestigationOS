@@ -1,5 +1,9 @@
 # ISO signing — what to send me, and what never to send
 
+> **In short.** Share the **fingerprint** freely, over a channel separate from
+> the image. Never share the private key or its passphrase, with anyone.
+> `./build_iso.py gen-key` creates the key and `backup-key` backs it up.
+
 Bootstrap requires an approved mounted backup identity and protected runtime passphrase source before expensive work. Private backup and revocation material are excluded from exports; see [BOOTSTRAP.md](BOOTSTRAP.md).
 
 ## Send only the fingerprint

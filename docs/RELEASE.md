@@ -1,5 +1,11 @@
 # Trusted Tier-2 release-candidate builds
 
+> **In short.** For the repository owner only. It sets up a dedicated,
+> self-hosted GitHub runner that builds release candidates with the production
+> key, started by hand from the Actions tab. Normal CI never touches that key.
+> You do not need this page to build or install an image: that is
+> [GUIDE.md](GUIDE.md).
+
 `build_iso.py bootstrap` performs staged, allowlisted, destination-readback-verified host export. `release_candidate.py` remains the stricter trusted-runner gate. See [BOOTSTRAP.md](BOOTSTRAP.md).
 
 The normal `checks` workflow is intentionally untrusted: it runs for pull
@@ -102,7 +108,7 @@ never recursively copied or uploaded. The candidate is not a release:
 promotion requires a separate explicit owner process after hardware
 installation testing. For publication as a download, run
 `./build_iso.py package-release` on the promoted image — see
-[GUIDE §7](GUIDE.md#7-distribute-the-iso).
+[GUIDE §3.2](GUIDE.md#32-publish-a-download-github-releases).
 
 ## Recovery
 

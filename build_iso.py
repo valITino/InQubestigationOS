@@ -83,15 +83,13 @@ DEFAULT_CONFIG: dict = {
     #   2 = investigator templates baked into the ISO as RPMs. Installs with no
     #       network. First boot only wires the topology — minutes, not hours.
     #
-    # The default is 1 because 2 cannot currently be built end to end from this
-    # repository. qubes-builderv2 finds a Debian template flavor's content at
+    # The default is 1 because 2 has not yet been built end to end.
+    # qubes-builderv2 finds a Debian template flavor's content at
     # <sources>/builder-debian/template_debian/<flavor>, appended by the
-    # template plugin itself with no configuration hook, and hardcodes extra
-    # directories only for whonix-*, kicksecure and names starting with "kali".
-    # A flavor with no directory there does not fail: it silently builds as
-    # stock Debian while still producing qubes-template-<flavor>-*.rpm. Tier 2
-    # now refuses rather than shipping that; set it once those directories
-    # exist and the build will verify them.
+    # template plugin itself with no configuration hook, and a flavor with no
+    # directory there silently builds as stock Debian while still producing
+    # qubes-template-<flavor>-*.rpm. materialize_flavors() puts the content
+    # there and refuses to build without it.
     "tier": 1,
 
     # "auto" picks the largest writable local filesystem with room for the
@@ -3671,7 +3669,7 @@ def doctor(x: Ctx, *, signing: bool = True, docker_via_sg: bool = False) -> int:
         c.append(Check("running under WSL", WARN, wsl,
                        "qubes-builderv2 is not tested on WSL. A Debian 13 VM "
                        "(Hyper-V/VirtualBox/VMware) is the path that is known to "
-                       "work. See docs/GUIDE.md section 2."))
+                       "work. See docs/GUIDE.md, Appendix A."))
         if wsl == "wsl1":
             c.append(Check("WSL version supports containers", FAIL,
                            "WSL1 has no real kernel — Docker cannot run",
