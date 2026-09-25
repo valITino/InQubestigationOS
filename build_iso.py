@@ -130,6 +130,13 @@ DEFAULT_CONFIG: dict = {
     "cache_templates": [],
 
     "auto_provision": True,
+    # Which edition oem/ks.cfg installs. Both are always generated and signed
+    # under oem/editions/, so write-usb --edition can pick either from one
+    # build; the ISO itself is identical for both.
+    #   "wired":   templates AND the full topology (chain, SIEM, policy), tested.
+    #   "unwired": the same templates only; the operator wires them, guided by
+    #              docs/WORKSTATION-GUIDE.md, which every install carries.
+    "edition": "wired",
     # How stale the recorded supply-chain baseline may be before a build
     # re-checks it automatically. 0 disables the automatic check entirely.
     "check_upstream_max_age_days": 7,
@@ -2065,7 +2072,7 @@ def write_builder_iso_config(x: Ctx, base_ks: str, iso_tpls: list[str], kickstar
     merge_builder_config(x, updates, "iso block")
 
 
-def provisioner_config_bytes(x: Ctx, payload: Path) -> bytes:
+def provisioner_config_bytes(x: Ctx, payload: Path, edition: str | None = None) -> bytes:
     """Validate and serialize the non-secret target configuration."""
     source = x.c.get("provisioner_config") or ""
     if source:
@@ -2099,6 +2106,10 @@ def provisioner_config_bytes(x: Ctx, payload: Path) -> bytes:
     embedded_version = match.group(1).decode() if match else ""
     if cfg.get("image_version", embedded_version) != embedded_version:
         raise Fatal("provisioner_config image_version does not match golden_image.py")
+    if edition:
+        # The kickstart decides the edition; a provisioner_config that says
+        # otherwise would make one signed file install two different things.
+        cfg["edition"] = edition
     return (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode()
 
 
@@ -2249,20 +2260,59 @@ def write_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
     runs.
     """
     x.phase("2b", "generate the install-time (QUBES_OEM) kickstart")
-    oem_dir = x.out_dir / "oem"
-    ks = oem_dir / "ks.cfg"
+    ks = oem_kickstart_path(x)
+    edition = x.c.get("edition", "wired")
+    if edition not in EDITIONS:
+        raise Fatal(f"edition must be one of {', '.join(EDITIONS)}, not {edition!r}")
     if x.args.dry_run:
-        x.info(f"[dry-run] write {ks} (installer answers + %post payload)")
+        x.info(f"[dry-run] write {ks} ({edition} edition: installer answers + "
+               f"%post payload), and one kickstart per edition under oem/editions/")
         return ks
     conf = release_dir(x) / "conf"
     if not (conf / base_ks).is_file():
         raise Fatal(f"base kickstart {base_ks} is not in {conf}")
-    oem_dir.mkdir(parents=True, exist_ok=True)
+    for ed in EDITIONS:
+        render_oem_kickstart(x, base_ks, payload, extra_packages, ed,
+                             edition_kickstart_path(x, ed))
+    shutil.copy2(edition_kickstart_path(x, edition), ks)
+    x.ok(f"oem/ks.cfg is the {edition} edition "
+         f"(every edition is in oem/editions/ — write-usb --edition picks one)")
+    return ks
+
+
+def render_oem_kickstart(x: Ctx, base_ks: str, payload: Path,
+                         extra_packages: list[str], edition: str, ks: Path) -> Path:
+    """Write one edition's install-time kickstart to `ks`."""
+    ks.parent.mkdir(parents=True, exist_ok=True)
     stock_pkgs = stock_package_block(x, base_ks)
     b64 = base64.b64encode(payload.read_bytes()).decode()
     b64 = "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))
-    cfg64 = base64.b64encode(provisioner_config_bytes(x, payload)).decode()
+    cfg64 = base64.b64encode(provisioner_config_bytes(x, payload, edition)).decode()
     cfg64 = "\n".join(cfg64[i:i + 76] for i in range(0, len(cfg64), 76))
+    # The workstation guide travels with every install: for the unwired
+    # edition it is the map of what to wire, for the wired one the reference.
+    guide_src = Path(__file__).resolve().parent / "docs" / "WORKSTATION-GUIDE.md"
+    if guide_src.is_file():
+        g64 = base64.b64encode(guide_src.read_bytes()).decode()
+        g64 = "\n".join(g64[i:i + 76] for i in range(0, len(g64), 76))
+        user = shlex.quote(x.c["install"]["username"])
+        guide_block = f"""
+# --- workstation guide ---------------------------------------------------
+mkdir -p {GUIDE_DIR}
+cat > {GUIDE_DIR}/WORKSTATION-GUIDE.md.b64 <<'GUIDE_B64_EOF'
+{g64}
+GUIDE_B64_EOF
+base64 -d {GUIDE_DIR}/WORKSTATION-GUIDE.md.b64 > {GUIDE_DIR}/WORKSTATION-GUIDE.md
+rm -f {GUIDE_DIR}/WORKSTATION-GUIDE.md.b64
+chmod 644 {GUIDE_DIR}/WORKSTATION-GUIDE.md
+if [ -d /home/{user} ]; then
+    cp {GUIDE_DIR}/WORKSTATION-GUIDE.md /home/{user}/WORKSTATION-GUIDE.md
+    chown {user}: /home/{user}/WORKSTATION-GUIDE.md
+fi
+"""
+    else:
+        x.warn(f"{guide_src} not found — this kickstart carries no workstation guide")
+        guide_block = ""
 
     # One %packages block: the stock dom0 selection plus our templates. A
     # kickstart's %packages REPLACES the default selection, so the stock list
@@ -2320,7 +2370,7 @@ CONFIG_B64_EOF
 base64 -d /usr/local/sbin/golden-image.json.b64 > /usr/local/sbin/golden-image.json
 rm -f /usr/local/sbin/golden-image.json.b64
 chmod 644 /usr/local/sbin/golden-image.json
-
+{guide_block}
 cat > /usr/local/sbin/golden-image-provision <<'WRAP_EOF'
 #!/bin/bash
 # Provision this machine into the investigator golden image.
@@ -2509,8 +2559,10 @@ chmod 755 /usr/local/sbin/golden-image-firstboot
 mkdir -p /etc/motd.d
 cat > /etc/motd.d/golden-image <<'MOTD_EOF'
 
-  {x.c['iso_flavor']}
-  {'-' * len(x.c['iso_flavor'])}
+  {x.c['iso_flavor']} ({edition} edition)
+  {'-' * len(x.c['iso_flavor'] + edition) + '-' * 11}
+    Guide: {GUIDE_DIR}/WORKSTATION-GUIDE.md
+    sudo golden-image-provision --status     # where this machine is
     sudo golden-image-provision --dry-run    # see the plan
     sudo golden-image-provision              # run or resume
     sudo golden-image-provision --verify     # acceptance tests
@@ -5324,6 +5376,11 @@ def write_usb(x: Ctx) -> int:
     no_oem = bool(getattr(x.args, "no_oem", False))
     ks = oem_kickstart_path(x)
     ks_sig = oem_kickstart_signature_path(x)
+    chosen = getattr(x.args, "edition", None)
+    if chosen and not no_oem:
+        ks = edition_kickstart_path(x, chosen)
+        ks_sig = ks.with_name("ks.cfg.asc")
+        x.info(f"edition: {chosen} ({ks.relative_to(x.out_dir)})")
     if no_oem:
         pass
     elif not ks.is_file():
@@ -5504,10 +5561,16 @@ def write_usb(x: Ctx) -> int:
 #  `if search --set=oem -l QUBES_OEM` in templates/config_files/x86/grub2-bios.cfg
 #  and grub2-efi.cfg. It is not a name this project is free to choose.
 OEM_LABEL = "QUBES_OEM"
+EDITIONS = ("wired", "unwired")
+GUIDE_DIR = "/usr/share/doc/inqubestigationos"
 
 
 def oem_kickstart_path(x: Ctx) -> Path:
     return x.out_dir / "oem" / "ks.cfg"
+
+
+def edition_kickstart_path(x: Ctx, edition: str) -> Path:
+    return x.out_dir / "oem" / "editions" / edition / "ks.cfg"
 
 
 def oem_kickstart_signature_path(x: Ctx) -> Path:
@@ -5531,6 +5594,15 @@ def sign_oem_kickstart(x: Ctx, fpr: str) -> Path | None:
     x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
           "--detach-sign", "--armor", "--output", str(sig), str(ks))
     x.ok(f"signed: oem/{sig.name} (the install-time kickstart)")
+    for ed in EDITIONS:
+        eks = edition_kickstart_path(x, ed)
+        if not eks.is_file():
+            continue
+        esig = eks.with_name("ks.cfg.asc")
+        esig.unlink(missing_ok=True)
+        x.run("gpg", *gpg_secret_options(x.args), "--local-user", fpr,
+              "--detach-sign", "--armor", "--output", str(esig), str(eks))
+        x.ok(f"signed: oem/editions/{ed}/ks.cfg.asc")
     return sig
 
 
@@ -5837,6 +5909,8 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("manual installation must not persist a destructive target disk")
     if not install.get("username", "").strip():
         raise ValueError("install.username is required for target-local account enrollment")
+    if cfg.get("edition", "wired") not in EDITIONS:
+        raise ValueError(f"edition must be one of {', '.join(EDITIONS)}")
 
 
 def main() -> int:
@@ -5910,6 +5984,9 @@ lifecycle
     u.add_argument("--allow-local-key-backup", action="store_true",
                    help="keep the signing-key backup on this host instead of "
                         "requiring separately mounted media")
+    u.add_argument("--edition", choices=list(EDITIONS),
+                   help="which edition's signed kickstart goes on the stick "
+                        "(default: oem/ks.cfg, the configured edition)")
     u.add_argument("--no-oem", action="store_true",
                    help=f"do not write the {OEM_LABEL} partition; the installer "
                         f"will then find no kickstart and nothing provisions the "

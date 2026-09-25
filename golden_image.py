@@ -45,6 +45,18 @@ DEFAULT_CONFIG: dict = {
     "image_version": "2.4",
     "expect_qubes_release": "4.3",
 
+    # Which edition this machine is.
+    #   "wired"   (default): the full design — templates, then the inspection
+    #             chain, SIEM, app qubes, dom0 policy and backups, wired and
+    #             tested (phases 1-12).
+    #   "unwired": the same templates with the same payloads (phases 1, 3, 4
+    #             and 5), and nothing wired: no qubes created, no netvm or
+    #             firewall changed, no SIEM, no credentials. The operator
+    #             decides the topology; /usr/share/doc/inqubestigationos/
+    #             WORKSTATION-GUIDE.md describes the wired design to copy from.
+    #             `golden-image-provision --edition wired` completes it later.
+    "edition": "wired",
+
     # Base templates. Verified against qubes-release release4.3 comps-dom0.xml,
     # which pins @debian to debian-13-xfce and @fedora to fedora-43-xfce.
     #
@@ -551,10 +563,19 @@ class Provisioner:
         "agent enrollment",
         "acceptance tests",
     ]
+    # The phases that build and fill templates without wiring anything: no
+    # qube is created, no netvm, firewall or policy is touched, no secret is
+    # generated. Everything else is topology, and the unwired edition leaves
+    # topology to the operator.
+    UNWIRED_PHASES = (1, 3, 4, 5)
+    GUIDE_PATH = "/usr/share/doc/inqubestigationos/WORKSTATION-GUIDE.md"
 
     def __init__(self, cfg: dict, args):
         self.c = cfg
         self.args = args
+        self.edition = getattr(args, "edition", None) or cfg.get("edition", "wired")
+        if self.edition not in ("wired", "unwired"):
+            raise Fatal(f"edition must be 'wired' or 'unwired', not {self.edition!r}")
         self.build_dir = BUILD_DIR
         if not args.dry_run:
             self.build_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +647,8 @@ class Provisioner:
         if self.args.phase is not None:
             return n == self.args.phase
         if n < self.args.from_phase:
+            return False
+        if self.edition == "unwired" and n not in self.UNWIRED_PHASES:
             return False
         if self._done(n) and not self.args.dry_run:
             self.out.phase_skipped(n, self.PHASES[n - 1])
@@ -3866,11 +3889,18 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         if self.state_file.exists():
             done = {t for t in self.state_file.read_text().split()
                     if t.startswith("phase:")}
+        wanted = (self.UNWIRED_PHASES if self.edition == "unwired"
+                  else range(1, len(self.PHASES) + 1))
+        print(f"  edition: {self.edition}\n")
         for i, name in enumerate(self.PHASES, start=1):
+            if i not in wanted:
+                print(f"  {Out.D}- {i:2d}  {name} (not part of this edition){Out.RST}")
+                continue
             mark = f"{Out.G}✓{Out.RST}" if f"phase:{i}" in done else f"{Out.Y}·{Out.RST}"
             print(f"  {mark} {i:2d}  {name}")
-        if len(done) < len(self.PHASES):
-            print(f"\n  {len(done)}/{len(self.PHASES)} phases complete — "
+        complete = sum(1 for i in wanted if f"phase:{i}" in done)
+        if complete < len(wanted):
+            print(f"\n  {complete}/{len(wanted)} phases complete — "
                   f"resume with:  sudo {Path(sys.argv[0]).name}")
 
         print(f"\n{Out.B}  Credentials{Out.RST}")
@@ -4200,6 +4230,83 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
         return 0
 
     # =======================================================================
+    def verify_unwired(self) -> int:
+        """Acceptance for the unwired edition: the templates, and nothing else.
+
+        Phase 12 asserts the inspection chain, the SIEM and the policy — none
+        of which this edition builds, so running it here would fail every
+        machine by design. What this edition promises is checked instead: each
+        template exists and carries its payload and a (disabled) agent.
+        """
+        o, r = self.out, self.r
+        print(f"\n{Out.B}{Out.C}\u2550\u2550 Unwired edition \u2014 are the templates ready?{Out.RST}")
+        o._log("VERIFY-UNWIRED")
+        for n in self.UNWIRED_PHASES:
+            if self._done(n) or self.args.dry_run:
+                self._t("pass", f"phase {n} ({self.PHASES[n - 1]}) complete")
+            else:
+                self._t("fail", f"phase {n} ({self.PHASES[n - 1]}) not complete — "
+                                "run: sudo golden-image-provision")
+        # The same probes phase 12 uses for templates (groups 4-6), so the two
+        # editions cannot disagree about what "a finished template" means.
+        k = self.c["kali"]
+        for tpl in self.t.values():
+            if not (r.vm_exists(tpl) or self.args.dry_run):
+                self._t("fail", f"template {tpl} is missing")
+                continue
+            self._t("pass", f"template {tpl} exists")
+            agent = r.qtest(tpl, "test -d /var/ossec")
+            self._t("pass" if agent else "fail",
+                    f"{tpl} carries the (disabled) Wazuh agent" if agent
+                    else f"{tpl} has no /var/ossec — sudo golden-image-provision "
+                         "--from-phase 5")
+            if self.c["prefer_debian"]:
+                deb = r.qtest(tpl, "test -f /etc/debian_version")
+                self._t("pass" if deb else "fail", f"{tpl} is Debian-based")
+        if r.vm_exists(self.t["kali"]) or self.args.dry_run:
+            good = r.qtest(self.t["kali"],
+                           f"gpg --no-default-keyring --keyring "
+                           f"{shlex.quote(k['keyring_path'])} --with-colons "
+                           f"--fingerprint 2>/dev/null "
+                           f"| awk -F: '$1==\"fpr\"{{print toupper($10)}}' "
+                           f"| grep -qxF {shlex.quote(k['key_fpr'].upper())}")
+            self._t("pass" if good else "fail",
+                    "Kali keyring carries the expected signing key" if good
+                    else "Kali keyring fingerprint mismatch — investigate")
+        if r.vm_exists(self.t["ids"]) or self.args.dry_run:
+            zp = self.c["zeek"]["prefix"]
+            good = r.qtest(self.t["ids"], f"test -x {zp}/bin/zeek")
+            self._t("pass" if good else "fail",
+                    f"Zeek present at {zp}" if good else f"Zeek binary missing at {zp}")
+        # Each probe started its template; leave them halted, as found.
+        for tpl in self.t.values():
+            r.shutdown(tpl)
+        o.say("")
+        print(f"  {Out.G}{self.tests['pass']} passed{Out.RST}   "
+              f"{Out.R}{self.tests['fail']} failed{Out.RST}   "
+              f"{Out.Y}{self.tests['warn']} warnings{Out.RST}")
+        return 2 if self.tests["fail"] else 0
+
+    def handover_unwired(self) -> None:
+        if self.args.dry_run:
+            return
+        me = Path(sys.argv[0]).name
+        tpls = "  ".join(self.t.values())
+        print(f"""
+{Out.B}{Out.C}══ Handover — unwired edition{Out.RST}
+
+  Templates ready   {tpls}
+  Wired             nothing — no qubes created, no netvm or firewall changed,
+                    no SIEM, no credentials generated
+  Your guide        {self.GUIDE_PATH}
+                    (the wired design, qube by qube, to copy from or adapt)
+  Build log         {self.out.log_path}
+
+  Next steps
+    sudo {me} --verify              check the templates and their payloads
+    sudo {me} --edition wired       wire the full design after all
+""")
+
     def handover(self):
         if self.args.dry_run:
             return
@@ -4247,6 +4354,12 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             print(f"{Out.Y}DRY RUN — nothing will be changed{Out.RST}")
         o.say(f"log: {self.out.log_path}")
 
+        if self.edition == "unwired":
+            o.info("unwired edition: templates only (phases "
+                   f"{', '.join(map(str, self.UNWIRED_PHASES))}); nothing is wired")
+            if self.args.verify:
+                return self.verify_unwired()
+
         if self.args.from_phase > 1 and self.args.phase is None and not self.args.verify:
             self._clear_marks_from(self.args.from_phase)
             o.info(f"resuming: completion marks for phases "
@@ -4260,6 +4373,11 @@ install -m 644 /rw/config/golden-image-dashboard.desktop \\
             if self._should_run(i):
                 o.phase(i, self.PHASES[i - 1])
                 fn()
+        if self.edition == "unwired":
+            self.handover_unwired()
+            o.say("")
+            o.ok("finished: templates ready, nothing wired")
+            return 0
         self.handover()
         o.say("")
         if self.tests["fail"]:
@@ -4330,6 +4448,9 @@ def main() -> int:
                      help="redo everything from phase N (resume after a failure)")
     sel.add_argument("--verify", action="store_true",
                      help="run the acceptance tests only; exits non-zero if any fail")
+    p.add_argument("--edition", choices=["wired", "unwired"],
+                   help="override the configured edition: 'unwired' builds the "
+                        "templates only, 'wired' also builds the topology")
     p.add_argument("--offline-checks", action="store_true",
                    help="skip network-dependent acceptance probes and report them pending")
     p.add_argument("--force", action="store_true",
