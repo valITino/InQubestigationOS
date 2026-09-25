@@ -2102,6 +2102,13 @@ WantedBy=multi-user.target
     # =======================================================================
     def p08(self):
         o, r, w, q = self.out, self.r, self.c["wazuh"], self.q
+        if w["mode"] == "auto":
+            # Still undecided here means phase 1's refusal applies, but phase 1
+            # may have run long ago (a machine wired later, from unwired).
+            raise Fatal("wazuh.mode is 'auto' and could not be decided: under 16G "
+                        "RAM with no wazuh.central_address, or Xen could not report "
+                        "memory.\n     Set wazuh.mode, or wazuh.central_address, in "
+                        "golden-image.json.")
         if w["mode"] == "central":
             if not w["central_address"]:
                 raise Fatal("wazuh.mode is 'central' but wazuh.central_address is empty")
@@ -4674,6 +4681,16 @@ def main() -> int:
                          args.refresh_repo_keys, args.rotate_credentials,
                          args.escrow_credentials, args.shred_credentials,
                          args.upgrade_wazuh, args.verify))
+        if (args.edition == "unwired" and cfg.get("edition", "wired") == "wired"
+                and any(prov._done(n) for n in range(1, len(prov.PHASES) + 1)
+                        if n not in prov.UNWIRED_PHASES)):
+            # The unwired edition only skips wiring; it removes nothing. Calling
+            # a wired machine unwired would switch its checks to templates-only
+            # while the chain, SIEM and policy stay in force, unchecked.
+            raise Fatal("--edition unwired cannot turn a wired machine back: it "
+                        "would stop checking the chain, SIEM and policy without "
+                        "removing them.\n     Reinstall with the unwired kickstart "
+                        "for an unwired machine.")
         if (args.edition and args.edition != cfg.get("edition", "wired")
                 and not lifecycle and not args.dry_run):
             persist_config({"edition": args.edition})

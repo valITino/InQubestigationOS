@@ -176,7 +176,8 @@ sudo golden-image-provision --verify                    # the full acceptance te
 
 Running it with `--edition wired` records the change in the machine's
 configuration, so `--status`, `--verify`, `--issue` and the weekly self-check
-treat the machine as wired from then on.
+treat the machine as wired from then on. There is no way back to unwired short
+of reinstalling: the unwired edition skips the wiring, it does not remove it.
 
 After wiring, the credentials land in `~/golden-image/credentials.json`
 (mode 600). Rotate, escrow and shred them with

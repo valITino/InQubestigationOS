@@ -49,11 +49,13 @@ def main():
         # up to "hardware-accepted".
         old = json.loads(report.read_text())
         old["checks"] = {k: {"status": "pass"} for k in list(ar.CHECKS)[1:]}
+        old["release_status"] = "issued"        # an earlier, now stale, status
         report.write_text(json.dumps(old))
         subprocess.run(cmd[:4], capture_output=True, text=True)
         data = json.loads(report.read_text())
         assert data["summary"]["pending"] == 1, data["summary"]
-        assert data.get("release_status") != "hardware-accepted-not-issued"
+        assert data["release_status"] == "release-candidate-not-hardware-verified", \
+            data["release_status"]
 
     source = (ROOT / "golden_image.py").read_text()
     assert "set -uo pipefail" in source

@@ -6255,9 +6255,11 @@ def package_release(x: Ctx) -> int:
               "BUILD-RECORD.txt"):
         if (x.out_dir / f).is_file():
             shutil.copy2(x.out_dir / f, out / f)
-    shutil.copytree(x.out_dir / "oem", out / "oem",
-                    ignore=shutil.ignore_patterns("*.b64", "*~"),
-                    dirs_exist_ok=True)
+    for ks in [oem_kickstart_path(x)] + [edition_kickstart_path(x, e) for e in EDITIONS]:
+        for f in (ks, ks.with_name("ks.cfg.asc")):
+            rel = f.relative_to(x.out_dir)
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, out / rel)
     shutil.copy2(Path(__file__).resolve(), kit_root / "build_iso.py")
     mk = kit_root / "make-usb.sh"
     mk.write_text(MAKE_USB_SH.replace("@ISO@", shlex.quote(iso.name)))

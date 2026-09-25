@@ -33,7 +33,8 @@ progress display; and a full review of the codebase afterwards. Detail in
   credentials, stock templates left as Qubes installed them. One build signs a
   kickstart per edition under `oem/editions/`; `write-usb --edition` picks one
   (`make usb EDITION=unwired`). `golden-image-provision --edition wired` wires
-  an unwired machine later and records the change for every later command.
+  an unwired machine later and records the change for every later command;
+  the reverse is refused, because the unwired edition removes nothing.
 - `docs/WORKSTATION-GUIDE.md`: the wired design qube by qube, the commands to
   reproduce it by hand, and best practice. Every install carries it at
   `/usr/share/doc/inqubestigationos/`, with a copy in the investigator's home.

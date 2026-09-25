@@ -142,6 +142,10 @@ def main() -> int:
                          "failures": failures, "pending_checks": pending}
     if not failures and not pending:
         report["release_status"] = "hardware-accepted-not-issued"
+    else:
+        # An earlier "accepted" or "issued" does not survive a check that now
+        # fails or is pending (for example one added since).
+        report["release_status"] = "release-candidate-not-hardware-verified"
     a.report.parent.mkdir(parents=True, exist_ok=True)
     a.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     a.report.chmod(0o600)

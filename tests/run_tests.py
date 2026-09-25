@@ -570,6 +570,11 @@ def main() -> int:
     stage("unwired: --edition wired is recorded for every later command",
           json.loads((usand / "golden-image.json").read_text()).get("edition") == "wired"
           and "edition: wired" in run(ugi, ["--status"], uenv, usand).stdout)
+    pd = run(ugi, ["--edition", "unwired"], uenv, usand)
+    stage("a wired machine cannot be relabelled unwired (nothing would be removed)",
+          pd.returncode == 1 and "cannot turn a wired machine back" in pd.stderr
+          and json.loads((usand / "golden-image.json").read_text()).get("edition") == "wired",
+          f"rc={pd.returncode} " + pd.stderr[-300:])
 
     print("\ngenerated configuration")
     p4 = subprocess.run([sys.executable, str(TESTS / "static_checks.py"),
