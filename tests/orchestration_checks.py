@@ -213,6 +213,22 @@ def main():
         assert merged["git"]["branch"] == "release4.3"
         assert len(merged["components"]) == 2
 
+        # The iso block turns on the signed Qubes repository: nothing is built
+        # locally, so it is where lorax-templates-qubes comes from. A testing
+        # flag the operator set survives the merge.
+        with open(bcfg, "a") as fh:
+            fh.write("use-qubes-repo:\n  testing: true\n")
+        with mock.patch.object(x, "run", return_value=""):
+            bi.write_builder_iso_config(x, "iso-online.ks", ["debian-13-xfce"],
+                                        "conf/custom.ks")
+        merged = yaml.safe_load(bcfg.read_text())
+        assert merged["use-qubes-repo"] == {"testing": True, "version": "4.3"}, \
+            merged["use-qubes-repo"]
+        assert merged["iso"]["templates"] == ["debian-13-xfce"]
+        # use-kernel-latest makes lorax run --excludepkgs, which crashes
+        # libdnf5 lorax before its transaction exists.
+        assert merged["iso"]["use-kernel-latest"] is False
+
         # podman is a supported engine; anything else is refused rather than
         # written into builder.yml for ./qb to choke on later.
         x.c["container_engine"] = "podman"
@@ -230,6 +246,23 @@ def main():
         with mock.patch.object(x, "run", return_value='{"type": "qubes"}'):
             expect_fatal(lambda: bi.write_builder_executor(x),
                          "reports type='qubes'")
+
+        # qb's answer is parsed from stdout alone, and a line of noise before
+        # the JSON does not fail the build. When qb itself crashes, the
+        # message shows what it said instead of just "not JSON".
+        def qb_answer(stdout, both):
+            def run(*argv, capture=False, **kw):
+                return stdout if capture == "stdout" else both
+            return run
+        ok = '{"type": "docker", "options": {"image": "qubes-builder-fedora"}}'
+        with mock.patch.object(x, "run", side_effect=qb_answer(
+                "loading plugins\n" + ok, "WARNING: noise\n" + ok)):
+            bi.write_builder_executor(x)
+        crash = ("Traceback (most recent call last):\n"
+                 "ModuleNotFoundError: No module named 'pathspec'")
+        with mock.patch.object(x, "run", side_effect=qb_answer(crash, crash)):
+            expect_fatal(lambda: bi.write_builder_executor(x),
+                         "No module named 'pathspec'")
 
         # ---------------------------------------------------------------
         # Wiring, not just the helper: setup_builder must fix the executor
@@ -516,7 +549,7 @@ def main():
         assert json.loads(lock.read_text()).get("checked") == "2020-01-01", \
             "an unverified run advanced the freshness date"
 
-    print("  69/69 unattended orchestration checks pass")
+    print("  74/74 unattended orchestration checks pass")
     return 0
 
 

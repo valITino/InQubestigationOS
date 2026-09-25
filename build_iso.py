@@ -338,6 +338,10 @@ class Ctx:
         self._log(f"      rc={p.returncode}\n{p.stdout[-4000:]}{p.stderr[-4000:]}")
         if check and p.returncode != 0:
             raise Fatal(f"failed: {' '.join(cmd)} — see {self.log}")
+        # capture="stdout" is for output that gets parsed: a warning qb or
+        # Python writes to stderr must not end up inside the JSON.
+        if capture == "stdout":
+            return p.stdout
         return (p.stdout + p.stderr) if capture else ""
 
     def quiet(self, *argv) -> bool:
@@ -1551,8 +1555,8 @@ def merge_builder_config(x: Ctx, updates: dict, what: str,
         # which is the only answer that matters: a stale `executor: type: qubes`
         # left in builder.yml means every ./qb call needs qrexec, which a
         # Debian/Fedora build host does not have.
-        raw = x.run("./qb", "config", "get-var", "executor", "--json",
-                    cwd=x.builder, check=False, capture=True).strip()
+        qb = ("./qb", "config", "get-var", "executor", "--json")
+        raw = x.run(*qb, cwd=x.builder, check=False, capture="stdout").strip()
         want = updates["executor"]["type"]
         if not raw:
             # qb could not be run at all. The file on disk is still the
@@ -1563,31 +1567,44 @@ def merge_builder_config(x: Ctx, updates: dict, what: str,
             x.warn("'qb config get-var executor' returned nothing — merged "
                    f"executor is {written!r} on disk, but not verified through qb")
             return
+        # The JSON is the last line qb prints; anything before it is noise.
+        last = next((ln for ln in reversed(raw.splitlines())
+                     if ln.lstrip().startswith("{")), raw)
         try:
-            resolved = json.loads(raw)
+            resolved = json.loads(last)
         except json.JSONDecodeError as exc:
-            raise Fatal(f"'qb config get-var executor --json' did not return "
-                        f"JSON ({exc}). Restored copy: {backup}") from exc
+            # Usually qb itself failed (a traceback from a missing Python
+            # module, say). Ask again with stderr included, so the message
+            # says why instead of just "not JSON".
+            said = x.run(*qb, cwd=x.builder, check=False, capture=True).strip()
+            tail = "\n       ".join(said.splitlines()[-15:]) or "(no output)"
+            raise Fatal(
+                f"'{' '.join(qb)}' did not return JSON ({exc}). It said:\n"
+                f"       {tail}\n"
+                f"     Reproduce:  cd {x.builder} && {' '.join(qb)}\n"
+                f"     A missing Python module there is fixed by:  "
+                f"./build_iso.py setup-host\n"
+                f"     Previous builder.yml kept at: {backup}") from exc
         got = (resolved or {}).get("type")
         if got != want:
             raise Fatal(
                 f"builder.yml merged but 'qb config get-var executor' reports "
                 f"type={got!r}, not {want!r}.\n"
-                f"     Restored copy: {backup}")
+                f"     Previous builder.yml kept at: {backup}")
         image = ((resolved or {}).get("options") or {}).get("image", "")
         x.ok(f"verified with 'qb config get-var executor': {got}"
              + (f" ({image})" if image else ""))
         return
 
     seen = x.run("./qb", "config", "get-var", "templates", cwd=x.builder,
-                 check=False, capture=True)
+                 check=False, capture="stdout")
     if seen.strip():
         missing = [n for n in updates.get("templates", [])
                    if _entry_key(n) and _entry_key(n) not in seen]
         if missing:
             raise Fatal(f"builder.yml merged but 'qb config get-var templates' "
                         f"does not list {', '.join(str(m) for m in missing)}.\n"
-                        f"     Restored copy: {backup}")
+                        f"     Previous builder.yml kept at: {backup}")
         x.ok("verified with 'qb config get-var templates'")
     else:
         x.warn("'qb config get-var templates' returned nothing — could not verify "
@@ -2016,12 +2033,26 @@ def write_builder_iso_config(x: Ctx, base_ks: str, iso_tpls: list[str], kickstar
         "comps": x.c["comps_file"],
         "flavor": x.c["iso_flavor"],
         "is-final": False,
-        "use-kernel-latest": True,
+        # True makes the installer Makefile pass lorax `--excludepkgs kernel`,
+        # and lorax since its libdnf5 port (40+, what Fedora 41 ships) runs
+        # that removepkg before any transaction exists: "Transaction needs to
+        # be run before calling _filelists". This only picks the kernel the
+        # installer boots; the installed system still gets kernel-latest from
+        # the kickstart's %packages.
+        "use-kernel-latest": False,
         "templates": list(iso_tpls),
     }
     if x.c["iso_version"]:
         iso["version"] = str(x.c["iso_version"])
-    updates: dict = {"iso": iso}
+    # The installer's Mock chroot installs lorax-templates-qubes, and the ISO
+    # pulls dom0 packages. Nothing here builds Qubes components, so the
+    # builder-local repository is empty; without use-qubes-repo the installer
+    # plugin never enables the signed yum.qubes-os.org repository and dnf
+    # stops at "No match for argument: lorax-templates-qubes".
+    updates: dict = {
+        "iso": iso,
+        "use-qubes-repo": {"version": str(x.c["qubes_release"]).lstrip("rR")},
+    }
     # Only when there is something to cache: an empty 'cache: {templates: []}'
     # would replace whatever the upstream example config put there.
     if x.c["cache_templates"]:
