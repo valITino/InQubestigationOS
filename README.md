@@ -234,9 +234,10 @@ Wazuh release the repository actually offers and its signing key, the Qubes
 4.3 template names and firewall chains, and the `qvm-backup` profile schema in
 qubes-core-admin. `supply-chain.lock.json` records what was seen;
 `./build_iso.py check-upstream` re-checks it and fails on drift. Its run on
-2026-09-25 found nothing blocking and two warnings, both left for a
-reviewer: Wazuh 4.14.8 is out (the pin is 4.14.7), and upstream's
-`wazuh-passwords-tool.sh` changed.
+2026-09-25 found nothing blocking and two warnings: Wazuh 4.14.8 was out and
+upstream's `wazuh-passwords-tool.sh` had changed. Both were reviewed — the tool
+change from 4.14.7 to 4.14.8 only adds retries and service-state polling,
+no new endpoints — and the pins moved to 4.14.8 in 2.6.
 
 `build_iso.py` has built and signed an image end to end on one real host:
 `./build_iso.py quickstart --usb` on Kali Linux rolling, in a VirtualBox VM with

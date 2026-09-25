@@ -42,7 +42,7 @@ from typing import Callable
 # ===========================================================================
 DEFAULT_CONFIG: dict = {
     "image_name": "InQubestigationOS",
-    "image_version": "2.5",
+    "image_version": "2.6",
     "expect_qubes_release": "4.3",
 
     # Which edition this machine is.
@@ -162,7 +162,7 @@ DEFAULT_CONFIG: dict = {
         "prefix": "/opt/zeek",
     },
     "wazuh": {
-        "version": "4.14.7",
+        "version": "4.14.8",
         "key_url": "https://packages.wazuh.com/key/GPG-KEY-WAZUH",
         # Verified the same way as the Kali key: whatever comes back from the
         # network is checked against this fingerprint before it is trusted to
@@ -189,10 +189,11 @@ DEFAULT_CONFIG: dict = {
         "port_events": 1514,
         "port_enroll": 1515,
         # The two vendor scripts phase 8 runs as root inside wazuh-srv. Pinned
-        # by checksum, confirmed 2026-09-08 for the 4.14 series; blank disables
-        # the check and says so. check-upstream reports drift.
+        # by checksum for the 4.14 series: the certs tool confirmed 2026-09-08,
+        # the passwords tool re-reviewed and re-pinned 2026-09-25 (4.14.8).
+        # Blank disables the check and says so. check-upstream reports drift.
         "certs_tool_sha256": "8c93ed36d7b956a6e97a906aed6b6bc636d7cb55a15a41fd6e9c2aa825164216",
-        "passwords_tool_sha256": "29ce567ce1bcb4629a34f3ccfcaec7463a5418bcdd0ee96db5e25dbc0340f8eb",
+        "passwords_tool_sha256": "ef4f8900f93ee40f9d7b6ee066535fb30044df643fe3ceb703a300d710b11d92",
         "mem": 4096, "maxmem": 8192, "vcpus": 2, "root_gb": 60,
     },
 
