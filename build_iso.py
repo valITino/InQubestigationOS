@@ -6199,6 +6199,33 @@ def signing_key_url(remote: str | None = None) -> str:
     return f"https://github.com/{m.group(1)}/{m.group(2)}/blob/HEAD/SIGNING-KEY.md"
 
 
+def primary_fingerprint(colons: str, fpr: str) -> str:
+    """The primary key's fingerprint for `fpr`, which may name the primary key
+    or one of its subkeys, from `gpg --with-colons` output. "" if absent.
+
+    Downloaders compare what gpg labels "Primary key fingerprint"; publishing a
+    signing subkey's fingerprint instead would make every genuine release look
+    forged."""
+    want, primary, next_is_primary = fpr.upper(), "", False
+    for ln in colons.splitlines():
+        f = ln.split(":")
+        if f[0] == "pub":
+            next_is_primary = True
+        elif f[0] == "fpr" and len(f) > 9:
+            if next_is_primary:
+                primary, next_is_primary = f[9].upper(), False
+            if f[9].upper() == want and primary:
+                return primary
+    return ""
+
+
+def release_key_listing(x: Ctx) -> str:
+    return subprocess.run(
+        ["gpg", "--batch", "--with-colons", "--show-keys",
+         str(x.out_dir / "unit-signing-key.asc")],
+        capture_output=True, text=True).stdout
+
+
 def check_published_fingerprint(x: Ctx, fpr: str) -> str:
     """A release must be checkable against the fingerprint the repository
     publishes. Fills the placeholder on first use; refuses a different key.
@@ -6310,7 +6337,8 @@ def package_release(x: Ctx) -> int:
     if dest.exists() and any(dest.iterdir()):
         raise Fatal(f"{dest} already has files in it — remove it or pass --to")
     if x.args.dry_run:
-        check_published_fingerprint(x, fpr)
+        check_published_fingerprint(
+            x, primary_fingerprint(release_key_listing(x), fpr) or fpr)
         x.info(f"[dry-run] verify, split {iso.name} into {part_mib} MiB parts, "
                f"write the kit and SHA256SUMS(.asc) into {dest}")
         return 0
@@ -6329,16 +6357,16 @@ def package_release(x: Ctx) -> int:
 
     # The public key downloaders import must be the key that signed: a stale
     # or replaced export would leave them nothing to verify SHA256SUMS with.
-    listed = subprocess.run(
-        ["gpg", "--batch", "--with-colons", "--show-keys",
-         str(x.out_dir / "unit-signing-key.asc")],
-        capture_output=True, text=True).stdout
+    listed = release_key_listing(x)
     if fpr.upper() not in {ln.split(":")[9].upper() for ln in listed.splitlines()
                            if ln.startswith("fpr:")}:
         raise Fatal(f"output/unit-signing-key.asc does not contain {fpr}.\n"
                     f"     Re-export it:  ./build_iso.py sign")
     x.ok("unit-signing-key.asc is the release key")
-    published = check_published_fingerprint(x, fpr)
+    # iso_sign_key may name a signing subkey; what is published and compared
+    # is always the primary key's fingerprint.
+    primary = primary_fingerprint(listed, fpr) or fpr.upper()
+    published = check_published_fingerprint(x, primary)
     url = signing_key_url()
 
     # 2. The kit: an allowlist, so nothing else in output/ (let alone the
@@ -6390,7 +6418,7 @@ def package_release(x: Ctx) -> int:
     x.ok(f"{len(parts)} parts of at most {part_mib} MiB")
 
     (kit_root / "README.txt").write_text(
-        release_readme(iso.name, parts, kit_name, fpr, url))
+        release_readme(iso.name, parts, kit_name, primary, url))
     import tarfile
     with tarfile.open(dest / kit_name, "w:gz") as tar:
         for f in sorted(kit_root.rglob("*")):
@@ -6422,7 +6450,7 @@ def package_release(x: Ctx) -> int:
 
   Never upload the key-backup folder or iso-build.json. The signing
   passphrase stays with you; downloaders need only the fingerprint:
-    {fpr}
+    {primary}
   — published in {SIGNING_KEY_PAGE.name}{' (' + url + ')' if url else ''}.
 """)
     if published == "filled":

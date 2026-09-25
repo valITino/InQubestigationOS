@@ -15,7 +15,8 @@
   "compare, do not just copy". It says to compare the *primary* key
   fingerprint, since a signing subkey shows a different one. Keys that signed
   older releases stay listed under "Previous keys", so a key rotation does not
-  make old releases look forged.
+  make old releases look forged. When `iso_sign_key` names a signing subkey,
+  the primary key's fingerprint is what gets published and compared.
 - GUIDE §3, README and SIGNING.md point to the new page. `doc_checks` fails
   if the page cannot be parsed.
 

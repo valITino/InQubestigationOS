@@ -302,6 +302,13 @@ def main():
                   "no readable 'Fingerprint:' line")
             page.unlink()
             assert bi.check_published_fingerprint(x, "A" * 40) == "absent"
+        # A signing subkey resolves to its primary key; that is what gpg shows
+        # downloaders as "Primary key fingerprint", so that is what is published.
+        colons = ("pub:u:4096:1:AAAA:1::::::scESC:\nfpr:::::::::" + "P" * 40 + ":\n"
+                  "sub:u:4096:1:BBBB:1::::::s:\nfpr:::::::::" + "S" * 40 + ":\n")
+        assert bi.primary_fingerprint(colons, "s" * 40) == "P" * 40
+        assert bi.primary_fingerprint(colons, "P" * 40) == "P" * 40
+        assert bi.primary_fingerprint(colons, "C" * 40) == ""
         for remote, want in (
                 ("https://github.com/o/r.git", "https://github.com/o/r/blob/HEAD/SIGNING-KEY.md"),
                 ("git@github.com:o/r.git", "https://github.com/o/r/blob/HEAD/SIGNING-KEY.md"),
@@ -315,7 +322,7 @@ def main():
         mk.write_text(bi.MAKE_USB_SH.replace("@ISO@", "x.iso"))
         assert subprocess.run(["bash", "-n", str(mk)]).returncode == 0
 
-    print("  63/63 installation-path checks pass")
+    print("  66/66 installation-path checks pass")
     return 0
 
 
