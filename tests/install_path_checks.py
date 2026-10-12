@@ -317,12 +317,53 @@ def main():
         readme = bi.release_readme("I.iso", ["I.iso.part01"], "k.tar.gz", "A" * 40,
                                    "https://github.com/o/r/blob/HEAD/SIGNING-KEY.md")
         assert "published at  https://github.com/o/r/blob/HEAD/SIGNING-KEY.md" in readme
+        # USB media: flagged removable, OR attached over USB with the
+        # removable bit cleared (many sticks' firmware); never a SATA/NVMe disk.
+        sysb = Path(td) / "sys" / "block"
+        def disk(name, removable, bus, size="30000000"):
+            d = sysb / name
+            d.mkdir(parents=True)
+            (d / "removable").write_text(removable + "\n")
+            (d / "size").write_text(size + "\n")
+            target = Path(td) / "devices" / bus / name
+            target.mkdir(parents=True)
+            (target / "model").write_text(name.upper() + "\n")
+            (d / "device").symlink_to(target)
+        disk("sda", "0", "pci0000:00/ata1/host0")                 # internal SATA
+        disk("sdb", "0", "pci0000:00/usb2/2-1/2-1:1.0/host3")     # USB, bit cleared
+        disk("sdc", "1", "pci0000:00/mmc0")                       # card reader
+        disk("sdd", "0", "pci0000:00/usb3/3-1/host4", size="0")   # empty USB slot
+        with mock.patch.object(bi, "SYS_BLOCK", sysb):
+            found = {d["dev"]: d["usb"] for d in bi.removable_devices()}
+        assert found == {"/dev/sdb": True, "/dev/sdc": False}, found
+
+        # A stick plugged in before write-usb --wait started is used, not
+        # waited for (the wait only ever saw NEW devices and timed out).
+        one = [{"dev": "/dev/sdb", "size": 3e10, "model": "STICK", "usb": True}]
+        two = one + [{"dev": "/dev/sdc", "size": 3e10, "model": "CARD", "usb": False}]
+        x.args.device, x.args.wait = None, True
+        with mock.patch.object(bi, "removable_devices", return_value=one), \
+                mock.patch.object(bi.time, "sleep", side_effect=AssertionError("waited")):
+            assert bi.select_device(x)[0] == "/dev/sdb"
+        x.args.device = None
+        clock = iter(range(0, 10_000, 100))
+        with mock.patch.object(bi, "removable_devices", return_value=two), \
+                mock.patch.object(bi.time, "sleep"), \
+                mock.patch.object(bi.time, "monotonic", side_effect=lambda: next(clock)):
+            fatal(lambda: bi.select_device(x), "/dev/sdb, /dev/sdc")
+        x.args.device = None
+        seq = iter([[], [], one])
+        with mock.patch.object(bi, "removable_devices", side_effect=lambda: next(seq)), \
+                mock.patch.object(bi.time, "sleep"):
+            assert bi.select_device(x)[0] == "/dev/sdb"
+        x.args.device, x.args.wait = None, False
+
         # The download kit's writer must at least be valid bash.
         mk = Path(td) / "make-usb.sh"
         mk.write_text(bi.MAKE_USB_SH.replace("@ISO@", "x.iso"))
         assert subprocess.run(["bash", "-n", str(mk)]).returncode == 0
 
-    print("  66/66 installation-path checks pass")
+    print("  70/70 installation-path checks pass")
     return 0
 
 
